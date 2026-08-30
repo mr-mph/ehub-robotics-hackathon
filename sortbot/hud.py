@@ -51,6 +51,20 @@ h1{font-size:15px;margin:0;letter-spacing:3px;color:var(--acc);font-weight:700}
 #banner.ok{border-left-color:var(--acc)}
 #banner.amber{border-left-color:var(--amber)}
 #banner.err{border-left-color:var(--red);color:#ffb3b5}
+#pwrap{display:none;align-items:center;gap:8px;width:100%;margin-top:6px}
+#pwrap.on{display:flex}
+#ptrack{flex:1;height:8px;border-radius:6px;background:var(--bg2);border:1px solid var(--line);overflow:hidden}
+#pfill{height:100%;width:0%;border-radius:6px;background:var(--acc);transition:width .35s ease}
+#pwrap.amber #pfill{background:var(--amber)}
+#pwrap.err #pfill{background:var(--red)}
+#pfill.pulse{animation:pulse 1.4s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}}
+#ptext{font-size:12px;color:var(--tx2);white-space:nowrap;min-width:132px;text-align:right;font-variant-numeric:tabular-nums}
+#d-pwrap{display:none;align-items:center;gap:10px;width:100%;margin:6px 0}
+#d-pwrap.on{display:flex}
+#d-ptrack{flex:1;height:12px;border-radius:8px;background:#1b1d22;overflow:hidden}
+#d-pfill{height:100%;width:0%;border-radius:8px;background:var(--acc);transition:width .35s ease}
+#d-ptext{font-size:16px;font-weight:600;color:#cfd3da;white-space:nowrap;font-variant-numeric:tabular-nums}
 #micchip{color:#fff;background:var(--red);border-radius:20px;padding:8px 14px;font-weight:700;font-size:12px;animation:blink 1.2s infinite;flex:none}
 .btn{background:var(--bg2);color:var(--tx);border:1px solid var(--line2);border-radius:var(--rs);padding:9px 14px;min-height:40px;cursor:pointer;font:inherit;font-weight:500}
 .btn:hover:not(:disabled){background:#243040;border-color:#4a5a72}
@@ -182,6 +196,7 @@ body.showhelp .help{display:block}
   <span class="conn" id="cd-vlm"><i class="dot"></i>vlm <span class="cv">off</span></span>
  </div>
  <div id="banner" title="">starting...</div>
+ <div id="pwrap"><div id="ptrack"><div id="pfill"></div></div><div id="ptext"></div></div>
  <span id="micchip" hidden>&#9679; MIC LIVE</span>
  <button id="torqon" class="btn primary" hidden>Torque on</button>
  <button id="demobtn" class="btn" title="Fullscreen view for judging: stream + last decision + rules, no controls">Demo</button>
@@ -333,6 +348,7 @@ body.showhelp .help{display:block}
  <div class="drow"><div id="d-banner">-</div>
   <button id="d-estop" class="btn danger big">E-STOP</button>
   <button id="d-close" class="btn big" title="Exit demo view (Esc)">&#10005; Exit</button></div>
+ <div id="d-pwrap"><div id="d-ptrack"><div id="d-pfill"></div></div><div id="d-ptext"></div></div>
  <div class="dview"><img id="d-ov" alt="overhead"></div>
  <div id="d-say"></div>
  <div id="d-decision">-</div>
@@ -592,6 +608,30 @@ function renderModels(){const d=window._models;if(!d)return;const cur=d.current|
 const fmt=v=>v==null?'-':(typeof v==='number'?v.toFixed(0):v);
 function dis(btn,reason){if(!btn)return;btn.disabled=!!reason;
  btn.title=reason?reason:(btn.dataset.hTitle?helpOf(btn.dataset.hTitle):btn.title);}
+function progressInfo(){
+ // -> {frac 0..1 (or null = indeterminate), text, cls} or null when there is nothing to show
+ const r=S.run,cal=S.calibration;
+ if(cal&&cal.state==='running'){const n=cal.n||0,need=8;
+  const cov=(cal.coverage_pct!=null)?(', '+Math.round(cal.coverage_pct)+'% coverage'):'';
+  return{frac:Math.min(1,n/need),text:n+' / '+need+' samples'+cov,cls:n>=need?'':'amber'};}
+ if(!r)return null;
+ const ph=r.phase,st=r.step||0,mx=r.max_steps||0;
+ if(ph==='running'||ph==='paused'){
+  const frac=mx?Math.min(1,st/mx):null;
+  const near=mx&&st/mx>0.85;
+  return{frac:frac,text:'step '+st+' / '+mx+(near?' - near step budget':''),
+         cls:ph==='paused'?'amber':(near?'amber':''),pulse:ph==='running'};}
+ if(ph==='done'||ph==='stopped')return{frac:1,text:'step '+st+' / '+mx+' - finished',cls:''};
+ return null;}
+function renderProgress(){
+ const p=progressInfo(),w=$('pwrap'),f=$('pfill'),t=$('ptext');
+ const dw=$('d-pwrap'),df=$('d-pfill'),dt=$('d-ptext');
+ if(!p){w.classList.remove('on');dw.classList.remove('on');return;}
+ w.classList.add('on');w.className='on'+(p.cls?' '+p.cls:'');
+ const pct=(p.frac==null?100:Math.round(p.frac*100));
+ f.style.width=pct+'%';f.classList.toggle('pulse',!!p.pulse&&p.frac==null);
+ t.textContent=p.text;
+ dw.classList.add('on');df.style.width=pct+'%';dt.textContent=p.text;}
 function bannerInfo(){
  const r=S.run,rb=S.robot,cal=S.calibration;
  if(rb&&rb.torque===false)return['E-STOP - torque is OFF. Press "Torque on" to re-enable the arm.','err','debug'];
@@ -696,6 +736,7 @@ async function tick(){let s;
  // banner
  const b=bannerInfo();
  $('banner').textContent=b[0];$('banner').title=b[0];$('banner').className=b[1];$('banner').dataset.tab=b[2];
+ renderProgress();
  // E-STOP / torque
  const toff=rb&&rb.torque===false;
  $('estop').classList.toggle('off',!!toff);

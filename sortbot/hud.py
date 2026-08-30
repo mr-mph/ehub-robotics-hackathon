@@ -25,7 +25,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 _BOUNDARY = b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n"
-GROUPS = ["run", "robot", "calibration", "voice", "rules", "models"]
+GROUPS = ["run", "robot", "perception", "calibration", "voice", "rules", "models", "log"]
 
 PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>sortbot HUD</title>
 <style>
@@ -78,6 +78,20 @@ select{background:#0d0d0d;color:#dfd;border:1px solid #444;border-radius:3px;pad
 .mrow{display:flex;align-items:center;gap:8px;margin:4px 0;flex-wrap:wrap}
 .mrow .lbl2{color:#789;font-size:11px;text-transform:uppercase;width:80px}
 #vlmstat{color:#fc8;font:12px Menlo,monospace}
+.prow{display:flex;align-items:center;gap:8px;margin:4px 0}
+.prow .lbl2{color:#789;font-size:11px;text-transform:uppercase;width:70px}
+.prow input[type=range]{width:150px;accent-color:#4a6}
+.prow .pv{font:12px Menlo,monospace;color:#cfc;width:56px}
+.zrow{display:flex;align-items:center;gap:8px;margin:3px 0;font:12px Menlo,monospace;color:#cfc}
+.zrow .zn{color:#fc8;width:84px}
+.zrow button{min-width:0}
+.zrow button.arm{background:#a60;border-color:#fc8}
+#logbox{max-height:460px;overflow-y:auto}
+.logrow{display:flex;gap:8px;margin:0 0 6px;border-bottom:1px solid #262626;padding-bottom:6px}
+.logrow img{width:160px;height:auto;flex:none;background:#000;align-self:flex-start}
+.logrow .lr{font:11px/1.35 Menlo,monospace;color:#cfc;white-space:pre-wrap;word-break:break-word;min-width:0}
+.logrow.bad .lr{color:#f66}
+.logrow .lt{color:#789}
 [hidden]{display:none!important}
 </style></head><body>
 <header>
@@ -109,6 +123,12 @@ select{background:#0d0d0d;color:#dfd;border:1px solid #444;border-radius:3px;pad
    <h3 style="margin-top:8px">Hints (one-shot, this run)</h3><ul id="hlist"></ul></div>
   <div data-extra="models"><div id="mrows"><span class="na">loading...</span></div>
    <div class="note">last VLM call: <span id="vlmstat">-</span></div><div class="note" id="mnotes"></div></div>
+  <div data-extra="perception"><div id="prows"><span class="na">loading...</span></div>
+   <div class="note">foreground if V &gt; v_min or S &gt; s_min; blobs kept if area_min &lt;= px area &lt;= area_max.
+   Changes apply live and persist to config.yaml. Toggle mask streams the binary mask on the overhead view.</div>
+   <h3 style="margin-top:8px">Zones</h3><div id="zrows"></div>
+   <div class="note">"set drop" then click the overhead image at the new drop point (converted px&rarr;mm, persisted).</div></div>
+  <div data-extra="log"><div id="logbox"><span class="na">no log entries yet</span></div></div>
  </div>
  <div class="card"><h3>Last VLM call</h3><pre id="call"></pre><pre id="say" style="color:#fc8"></pre></div>
  <div class="card"><h3>Rules</h3><ul id="rules"></ul></div>
@@ -117,7 +137,7 @@ select{background:#0d0d0d;color:#dfd;border:1px solid #444;border-radius:3px;pad
 const $=id=>document.getElementById(id);
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const li=(id,a)=>{$(id).innerHTML=(a||[]).map(x=>'<li>'+esc(x)+'</li>').join('')||'<li style="color:#666">none</li>'};
-const GROUPS=['run','robot','calibration','voice','rules','models'];
+const GROUPS=['run','robot','perception','calibration','voice','rules','models','log'];
 const HDR=new Set(['set_mode','torque_off']);
 let actions=[],actsig='',curTab='run',ring=null,frameW=640,frameH=480;
 async function act(name,body){try{
@@ -141,7 +161,8 @@ function renderBody(){const rows=actions.filter(a=>a.group===curTab&&a.label&&!H
    body[i.dataset.p]=/^-?\\d+(\\.\\d+)?$/.test(v)?parseFloat(v):v;});
   act(b.dataset.n,body);});
  document.querySelectorAll('[data-extra]').forEach(d=>d.hidden=d.dataset.extra!==curTab);
- if(curTab==='models'&&!window._models)loadModels();}
+ if(curTab==='models'&&!window._models)loadModels();
+ if(curTab==='log'){logSig='';loadLog();}}
 async function loadActions(){try{const a=await(await fetch('/actions')).json();
  const sig=JSON.stringify(a);if(sig!==actsig){actsig=sig;actions=a;renderTabs();}}catch(e){}}
 document.querySelectorAll('.pill').forEach(b=>b.onclick=()=>act('set_mode',{[b.dataset.k]:b.dataset.v}));
@@ -149,6 +170,10 @@ $('estop').onclick=()=>act('torque_off');
 $('ov').onclick=async e=>{const im=$('ov'),r=im.getBoundingClientRect();
  const nw=im.naturalWidth||frameW,nh=im.naturalHeight||frameH;
  const u=(e.clientX-r.left)/r.width*nw,v=(e.clientY-r.top)/r.height*nh;
+ if(dropZone){const z=dropZone;dropZone=null;zoneSig='';
+  const j=await act('px_to_mm',{u:Math.round(u),v:Math.round(v)});
+  if(j.ok&&j.data)await act('set_zone_drop',{name:z,x:j.data.x,y:j.data.y});
+  return;}
  const j=await act('calib_sample',{u:Math.round(u),v:Math.round(v)});
  ring=j.data&&j.data.det?j.data.det:null;drawRing();};
 function drawRing(){const im=$('ov'),el=$('ring');if(!ring){el.style.display='none';return;}
@@ -196,6 +221,7 @@ async function tick(){try{
   +(vs.last_cost_usd!=null?'  ~$'+vs.last_cost_usd.toFixed(4)+'/call':'')
   +(vs.last_usage?'  ('+vs.last_usage.input_tokens+' in / '+vs.last_usage.output_tokens+' out)':'')):'-';
  document.querySelectorAll('#vlmstat,.vlmbeside').forEach(el=>el.textContent=vtxt);
+ renderPerc(s.perception);
 }catch(e){}}
 const fmt=v=>v==null?'-':(typeof v==='number'?v.toFixed(0):v);
 const grip=g=>g===undefined||g===null?'-':(g?'open':'closed');
@@ -237,6 +263,28 @@ function renderModels(){const d=window._models;if(!d)return;const cur=d.current|
    (p==='openai'?' <span class="vlmbeside" style="color:#fc8;font:12px Menlo,monospace"></span>':'')+`</div>`;}).join('');
  $('mnotes').textContent=(d.notes||[]).join('; ');
  $('mrows').querySelectorAll('select').forEach(sl=>sl.onchange=async()=>{await act('set_model',{provider:sl.dataset.prov,value:sl.value});window._models=null;loadModels();});}
+// ---- perception tab: threshold sliders + zone drop points ----
+const SL=[['v_min',0,255,1],['s_min',0,255,1],['area_min',0,5000,10],['area_max',1000,120000,500]];
+let percBuilt=false,zoneSig='',dropZone=null,dragging=null;
+function buildPerc(){percBuilt=true;
+ $('prows').innerHTML=SL.map(([n,lo,hi,st])=>`<div class="prow"><span class="lbl2">${n}</span><input type="range" data-s="${n}" min="${lo}" max="${hi}" step="${st}" title="Applies live on release; persisted to config.yaml perception:"><span class="pv" data-v="${n}">-</span></div>`).join('');
+ $('prows').querySelectorAll('input[type=range]').forEach(sl=>{
+  sl.oninput=()=>{dragging=sl.dataset.s;$('prows').querySelector(`[data-v="${sl.dataset.s}"]`).textContent=sl.value;};
+  sl.onchange=async()=>{dragging=null;await act('set_detector_params',{[sl.dataset.s]:parseFloat(sl.value)});act('redetect');};});}
+function renderPerc(pc){if(!pc||!pc.params)return;if(!percBuilt)buildPerc();
+ for(const[n]of SL){const sl=$('prows').querySelector(`input[data-s="${n}"]`);
+  if(sl&&dragging!==n){sl.value=pc.params[n];$('prows').querySelector(`[data-v="${n}"]`).textContent=pc.params[n];}}
+ const sig=JSON.stringify([pc.zones,dropZone]);if(sig===zoneSig)return;zoneSig=sig;
+ $('zrows').innerHTML=(pc.zones||[]).map(z=>`<div class="zrow"><span class="zn">${esc(z.name)}</span><span>drop (${z.drop[0]}, ${z.drop[1]})</span><button data-z="${esc(z.name)}" class="${dropZone===z.name?'arm':''}" title="Click, then click the overhead image at the new drop point.">${dropZone===z.name?'click overhead...':'set drop'}</button></div>`).join('');
+ $('zrows').querySelectorAll('button[data-z]').forEach(b=>b.onclick=()=>{dropZone=dropZone===b.dataset.z?null:b.dataset.z;zoneSig='';});}
+// ---- log tab: decision ring buffer, newest first ----
+let logSig='';
+async function loadLog(){if(curTab!=='log')return;try{
+ const l=await(await fetch('/log')).json();const sig=l.length?l[0].i+'/'+l.length:'0';if(sig===logSig)return;logSig=sig;
+ $('logbox').innerHTML=l.map(e=>`<div class="logrow${e.ok===false?' bad':''}">${e.thumb_b64?`<img src="data:image/jpeg;base64,${e.thumb_b64}">`:''}`+
+  `<div class="lr"><span class="lt">#${e.step} ${new Date(e.t*1000).toLocaleTimeString()}${e.latency_ms!=null?' '+e.latency_ms+'ms':''}</span>\n${esc(e.tool)}(${esc(JSON.stringify(e.args||{}))})\n${esc(e.result||'')}${e.say?'\\n"'+esc(e.say)+'"':''}</div></div>`).join('')
+  ||'<span class="na">no log entries yet</span>';}catch(e){}}
+setInterval(loadLog,1500);
 loadActions();setInterval(tick,500);tick();setInterval(loadActions,5000);
 </script></body></html>"""
 
@@ -317,6 +365,10 @@ class HUD:
     def add_state_source(self, key: str, fn: Callable[[], dict]) -> None:
         """fn() is merged into GET /state under `key` at request time."""
         self._sources[key] = fn
+
+    def add_route(self, path: str, fn: Callable[[], object]) -> None:
+        """Serve fn() as JSON at GET `path` (e.g. /log) -- for payloads too heavy to ride along in /state."""
+        self.app.get(path)(lambda: JSONResponse(_jsonable(fn())))
 
     def start(self) -> None:
         cfg = uvicorn.Config(self.app, host=self.host, port=self.port, log_level="warning")

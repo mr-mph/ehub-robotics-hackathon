@@ -70,7 +70,7 @@ forget rules), `--config PATH`.
 ## HUD (browser page, everything works without the terminal)
 
 Layout: header (mode pills + phase/step counter + red **E-STOP**), left column overhead (large) + wrist streams,
-right column status card and one tab per action group (run / robot / calibration / voice / rules / models), rendered dynamically
+right column status card and one tab per action group (run / robot / perception / calibration / voice / rules / models / log), rendered dynamically
 from `GET /actions` (button rows with input fields derived from each action's parameters). While no run is
 active a preview thread keeps the camera streams live.
 
@@ -109,6 +109,24 @@ RULES group: `add_rule(text)`, `delete_rule(i)`, `move_rule(i, dir: up|down)` an
 persistent RULES list (same RulesStore the voice path uses; survives restarts via `--rules-file`) and the
 one-shot hints of the current run. The rules tab renders the list with per-rule up/down/delete controls;
 `GET /state` carries `rules: {list, hints}`.
+
+PERCEPTION group: `set_detector_params(v_min, s_min, area_min, area_max)` (any subset) tunes the shared
+`ClassicalDetector` thresholds **live** -- the running loop picks them up on the next frame -- and persists them
+under `config.yaml perception:` (sliders with live values on the page; a pixel is foreground if HSV V > `v_min`
+or S > `s_min`, blobs kept if `area_min <= px area <= area_max`). `redetect()` re-runs detection + overlay on the
+latest overhead frame without a robot step (shown for a few seconds while idle). `toggle_mask()` streams the
+detector's binary foreground mask on `/overhead.mjpg` instead of the overlay (toggle again for the overlay).
+`set_zone_drop(name, x, y)` moves a zone's drop point (table mm, validated against the workspace) and persists it
+into `config.yaml zones` (rect untouched, comments preserved); on the page press a zone's **set drop** then click
+the overhead image -- the click is converted px -> mm via the `px_to_mm(u, v)` action. `GET /state` carries
+`perception: {params, mask, zones: [{name, drop, rect}]}`.
+
+LOG group: a ring buffer of the last 200 decisions/events -- every loop tool call (with a 160px overlay jpeg
+thumbnail at decision time, latency and the say text), plus voice events, mode changes, zone-drop moves and
+torque on/off -- served newest-first at `GET /log` as
+`{i, step, t, tool, args, result, ok, say, latency_ms, thumb_b64}`. The log tab renders a scrolling list with
+thumbnails; rejections / safety errors / E-STOP (`ok: false`, `FAILED:`/`rejected:`/`safety:` results) are red.
+`log_clear()` empties it.
 
 MODELS group: `get_models()` lists what is selectable -- OpenAI vision-capable ids from `models.list()`
 (gpt-5 / gpt-4.1 / gpt-4o / o3 / o4 families, cached 5 min, graceful when the key is missing) and the

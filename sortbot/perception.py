@@ -75,25 +75,48 @@ def _color_hint(rgb: np.ndarray, mask: np.ndarray) -> str:
     return "red"
 
 
+@dataclass
+class DetectorParams:
+    """Live-tunable ClassicalDetector thresholds. The HUD's set_detector_params mutates the shared instance
+    in place, so the running detector picks changes up on the very next frame."""
+
+    v_min: int = 70       # pixel is foreground if HSV V > v_min ...
+    s_min: int = 90       # ... or S > s_min (dark matte mat stays background)
+    area_min: int = 300   # blob area (px^2) kept if area_min <= area <= area_max
+    area_max: int = 60_000
+
+    def to_dict(self) -> dict:
+        return {"v_min": self.v_min, "s_min": self.s_min, "area_min": self.area_min, "area_max": self.area_max}
+
+
 class ClassicalDetector:
-    """Anything brighter / more saturated than the dark matte mat is an object."""
+    """Anything brighter / more saturated than the dark matte mat is an object. Thresholds live in a
+    (shareable) DetectorParams read on every detect(), so they can be tuned while running."""
 
-    def __init__(self, min_area_px: int = 300, max_area_px: int = 60_000, v_thresh: int = 70, s_thresh: int = 90, kernel: int = 5):
-        self.min_area, self.max_area = min_area_px, max_area_px
-        self.v_thresh, self.s_thresh, self.kernel = v_thresh, s_thresh, kernel
+    def __init__(self, params: DetectorParams | None = None, min_area_px: int = 300, max_area_px: int = 60_000,
+                 v_thresh: int = 70, s_thresh: int = 90, kernel: int = 5):
+        self.params = params if params is not None else DetectorParams(v_thresh, s_thresh, min_area_px, max_area_px)
+        self.kernel = kernel
 
-    def detect(self, rgb: np.ndarray, roi_mask: np.ndarray) -> list[RawBlob]:
+    def fg_mask(self, rgb: np.ndarray, roi_mask: np.ndarray | None = None) -> np.ndarray:
+        """Binary foreground mask (uint8 0/255) after thresholding + morphology; the HUD mask view streams this."""
+        p = self.params
         hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
-        fg = ((hsv[..., 2] > self.v_thresh) | (hsv[..., 1] > self.s_thresh)).astype(np.uint8) * 255
-        fg &= roi_mask
+        fg = ((hsv[..., 2] > p.v_min) | (hsv[..., 1] > p.s_min)).astype(np.uint8) * 255
+        if roi_mask is not None:
+            fg &= roi_mask
         k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (self.kernel, self.kernel))
         fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, k)
-        fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, k)
+        return cv2.morphologyEx(fg, cv2.MORPH_CLOSE, k)
+
+    def detect(self, rgb: np.ndarray, roi_mask: np.ndarray) -> list[RawBlob]:
+        p = self.params
+        fg = self.fg_mask(rgb, roi_mask)
         contours, _ = cv2.findContours(fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         out = []
         for c in contours:
             area = cv2.contourArea(c)
-            if not (self.min_area <= area <= self.max_area):
+            if not (p.area_min <= area <= p.area_max):
                 continue
             x, y, w, h = cv2.boundingRect(c)
             m = cv2.moments(c)

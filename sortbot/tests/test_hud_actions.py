@@ -116,6 +116,51 @@ def test_hud_actions() -> None:
         assert post("torque_on")["ok"] and get("/state")["robot"]["torque"] is True
         assert post("home")["ok"]
 
+        # --- PERCEPTION group: live detector params, redetect, mask view, zone drop points ---
+        acts = {a["name"]: a for a in get("/actions")}
+        for name, group in (("set_detector_params", "perception"), ("redetect", "perception"),
+                            ("toggle_mask", "perception"), ("set_zone_drop", "perception"),
+                            ("px_to_mm", "perception"), ("log_clear", "log")):
+            assert name in acts and acts[name]["group"] == group, (name, acts.get(name))
+            assert acts[name]["help"], f"{name} has no help text in GET /actions"
+        p0 = get("/state")["perception"]
+        assert p0["params"] == {"v_min": 70, "s_min": 90, "area_min": 300, "area_max": 60000}, p0
+        assert p0["mask"] is False and {z["name"] for z in p0["zones"]} == {"WIRES", "SENSORS", "ACTUATORS"}, p0
+        _wait(lambda: post("redetect")["ok"], what="first preview frame for redetect")
+        r = post("redetect")
+        assert r["ok"] and r["data"]["n"] == 4, r  # the 4 SimScene blobs
+        o = r["data"]["objects"][0]
+        r = post("px_to_mm", {"u": o["px"][0], "v": o["px"][1]})  # page click -> mm roundtrip
+        assert r["ok"] and abs(r["data"]["x"] - o["x_mm"]) < 2 and abs(r["data"]["y"] - o["y_mm"]) < 2, (r, o)
+        # live param change filters everything out, then back
+        assert post("set_detector_params", {"area_min": 50000})["ok"]
+        assert get("/state")["perception"]["params"]["area_min"] == 50000
+        assert post("redetect")["data"]["n"] == 0
+        assert post("set_detector_params", {"area_min": 300, "v_min": 80})["ok"]
+        assert post("redetect")["data"]["n"] == 4
+        assert not post("set_detector_params", {"v_min": 999})["ok"]
+        assert not post("set_detector_params", {"area_min": 90000})["ok"]  # would be >= area_max
+        assert not post("set_detector_params", {})["ok"]
+        import yaml as _y
+        ytext = cfg_copy.read_text()
+        y = _y.safe_load(ytext)
+        assert y["perception"] == {"v_min": 80, "s_min": 90, "area_min": 300, "area_max": 60000}, y["perception"]
+        assert "# ClassicalDetector thresholds" in ytext, "config.yaml comments were clobbered"
+        assert post("set_detector_params", {"v_min": 70})["ok"]  # back to default
+        # mask view toggles what /overhead.mjpg streams
+        assert post("toggle_mask")["ok"] and get("/state")["perception"]["mask"] is True
+        assert post("toggle_mask")["ok"] and get("/state")["perception"]["mask"] is False
+        # zone drop points: moved live + persisted (rect untouched)
+        r = post("set_zone_drop", {"name": "SENSORS", "x": 280, "y": 5})
+        assert r["ok"], r
+        z = next(z for z in get("/state")["perception"]["zones"] if z["name"] == "SENSORS")
+        assert z["drop"] == [280, 5], z
+        y = _y.safe_load(cfg_copy.read_text())
+        assert y["zones"]["SENSORS"]["drop"] == [280, 5], y["zones"]
+        assert y["zones"]["SENSORS"]["rect"] == [[150.0, 60.0], [400.0, -60.0]], y["zones"]
+        assert not post("set_zone_drop", {"name": "NOPE", "x": 280, "y": 5})["ok"]
+        assert not post("set_zone_drop", {"name": "WIRES", "x": 9999, "y": 0})["ok"]
+
         # --- run config ---
         assert post("set_task", {"text": "sort it however makes sense"})["ok"]
         assert post("set_max_steps", {"n": 30})["ok"]
@@ -278,13 +323,29 @@ def test_hud_actions() -> None:
         d = post("get_models")["data"]
         assert d["openai"][0] == "gpt-4o" and d["current"]["elevenlabs_voice"] == "v2", d
         assert get("/state")["vlm"]["model"] == "mock"  # mock vlm is connected; latency card present
+
+        # --- LOG group: ring buffer of decisions + events at GET /log, newest first ---
+        lg = get("/log")
+        assert isinstance(lg, list) and len(lg) > 5, len(lg)
+        assert all(set(e) >= {"i", "step", "t", "tool", "args", "result", "ok", "say", "latency_ms", "thumb_b64"}
+                   for e in lg), lg[0]
+        assert lg[0]["i"] > lg[-1]["i"], "log not newest-first"
+        tools = [e["tool"] for e in lg]
+        assert "set_mode" in tools and "voice" in tools and "set_zone_drop" in tools, tools
+        picks = [e for e in lg if e["tool"] == "pick"]
+        assert picks and any(e["thumb_b64"] for e in picks), "no pick decisions with overlay thumbnails"
+        assert any(e["thumb_b64"] and e["thumb_b64"].startswith("/9j/") for e in lg), "thumb is not a jpeg"
+        assert any(e["tool"] == "torque_off" and e["ok"] is False for e in lg), "E-STOP not logged as red"
+        assert any(e["tool"] == "place_in_zone" and e["ok"] for e in lg), tools
+        assert post("log_clear")["ok"]
+        assert get("/log") == []
     finally:
         session.shutdown()
         session.voice.stop()
         if session.hud is not None:
             session.hud.stop()
-    print("hud actions OK: RUN/ROBOT/VOICE/RULES/MODELS groups, E-STOP, restart, calibration, "
-          "push-to-talk transcribe + model hot-swap all over HTTP")
+    print("hud actions OK: RUN/ROBOT/PERCEPTION/VOICE/RULES/MODELS/LOG groups, E-STOP, restart, calibration, "
+          "push-to-talk transcribe, model hot-swap, live detector tuning + zone drops + /log all over HTTP")
 
 
 if __name__ == "__main__":

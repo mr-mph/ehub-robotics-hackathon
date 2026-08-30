@@ -52,6 +52,10 @@ class Config:
     calib_min_spacing_mm: float = 15.0
     tts_model: str = "eleven_turbo_v2_5"   # voice.tts_model
     stt_model: str = "scribe_v2"           # voice.stt_model
+    det_v_min: int = 70                    # perception.v_min: foreground if HSV V > v_min ...
+    det_s_min: int = 90                    # perception.s_min: ... or S > s_min
+    det_area_min: int = 300                # perception.area_min (px^2)
+    det_area_max: int = 60000              # perception.area_max (px^2)
     source_path: Path = DEFAULT_YAML       # yaml file this config was loaded from (set_model persists here)
     raw: dict = field(default_factory=dict, repr=False)
 
@@ -99,6 +103,10 @@ def load(path: str | Path = DEFAULT_YAML) -> Config:
         calib_min_spacing_mm=float(cal.get("min_sample_spacing_mm", 15.0)),
         tts_model=str(raw["voice"].get("tts_model", Config.tts_model)),
         stt_model=str(raw["voice"].get("stt_model", Config.stt_model)),
+        det_v_min=int((raw.get("perception") or {}).get("v_min", Config.det_v_min)),
+        det_s_min=int((raw.get("perception") or {}).get("s_min", Config.det_s_min)),
+        det_area_min=int((raw.get("perception") or {}).get("area_min", Config.det_area_min)),
+        det_area_max=int((raw.get("perception") or {}).get("area_max", Config.det_area_max)),
         source_path=Path(path),
         raw=raw,
     )

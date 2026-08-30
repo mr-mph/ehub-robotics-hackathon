@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import collections
 import io
 import logging
 import tempfile
@@ -162,6 +163,45 @@ def png(rgb: np.ndarray) -> bytes:
     return buf.tobytes()
 
 
+class DecisionLog:
+    """Ring buffer (last 200) of decisions/events for the HUD LOG tab, served newest-first at GET /log.
+    Entries: {i, step, t, tool, args, result, ok, say, latency_ms, thumb_b64 (160px overlay jpeg)}."""
+
+    def __init__(self, maxlen: int = 200):
+        self._d: collections.deque = collections.deque(maxlen=maxlen)
+        self._lock = threading.Lock()
+        self._n = 0
+
+    def add(self, tool: str, args: dict, result: str, ok: bool = True, step: int = 0, say: str = "",
+            latency_ms: int | None = None, frame: np.ndarray | None = None) -> None:
+        thumb = None
+        if frame is not None:
+            try:
+                h, w = frame.shape[:2]
+                small = cv2.resize(frame, (160, max(1, round(h * 160 / w))), interpolation=cv2.INTER_AREA)
+                okj, buf = cv2.imencode(".jpg", cv2.cvtColor(small, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 70])
+                if okj:
+                    thumb = base64.b64encode(buf).decode()
+            except Exception as e:  # noqa: BLE001
+                log.debug("log thumb: %s", e)
+        with self._lock:
+            self._n += 1
+            self._d.append({"i": self._n, "step": int(step), "t": round(time.time(), 2), "tool": tool,
+                            "args": args, "result": result, "ok": bool(ok), "say": say,
+                            "latency_ms": latency_ms, "thumb_b64": thumb})
+
+    def entries(self) -> list[dict]:
+        """Newest first."""
+        with self._lock:
+            return list(self._d)[::-1]
+
+    def clear(self) -> int:
+        with self._lock:
+            n = len(self._d)
+            self._d.clear()
+            return n
+
+
 class Loop:
     def __init__(self, cfg, robot, vlm, voice, hud, homography, rules: RulesStore, max_steps: int,
                  task: str = "", ctl: Control | None = None, lock: threading.RLock | None = None,
@@ -182,6 +222,11 @@ class Loop:
         self._calib_requested = threading.Event()
         self.last_overhead: np.ndarray | None = None
         self.frame_sink = None  # optional callable(overhead) so the Session sees the latest raw frame
+        self.detector = None    # shared perception.ClassicalDetector (Session-tuned); default per detect_objects
+        self.dlog: DecisionLog | None = None
+        self.view = None        # optional callable(overlay, raw) -> frame shown on /overhead.mjpg (mask view)
+        self._overlay: np.ndarray | None = None  # overlay at decision time (log thumbnails)
+        self._t0: float | None = None
 
     # ---- voice ----
     def drain_voice(self) -> bool:
@@ -213,6 +258,11 @@ class Loop:
     def record(self, tool: str, args: dict, r: ExecResult) -> None:
         self.history.append({"tool": tool, "args": args, "result": ("ok: " if r.ok else "FAILED: ") + r.message})
         log.info("%s(%s) -> %s", tool, args, self.history[-1]["result"])
+        if self.dlog is not None:
+            self.dlog.add(tool, args, self.history[-1]["result"], ok=r.ok, step=self.step,
+                          say=self.last_say if tool == "say" else "",
+                          latency_ms=int((time.time() - self._t0) * 1000) if self._t0 else None,
+                          frame=self._overlay)
 
     # ---- validate + execute ----
     def validate(self, cmd: Command, world: WorldState) -> str | None:
@@ -318,6 +368,7 @@ class Loop:
             self.step += 1
             step = self.step
             t0 = time.time()
+            self._t0 = t0
             self._maybe_calibrate()
             with self.lock:
                 hr = self.robot.home()
@@ -335,19 +386,24 @@ class Loop:
                 self.hud_update(overhead, wrist, step, t0, "no homography - calibrate")
                 time.sleep(0.5)
                 continue
-            objects = perception.detect_objects(overhead, H, self.cfg, filled_zones=sorted(self.filled), method=self.homog.method)
+            objects = perception.detect_objects(overhead, H, self.cfg, detector=self.detector,
+                                                filled_zones=sorted(self.filled), method=self.homog.method)
             rules = ([f"GOAL: {self.task}"] if self.task else []) + self.rules.list() + self.hints
             if self.holding_obj is not None:
                 o = self.holding_obj
                 rules = rules + [f"holding: the {o.color_hint} object picked from ({o.centroid_mm[0]:.0f},{o.centroid_mm[1]:.0f}); object ids below are renumbered"]
             world = WorldState(objects, self.cfg.zones, self.robot.get_ee_pose(), self.robot.gripper_open, self.holding, rules)
             overlay = perception.render_overlay(overhead, H, objects, self.cfg.zones, world.ee_pose, rules)
+            self._overlay = overlay
             self.hud_update(overlay, wrist, step, t0, "planning")
             try:
                 cmd = self.vlm.plan_step(png(overlay), png(wrist), world, self.history)
             except Exception as e:  # noqa: BLE001
                 log.error("VLM failed: %s", e)
                 self.history.append({"tool": "vlm", "args": {}, "result": f"error {e}"})
+                if self.dlog is not None:
+                    self.dlog.add("vlm", {}, f"error {e}", ok=False, step=step, frame=overlay,
+                                  latency_ms=int((time.time() - t0) * 1000))
                 continue
             err = self.validate(cmd, world)
             if err:
@@ -373,6 +429,8 @@ class Loop:
     def hud_update(self, overlay, wrist, step, t0, status) -> None:
         if self.hud is None:
             return
+        if self.view is not None:
+            overlay = self.view(overlay, self.last_overhead)
         self.hud.update(overlay, wrist, dict(
             step=step, status=status, ee_pose=self.robot.get_ee_pose(), holding=self.holding,
             gripper_open=self.robot.gripper_open, last_call=self.history[-1] if self.history else None,
@@ -405,6 +463,11 @@ class Session:
         self._robot_cache: dict = {}
         self.calib, self._calib_out = None, None
         self.models = ModelRegistry()
+        self.det_params = perception.DetectorParams(cfg.det_v_min, cfg.det_s_min, cfg.det_area_min, cfg.det_area_max)
+        self.detector = perception.ClassicalDetector(self.det_params)  # shared: loop + redetect + mask view
+        self.mask_view = False
+        self.dlog = DecisionLog()
+        self._overlay_hold: tuple[float, np.ndarray] | None = None  # (until_ts, overlay) shown while idle after redetect
         self.last_overhead: np.ndarray | None = None
         self._shutdown = threading.Event()
         self._register()
@@ -438,9 +501,9 @@ class Session:
                    help="Push-to-talk: POST base64 audio (webm/opus and friends); ElevenLabs STT transcribes it and the text goes through say_to_bot.")
         h.register("speak", self.speak, "Speak (TTS test)", "voice",
                    help="Say the text aloud via ElevenLabs TTS with the current voice/model (plays on the server machine).")
-        h.register("mic_on", lambda: {"ok": True, "message": self.voice.mic_on()}, "Listening ON", "voice",
+        h.register("mic_on", lambda: self._voice_event("mic_on", self.voice.mic_on()), "Listening ON", "voice",
                    help="Start hands-free listening: the mic transcribes continuously until toggled off. A MIC LIVE chip shows while on.")
-        h.register("mic_off", lambda: {"ok": True, "message": self.voice.mic_off()}, "Listening OFF", "voice",
+        h.register("mic_off", lambda: self._voice_event("mic_off", self.voice.mic_off()), "Listening OFF", "voice",
                    help="Stop hands-free listening. Push-to-talk and the text box keep working.")
         h.register("add_rule", self.add_rule, "Add rule", "rules",
                    help="Append a persistent rule; rules ride along with every VLM prompt and survive restarts.")
@@ -454,11 +517,25 @@ class Session:
                    help="List selectable OpenAI / ElevenLabs models and voices (OpenAI listing cached 5 min).")
         h.register("set_model", self.set_model, None, "models",
                    help="Hot-swap a model (provider: openai|elevenlabs_tts|elevenlabs_stt|elevenlabs_voice) on the live clients and persist it to config.yaml.")
+        h.register("set_detector_params", self.set_detector_params, None, "perception",
+                   help="Tune the blob detector live (v_min/s_min HSV foreground thresholds, area_min/area_max px^2); persists to config.yaml perception:. Driven by the sliders.")
+        h.register("redetect", self.redetect, "Redetect", "perception", params=[],
+                   help="Re-run detection on the latest overhead frame and refresh the overlay, without a robot step.")
+        h.register("toggle_mask", self.toggle_mask, "Toggle mask view", "perception", params=[],
+                   help="Stream the detector's binary foreground mask on /overhead.mjpg instead of the overlay (toggle back for the overlay).")
+        h.register("set_zone_drop", self.set_zone_drop, "Set zone drop", "perception",
+                   help="Move a zone's drop point to table-frame (x, y) mm and persist it to config.yaml zones; or use 'set drop' + click on the overhead image.")
+        h.register("px_to_mm", self.px_to_mm, None, "perception",
+                   help="Convert an overhead pixel (u, v) to table-frame mm via the current homography (used by the click-to-set-drop mode).")
+        h.register("log_clear", self.log_clear, "Clear log", "log", params=[],
+                   help="Empty the decision log (ring buffer of the last 200 decisions/events, served at GET /log).")
         h.add_state_source("run", self._run_state)
         h.add_state_source("robot", self._robot_state)
         h.add_state_source("voice", self._voice_state)
         h.add_state_source("rules", self._rules_state)
         h.add_state_source("vlm", self._vlm_state)
+        h.add_state_source("perception", self._perception_state)
+        h.add_route("/log", self.dlog.entries)
         self._register_calib_placeholders()
 
     def _register_calib_placeholders(self) -> None:
@@ -499,6 +576,9 @@ class Session:
         if errs:
             self.last_error = "; ".join(errs)
         msg = "; ".join(done + [f"ERROR {e}" for e in errs]) or "nothing changed"
+        if done or errs:
+            self.dlog.add("set_mode", {k: v for k, v in (("robot", robot), ("cams", cams), ("vlm", vlm)) if v is not None},
+                          msg, ok=not errs, step=self.loop.step if self.loop is not None else 0)
         return {"ok": not errs, "message": msg, "data": {"mode": self.mode, "connected": self._connected()}}
 
     def _set_robot(self, v: str) -> None:
@@ -635,6 +715,7 @@ class Session:
                          self.max_steps, task=self.task, ctl=self.ctl, lock=self.robot_lock, step_delay_s=delay)
         self.loop.calib, self.loop._calib_out = self.calib, self._calib_out
         self.loop.frame_sink = lambda f: setattr(self, "last_overhead", f)
+        self.loop.detector, self.loop.dlog, self.loop.view = self.detector, self.dlog, self._overhead_view
         self.result = ""
         self.thread = threading.Thread(target=self._run_loop, daemon=True, name="sortbot-loop")
         self.thread.start()
@@ -706,10 +787,14 @@ class Session:
         it = classify(text)
         if it.kind == "rule" and not self._running():
             self.rules.append(it.text)  # nothing drains the queue while idle; persist now so the page shows it
+            self.dlog.add("voice", {"text": text}, f"rule added: {it.text}",
+                          step=self.loop.step if self.loop is not None else 0)
             return {"ok": True, "message": f"rule added: {it.text}", "data": {"kind": "rule"}}
         self.voice.push(text)
         kind = {"rule": "rule", "action": "command", "unknown": "hint"}[it.kind]
         when = "" if self._running() else " (queued until the next run)"
+        self.dlog.add("voice", {"text": text}, f"heard as {kind}: {it.text}{when}",
+                      step=self.loop.step if self.loop is not None else 0)
         return {"ok": True, "message": f"heard as {kind}: {it.text}{when}", "data": {"kind": it.kind}}
 
     def transcribe(self, audio_b64: str, mime: str = "audio/webm") -> dict:
@@ -803,6 +888,129 @@ class Session:
         return {"ok": True, "message": f"{provider} = {value} (live; {persisted})",
                 "data": {"current": self._model_current()}}
 
+    # ------------------------------------------------ PERCEPTION + LOG actions
+    def _current_H(self) -> np.ndarray | None:
+        """Homography for the latest overhead frame: the sim scene's fixed H, or the real TableHomography."""
+        if isinstance(self.rig, SimScene):
+            return self.rig.H
+        if self.last_overhead is None:
+            return None
+        if self.homog_real is None:
+            self.homog_real = Homography(self.cfg)
+        return self.homog_real.update(self.last_overhead)
+
+    def _homog_method(self) -> str:
+        if isinstance(self.rig, SimScene) or self.homog_real is None:
+            return "ball"
+        return self.homog_real.method
+
+    def set_detector_params(self, v_min=None, s_min=None, area_min=None, area_max=None) -> dict:
+        """Any subset; applied to the shared DetectorParams (live) and persisted under config.yaml perception:."""
+        p, sets = self.det_params, {}
+        for k, v, lo, hi in (("v_min", v_min, 0, 255), ("s_min", s_min, 0, 255),
+                             ("area_min", area_min, 0, 10**7), ("area_max", area_max, 1, 10**7)):
+            if v is None:
+                continue
+            v = int(float(v))
+            if not (lo <= v <= hi):
+                return {"ok": False, "message": f"{k}={v} out of range [{lo}, {hi}]", "data": {"params": p.to_dict()}}
+            sets[k] = v
+        if not sets:
+            return {"ok": False, "message": "nothing to set (v_min, s_min, area_min, area_max)", "data": {"params": p.to_dict()}}
+        trial = {**p.to_dict(), **sets}
+        if trial["area_min"] >= trial["area_max"]:
+            return {"ok": False, "message": f"area_min {trial['area_min']} must be < area_max {trial['area_max']}",
+                    "data": {"params": p.to_dict()}}
+        for k, v in sets.items():
+            setattr(p, k, v)
+            setattr(self.cfg, f"det_{k}", v)
+        try:
+            for k, v in sets.items():
+                yaml_set(self.cfg.source_path, "perception", k, str(v))
+            persisted = f"persisted to {self.cfg.source_path.name}"
+        except Exception as e:  # noqa: BLE001
+            persisted = f"NOT persisted: {e}"
+        return {"ok": True, "message": ", ".join(f"{k}={v}" for k, v in sets.items()) + f" (live; {persisted})",
+                "data": {"params": p.to_dict()}}
+
+    def redetect(self) -> dict:
+        """Detection + overlay on the latest overhead frame, no robot step (idle: shown for a few seconds)."""
+        frame = self.last_overhead
+        if frame is None:
+            return {"ok": False, "message": "no overhead frame yet (connect cameras with set_mode)", "data": None}
+        H = self._current_H()
+        if H is None:
+            return {"ok": False, "message": "no homography (run calibration / show the ArUco tags)", "data": None}
+        filled = sorted(self.loop.filled) if self.loop is not None else []
+        objs = perception.detect_objects(frame, H, self.cfg, detector=self.detector,
+                                         filled_zones=filled, method=self._homog_method())
+        overlay = perception.render_overlay(frame, H, objs, self.cfg.zones, None, self.rules.list())
+        self._overlay_hold = (time.time() + 5.0, overlay)
+        if self.hud is not None and not self._running():
+            self.hud.update(self._overhead_view(overlay, frame), None, {})
+        data = {"n": len(objs),
+                "objects": [{"id": o.id, "x_mm": round(o.centroid_mm[0], 1), "y_mm": round(o.centroid_mm[1], 1),
+                             "px": [int(round(c)) for c in perception.mm_to_px(H, [o.centroid_mm])[0]],
+                             "area_px": o.area_px, "color": o.color_hint} for o in objs]}
+        return {"ok": True, "message": f"{len(objs)} object(s) detected", "data": data}
+
+    def toggle_mask(self) -> dict:
+        self.mask_view = not self.mask_view
+        return {"ok": True, "message": "mask view ON (binary detector mask on /overhead.mjpg)" if self.mask_view
+                else "mask view off (overlay)", "data": {"mask": self.mask_view}}
+
+    def _overhead_view(self, overlay: np.ndarray, raw: np.ndarray | None) -> np.ndarray:
+        """What /overhead.mjpg shows: the overlay, or the detector's binary mask while toggle_mask is on."""
+        if not self.mask_view or raw is None:
+            return overlay
+        m = cv2.cvtColor(self.detector.fg_mask(raw), cv2.COLOR_GRAY2RGB)
+        p = self.det_params
+        cv2.putText(m, f"MASK  v>{p.v_min} | s>{p.s_min}   area {p.area_min}-{p.area_max}", (6, 18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
+        return m
+
+    def set_zone_drop(self, name: str, x: float, y: float) -> dict:
+        """Move a zone's drop point (table mm); persists into config.yaml zones (rect kept as is)."""
+        z = self.cfg.zone(str(name))
+        if z is None:
+            return {"ok": False, "message": f"unknown zone {name!r}; zones: {[q.name for q in self.cfg.zones]}", "data": None}
+        x, y = round(float(x), 1), round(float(y), 1)
+        lo, hi = self.cfg.aabb_min_mm, self.cfg.aabb_max_mm
+        if not (lo[0] <= x <= hi[0] and lo[1] <= y <= hi[1]):
+            return {"ok": False, "message": f"({x}, {y}) outside workspace x[{lo[0]},{hi[0]}] y[{lo[1]},{hi[1]}]", "data": None}
+        z.drop_point_mm = (x, y)
+        warn = "" if z.contains(x, y) else " (note: outside the zone rectangle)"
+        (x0, y0), (x1, y1) = z.polygon_mm[0], z.polygon_mm[2]
+        try:
+            yaml_set(self.cfg.source_path, "zones", z.name,
+                     f"{{rect: [[{x0}, {y0}], [{x1}, {y1}]], drop: [{x}, {y}]}}")
+            persisted = f"persisted to {self.cfg.source_path.name}"
+        except Exception as e:  # noqa: BLE001
+            persisted = f"NOT persisted: {e}"
+        self.dlog.add("set_zone_drop", {"name": z.name, "x": x, "y": y}, f"drop moved{warn}; {persisted}",
+                      step=self.loop.step if self.loop is not None else 0)
+        if not self._running():
+            self.redetect()  # re-render the overlay with the new drop marker
+        return {"ok": True, "message": f"{z.name} drop -> ({x}, {y}){warn}; {persisted}",
+                "data": {"zones": self._perception_state()["zones"]}}
+
+    def px_to_mm(self, u: float, v: float) -> dict:
+        H = self._current_H()
+        if H is None:
+            return {"ok": False, "message": "no homography (connect cameras / calibrate first)", "data": None}
+        x, y = perception.px_to_mm(H, [(float(u), float(v))])[0]
+        return {"ok": True, "message": f"({u}, {v}) px -> ({x:.1f}, {y:.1f}) mm",
+                "data": {"x": round(float(x), 1), "y": round(float(y), 1)}}
+
+    def log_clear(self) -> dict:
+        n = self.dlog.clear()
+        return {"ok": True, "message": f"cleared {n} log entries", "data": None}
+
+    def _perception_state(self) -> dict:
+        return {"params": self.det_params.to_dict(), "mask": self.mask_view,
+                "zones": [{"name": z.name, "drop": [z.drop_point_mm[0], z.drop_point_mm[1]],
+                           "rect": [list(z.polygon_mm[0]), list(z.polygon_mm[2])]} for z in self.cfg.zones]}
+
     # ------------------------------------------------ ROBOT actions
     def _robot_act(self, fn, allow_while_running: bool = False) -> dict:
         if self.robot is None:
@@ -853,10 +1061,19 @@ class Session:
         finally:
             if got:
                 self.robot_lock.release()
+        self.dlog.add("torque_off", {}, "TORQUE OFF (E-STOP); loop paused", ok=False,  # ok=False -> red in the log
+                      step=self.loop.step if self.loop is not None else 0)
         return {"ok": True, "message": "TORQUE OFF (E-STOP); loop paused", "data": None}
 
     def torque_on(self) -> dict:
-        return self._robot_act(lambda r: r.torque_on())
+        r = self._robot_act(lambda r: r.torque_on())
+        if r["ok"]:
+            self.dlog.add("torque_on", {}, "torque on", step=self.loop.step if self.loop is not None else 0)
+        return r
+
+    def _voice_event(self, tool: str, msg: str) -> dict:
+        self.dlog.add(tool, {}, msg, step=self.loop.step if self.loop is not None else 0)
+        return {"ok": True, "message": msg}
 
     # ------------------------------------------------ state
     def _run_state(self) -> dict:
@@ -909,7 +1126,9 @@ class Session:
                 if self.hud is not None and not busy and self.rig is not None:
                     ov, wr = self.rig.capture("overhead"), self.rig.capture("wrist")
                     self.last_overhead = ov
-                    self.hud.update(ov, wr, {})
+                    hold = self._overlay_hold
+                    show = hold[1] if hold is not None and time.time() < hold[0] else ov
+                    self.hud.update(self._overhead_view(show, ov), wr, {})
             except Exception as e:  # noqa: BLE001
                 log.debug("preview: %s", e)
             time.sleep(0.4)

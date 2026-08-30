@@ -155,10 +155,12 @@ class Overlay:
             layer, mask = self._static(img.shape[:2], homography, calib_region_px, calib_samples_px)
             layer, mask = layer.copy(), mask.copy()
         img[mask] = layer[mask]
-        if ee_pose is not None:  # the ONLY per-frame element
+        if ee_pose is not None:  # the ONLY per-frame element: a mark, not a caption
             ex, ey = mm_to_px(homography, [(ee_pose.x, ee_pose.y)])[0].astype(int)
             cv2.drawMarker(img, (ex, ey), _BGR["ee"], cv2.MARKER_CROSS, 24, 2)
-            _put(img, f"EE z={ee_pose.z / 10.0:.1f}cm", (ex + 12, ey - 8), _BGR["ee"], 0.45)  # mm -> cm
+            # No caption. The gripper's x, y and z are NUMBERS, and numbers go to the model as text
+            # (vlm._state_text's "EE pose (table cm)" line) -- printing the height beside the cross only
+            # covered up the table next to the gripper, which is exactly where the object being picked is.
         return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 

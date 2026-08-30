@@ -162,8 +162,9 @@ def _state_text(world: WorldState, history: list, workspace_mm=None, grid_cm: fl
     # What the overlay MEANS is prose, so it is said here instead of being painted over the photo:
     # nothing is written on the image except the grid, its cm tick labels and the spatial markers.
     lines = [f"OVERLAY KEY: grid lines every {grid_cm:g} cm, each labelled in cm at both ends (x.. forward, "
-             f"y.. left); magenta cross = the gripper; thin outline = the calibrated camera area and a "
-             f"dimmed grid outside it means positions read there are unreliable.",
+             f"y.. left); magenta cross = where the gripper is (its exact x, y and z are the EE pose "
+             f"line below -- they are NOT written on the image); thin outline = the calibrated camera "
+             f"area, and a dimmed grid outside it means positions read there are unreliable.",
              f"EE pose (table cm): x={p.x / 10:.1f} y={p.y / 10:.1f} z={p.z / 10:.1f} roll={p.roll_deg:.0f}deg",
              f"table z=0  gripper_open={world.gripper_open}  holding={world.holding or 'nothing'}",
              f"REACHABLE AREA (cm): x {lo[0] / 10:g}..{hi[0] / 10:g}, y {lo[1] / 10:g}..{hi[1] / 10:g}"]
@@ -342,13 +343,17 @@ def _selftest() -> None:
                                           "move_to", "turn_to", "turn_by", "say", "done"}, [t["name"] for t in TOOLS]
     for gone in ("pick", "place_in_zone"):
         assert not any(t["name"] == gone for t in TOOLS), f"{gone} must be gone"
+    import inspect as _i
+
+    import sortbot.perception as _pc
     st = _state_text(world, hist)
     assert "RULES" in st and "put red things" in st
     # the overlay legend is TEXT now, not pixels (sortbot.perception draws no legend/rules block)
     assert "OVERLAY KEY" in st and "grid lines every 5 cm" in st, st
+    # the gripper pose is text, never a caption on the photo
+    assert "EE pose (table cm): x=" in st and "NOT written on the image" in st, st
+    assert "EE z=" not in _i.getsource(_pc.Overlay.render), "the EE pose is still labelled on the overlay"
     assert "written on the photos" in SYSTEM_PROMPT
-    import sortbot.perception as _pc
-    import inspect as _i
     src = _i.getsource(_pc.Overlay._static)
     assert "rule: " not in src and '_BGR["text"]' not in src, "the overlay still paints the rules on the frame"
     assert "cm" in st and "zone" not in st.lower(), st  # coordinates only; zones are gone

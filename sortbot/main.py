@@ -441,10 +441,12 @@ class Loop:
             self.record(cmd.tool, dict(cmd.args), res)
             self.hud_update(overlay, wrist, step, t0, f"{cmd.tool} -> {res.message}")
             if cmd.tool == "done":
-                return f"done: {res.message}"
+                log.info("VLM called done() at step %d: %s", step, res.message)
+                return f"done (the model decided it had finished): {res.message}"
             if self.step_delay_s:
                 time.sleep(self.step_delay_s)
-        return f"max_steps {self.max_steps} reached"
+        return (f"stopped: step budget reached ({self.max_steps} steps). Nothing failed — "
+                f"raise Max steps in the Run tab and press Start to continue.")
 
     def hud_update(self, overlay, wrist, step, t0, status) -> None:
         if self.hud is None:
@@ -552,7 +554,7 @@ class Session:
     JOG_AXES = ("x", "y", "z", "roll")
 
     def __init__(self, cfg: cfgmod.Config, hud, voice: VoiceIO, rules: RulesStore,
-                 max_steps: int = 40, step_delay_s: float = 0.0, factories: dict | None = None):
+                 max_steps: int = 200, step_delay_s: float = 0.0, factories: dict | None = None):
         self.cfg, self.hud, self.voice, self.rules = cfg, hud, voice, rules
         self.factories = {**DEFAULT_FACTORIES, **(factories or {})}
         self.robot = None          # SO101Robot (RobotAPI)
@@ -1211,7 +1213,7 @@ def serve(args, factories: dict | None = None) -> Session:
 
 def main(argv=None) -> str:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--max-steps", type=int, default=40)
+    ap.add_argument("--max-steps", type=int, default=200)
     ap.add_argument("--no-voice", action="store_true", help="do not read stdin for corrections")
     ap.add_argument("--hud-port", type=int, default=0, help="0 = the port from config.yaml (default 8765)")
     ap.add_argument("--rules-file", default=None)

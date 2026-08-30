@@ -147,7 +147,7 @@ class VoiceIO:
         self.mode = "text"  # mic NEVER auto-starts; toggle with mic_on()/mic_off()
         self._mic_ok = bool(self._client and shutil.which("ffmpeg") and sys.platform == "darwin")
         self._mic_thread = None
-        self._player = next((p for p in ("afplay", "ffplay") if shutil.which(p)), None)
+        self._player = next((p for p in ("ffplay", "afplay") if shutil.which(p)), None)
         # ONE speech worker: synth + playback are serialized so the bot never talks over itself,
         # and the sorting loop never blocks on the TTS network call. Backlog is capped: stale
         # lines are dropped rather than droning on long after the moment has passed.
@@ -285,23 +285,37 @@ class VoiceIO:
             except queue.Empty:
                 continue
             try:
-                audio = b"".join(self._client.text_to_speech.convert(
-                    self.voice_id, text=text, model_id=self.tts_model, output_format="mp3_22050_32"))
+                # stream: first audio chunk plays while the rest is still being synthesized
+                chunks = self._client.text_to_speech.stream(
+                    self.voice_id, text=text, model_id=self.tts_model, output_format="mp3_22050_32")
             except Exception as e:  # noqa: BLE001
                 log.warning("TTS failed: %s", e)
                 continue
-            self._play(audio)  # blocking on purpose: one utterance at a time, never talking over itself
+            self._play(chunks)  # blocking on purpose: one utterance at a time, never talking over itself
 
-    def _play(self, audio: bytes) -> None:
+    def _play(self, audio) -> None:
+        """audio: bytes or an iterator of byte chunks. ffplay streams (starts on chunk 1); afplay
+        needs a complete file, so an iterator is buffered first."""
         try:
             if self._player == "ffplay":
-                subprocess.run(["ffplay", "-autoexit", "-nodisp", "-loglevel", "quiet", "-"],
-                               input=audio, capture_output=True, timeout=60)
-            else:
-                with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
-                    f.write(audio)
-                subprocess.run(["afplay", f.name], capture_output=True, timeout=60)
-                Path(f.name).unlink(missing_ok=True)
+                proc = subprocess.Popen(["ffplay", "-autoexit", "-nodisp", "-loglevel", "quiet", "-"],
+                                        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL)
+                try:
+                    for chunk in ([audio] if isinstance(audio, bytes) else audio):
+                        if self._stop.is_set():
+                            break
+                        proc.stdin.write(chunk)
+                    proc.stdin.close()
+                except (BrokenPipeError, OSError):
+                    pass
+                proc.wait(timeout=60)
+                return
+            data = audio if isinstance(audio, bytes) else b"".join(audio)
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+                f.write(data)
+            subprocess.run(["afplay", f.name], capture_output=True, timeout=60)
+            Path(f.name).unlink(missing_ok=True)
         except Exception as e:  # noqa: BLE001
             log.warning("playback failed: %s", e)
 

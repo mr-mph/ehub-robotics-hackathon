@@ -115,7 +115,7 @@ def load(path: str | Path = DEFAULT_YAML) -> Config:
 if __name__ == "__main__":
     cfg = load()
     assert cfg.urdf.exists(), cfg.urdf
-    assert cfg.zone("wires") and cfg.zone("WIRES").contains(*cfg.zone("WIRES").drop_point_mm)
+    assert cfg.zone("left") and cfg.zone("LEFT").contains(*cfg.zone("LEFT").drop_point_mm)
     assert cfg.calib_mode in ("ball", "aruco", "auto") and cfg.leader_port
     print(cfg)
     print("selftest OK")

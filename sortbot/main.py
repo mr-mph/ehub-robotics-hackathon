@@ -190,7 +190,7 @@ class Loop:
                 w = it.text.split()[0]
                 if w in ("stop", "halt", "freeze"):
                     return False
-                # only short bare commands act immediately; "drop the red one in WIRES" is a hint for the VLM
+                # only short bare commands act immediately; "drop the red one in LEFT" is a hint for the VLM
                 bare = len(it.text.split()) <= 2
                 if bare and w in ("open", "release", "drop", "let"):
                     self.record("open", {}, self.robot.open_gripper())

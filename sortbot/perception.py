@@ -260,12 +260,12 @@ def _selftest(out_png: Path) -> None:
     assert [o.id for o in objs] == list(range(1, len(objs) + 1))
     assert {o.color_hint for o in objs} == {"red", "green", "yellow", "white"}, [o.color_hint for o in objs]
 
-    filled = detect_objects(img, H, cfg, filled_zones=["SENSORS"])
-    assert len(filled) == 3, filled  # the green one at (300,0) is inside SENSORS
+    filled = detect_objects(img, H, cfg, filled_zones=["MIDDLE"])
+    assert len(filled) == 3, filled  # the green one at (300,0) is inside MIDDLE
     ball = detect_objects(img, H, cfg, method="ball")  # no tag masking: the 4 white tag squares become objects
     assert len(ball) == len(truth) + 4, [o.centroid_mm for o in ball]
 
-    ov = render_overlay(img, H, objs, cfg.zones, Pose(*cfg.home.__dict__.values()), ["put white things in WIRES"])
+    ov = render_overlay(img, H, objs, cfg.zones, Pose(*cfg.home.__dict__.values()), ["put white things in LEFT"])
     out_png.parent.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(out_png), cv2.cvtColor(ov, cv2.COLOR_RGB2BGR))
     print(f"detected {len(objs)}: " + ", ".join(f"#{o.id} {o.color_hint} @({o.centroid_mm[0]:.1f},{o.centroid_mm[1]:.1f})" for o in objs))

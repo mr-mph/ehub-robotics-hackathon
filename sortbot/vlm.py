@@ -57,8 +57,9 @@ def estimate_cost_usd(model: str, input_tokens: int, output_tokens: int) -> floa
 SYSTEM_PROMPT = """You are the planner for a small tabletop robot arm that sorts objects into zones.
 Each step you see an overhead photo with numbered candidate objects (and zone outlines) and a wrist-camera photo,
 plus a text state block. Decide the single best next action and call exactly one tool.
-Policy: sort however makes sense — group similar objects (by type, colour, size) into the named zones; if a zone name
-obviously matches an object (e.g. wires -> WIRES) use it. Pick only objects that are not already in a sensible zone.
+Policy: sort the items on the table into the zones. Follow the human's GOAL and RULES exactly when given;
+if no task is given, group similar items sensibly (by type, colour, size), one group per zone; if a zone name
+obviously matches an object, use it. Pick only objects that are not already in a sensible zone.
 If holding an object, place it. When everything is sorted, call done.
 Use say() sparingly: only for genuine ambiguity, a question to the human, or a final summary.
 RULES from the human override everything else and must always be respected.
@@ -147,9 +148,9 @@ def _demo_world() -> WorldState:
     from sortbot import config
     cfg = config.load()
     return WorldState(
-        objects=[DetectedObject(1, (250.0, 120.0), (40, 60, 100, 120), 3600, "red", "wire"),
-                 DetectedObject(2, (300.0, -50.0), (200, 100, 260, 160), 3600, "blue", "sensor")],
-        zones=cfg.zones, ee_pose=cfg.home, rules=["put red things in WIRES"])
+        objects=[DetectedObject(1, (250.0, 120.0), (40, 60, 100, 120), 3600, "red", "block"),
+                 DetectedObject(2, (300.0, -50.0), (200, 100, 260, 160), 3600, "blue", "ball")],
+        zones=cfg.zones, ee_pose=cfg.home, rules=["put red things in LEFT"])
 
 
 def _selftest() -> None:

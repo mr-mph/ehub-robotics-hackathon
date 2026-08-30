@@ -1,6 +1,7 @@
 # sortbot
 
-VLM-driven pick-and-sort on an SO101 arm: sort parts into WIRES / SENSORS / ACTUATORS zones.
+VLM-driven pick-and-sort on an SO101 arm: sort the things on the table into the LEFT / MIDDLE / RIGHT zones.
+The app is task-agnostic — your spoken task and RULES say what goes where; with no task it groups similar items sensibly.
 
 ## Architecture
 

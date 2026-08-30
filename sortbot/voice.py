@@ -292,13 +292,13 @@ def _selftest() -> None:
     rules = RulesStore(tmp)
     assert rules.list() == []
 
-    fake_stdin = io.StringIO("put the red wires with the black ones\nstop\nscrews go in the left bin\n\n")
+    fake_stdin = io.StringIO("put the red pieces with the black ones\nstop\nscrews go in the left bin\n\n")
     v = VoiceIO(stdin=fake_stdin, force_text=True)
     assert v.mode == "text"
     v.start()
     time.sleep(0.3)
     cmds = v.drain()
-    assert cmds == ["put the red wires with the black ones", "stop", "screws go in the left bin"], cmds
+    assert cmds == ["put the red pieces with the black ones", "stop", "screws go in the left bin"], cmds
     assert v.drain() == []
     for c in cmds:
         i = classify(c)
@@ -307,7 +307,7 @@ def _selftest() -> None:
     kinds = [classify(c).kind for c in cmds]
     assert kinds == ["rule", "action", "rule"], kinds
     assert classify("that's wrong, open the gripper").kind == "action"
-    assert classify("resistors on the left").kind == "rule"
+    assert classify("round things on the left").kind == "rule"
     assert classify("hello there").kind == "unknown"
     assert RulesStore(tmp).list() == rules.list() == cmds[0::2]
     rules.append(cmds[0])  # dedupe

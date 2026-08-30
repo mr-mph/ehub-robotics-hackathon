@@ -137,7 +137,7 @@ def test_hud_actions() -> None:
             assert acts[name]["help"], f"{name} has no help text in GET /actions"
         p0 = get("/state")["perception"]
         assert p0["params"] == {"v_min": 70, "s_min": 90, "area_min": 300, "area_max": 60000}, p0
-        assert p0["mask"] is False and {z["name"] for z in p0["zones"]} == {"WIRES", "SENSORS", "ACTUATORS"}, p0
+        assert p0["mask"] is False and {z["name"] for z in p0["zones"]} == {"LEFT", "MIDDLE", "RIGHT"}, p0
         _wait(lambda: post("redetect")["ok"], what="first preview frame for redetect")
         r = post("redetect")
         assert r["ok"] and r["data"]["n"] == 4, r  # the 4 SimScene blobs
@@ -163,15 +163,15 @@ def test_hud_actions() -> None:
         assert post("toggle_mask")["ok"] and get("/state")["perception"]["mask"] is True
         assert post("toggle_mask")["ok"] and get("/state")["perception"]["mask"] is False
         # zone drop points: moved live + persisted (rect untouched)
-        r = post("set_zone_drop", {"name": "SENSORS", "x": 280, "y": 5})
+        r = post("set_zone_drop", {"name": "MIDDLE", "x": 280, "y": 5})
         assert r["ok"], r
-        z = next(z for z in get("/state")["perception"]["zones"] if z["name"] == "SENSORS")
+        z = next(z for z in get("/state")["perception"]["zones"] if z["name"] == "MIDDLE")
         assert z["drop"] == [280, 5], z
         y = _y.safe_load(cfg_copy.read_text())
-        assert y["zones"]["SENSORS"]["drop"] == [280, 5], y["zones"]
-        assert y["zones"]["SENSORS"]["rect"] == [[150.0, 60.0], [400.0, -60.0]], y["zones"]
+        assert y["zones"]["MIDDLE"]["drop"] == [280, 5], y["zones"]
+        assert y["zones"]["MIDDLE"]["rect"] == [[150.0, 60.0], [400.0, -60.0]], y["zones"]
         assert not post("set_zone_drop", {"name": "NOPE", "x": 280, "y": 5})["ok"]
-        assert not post("set_zone_drop", {"name": "WIRES", "x": 9999, "y": 0})["ok"]
+        assert not post("set_zone_drop", {"name": "LEFT", "x": 9999, "y": 0})["ok"]
 
         # --- run config ---
         assert post("set_task", {"text": "sort it however makes sense"})["ok"]
@@ -222,7 +222,7 @@ def test_hud_actions() -> None:
         _wait(lambda: get("/state")["run"]["phase"] == "stopped", what="stopped after estop")
 
         # --- voice from the page ---
-        assert post("say_to_robot", {"text": "put white things in wires"})["ok"]
+        assert post("say_to_robot", {"text": "put white things on the left"})["ok"]
 
         # --- calibration from the page while idle (fixture teleop session, temp calib file) ---
         assert post("calib_start")["ok"]
@@ -272,7 +272,7 @@ def test_hud_actions() -> None:
                 @classmethod
                 def convert(cls, **kw):
                     cls.last = kw
-                    return _O(text="always put wires on the left")
+                    return _O(text="always put round things on the left")
 
             class text_to_speech:
                 @staticmethod
@@ -292,37 +292,37 @@ def test_hud_actions() -> None:
                             ("clear_hints", "rules"), ("get_models", "models"), ("set_model", "models")):
             assert name in acts and acts[name]["group"] == group, (name, acts.get(name))
             assert acts[name]["help"], f"{name} has no help text in GET /actions"
-        r = post("say_to_bot", {"text": "screws go in the actuators bin"})  # idle + rule -> persisted now
+        r = post("say_to_bot", {"text": "screws go in the right bin"})  # idle + rule -> persisted now
         assert r["ok"] and r["data"]["kind"] == "rule", r
-        assert "screws go in the actuators bin" in get("/state")["rules"]["list"]
+        assert "screws go in the right bin" in get("/state")["rules"]["list"]
         r = post("say_to_bot", {"text": "open"})  # idle + immediate command -> queued for the next run
         assert r["ok"] and r["data"]["kind"] == "action" and "queued" in r["message"], r
         assert "open" in get("/state")["voice"]["queue"]
         r = post("transcribe", {"audio_b64": base64.b64encode(b"\x1aE\xdf\xa3 fake webm").decode(),
                                 "mime": "audio/webm"})
-        assert r["ok"] and r["data"]["text"] == "always put wires on the left", r
+        assert r["ok"] and r["data"]["text"] == "always put round things on the left", r
         assert _FakeEL.speech_to_text.last["model_id"] == "scribe_v2"
         assert _FakeEL.speech_to_text.last["file"][2] == "audio/webm"
-        assert get("/state")["voice"]["last_transcript"] == "always put wires on the left"
-        assert "always put wires on the left" in get("/state")["rules"]["list"]  # classified as a rule
+        assert get("/state")["voice"]["last_transcript"] == "always put round things on the left"
+        assert "always put round things on the left" in get("/state")["rules"]["list"]  # classified as a rule
         assert not post("transcribe", {"audio_b64": ""})["ok"]
         assert post("speak", {"text": "test sentence"})["ok"]
         assert not post("speak", {"text": ""})["ok"]
 
         # --- RULES group ---
         rules0 = get("/state")["rules"]["list"]
-        assert post("add_rule", {"text": "red things are wires"})["ok"]
+        assert post("add_rule", {"text": "red things go in LEFT"})["ok"]
         lst = get("/state")["rules"]["list"]
-        assert lst == rules0 + ["red things are wires"], lst
-        i = lst.index("red things are wires")
+        assert lst == rules0 + ["red things go in LEFT"], lst
+        i = lst.index("red things go in LEFT")
         while i > 0:  # walk it to the top
             assert post("move_rule", {"i": i, "dir": "up"})["ok"]
             i -= 1
-        assert get("/state")["rules"]["list"][0] == "red things are wires"
+        assert get("/state")["rules"]["list"][0] == "red things go in LEFT"
         assert not post("move_rule", {"i": 0, "dir": "up"})["ok"]
         assert not post("move_rule", {"i": 0, "dir": "sideways"})["ok"]
         assert post("delete_rule", {"i": 0})["ok"]
-        assert "red things are wires" not in get("/state")["rules"]["list"]
+        assert "red things go in LEFT" not in get("/state")["rules"]["list"]
         assert not post("delete_rule", {"i": 99})["ok"]
         assert post("clear_hints")["ok"]
 

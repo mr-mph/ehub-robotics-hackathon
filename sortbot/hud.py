@@ -233,7 +233,7 @@ body.showhelp .help{display:block}
  <section class="tabsec" id="tab-operate" hidden>
   <div class="sec" id="sec-task" hidden>
    <h3>Task</h3>
-   <div class="inline"><input id="task" class="grow" placeholder="e.g. sort screws left, sensors right"><button id="taskbtn" class="btn">Set task</button></div>
+   <div class="inline"><input id="task" class="grow" placeholder="e.g. group similar items; big things go in LEFT"><button id="taskbtn" class="btn">Set task</button></div>
    <div class="help" data-h="set_task"></div>
    <div class="note">current: <span id="taskcur" class="mono">(default: sort sensibly)</span></div>
   </div>
@@ -253,7 +253,7 @@ body.showhelp .help{display:block}
   </div>
   <div class="sec" id="sec-voice" hidden>
    <h3>Talk to the bot</h3>
-   <div class="inline"><input id="corr" class="grow" placeholder='e.g. "screws go in the actuators bin"'><button id="corrbtn" class="btn">Send</button></div>
+   <div class="inline"><input id="corr" class="grow" placeholder='e.g. "shiny things go in the RIGHT zone"'><button id="corrbtn" class="btn">Send</button></div>
    <div class="help" data-h="say_to_bot"></div>
    <div class="inline"><button id="ptt" class="btn" data-h-title="transcribe">&#127908; Hold to talk</button>
     <button id="mictoggle" class="btn" hidden>Listening: OFF</button></div>
@@ -266,7 +266,7 @@ body.showhelp .help{display:block}
   <div class="sec" id="sec-rules" hidden>
    <h3>Rules <span style="text-transform:none;letter-spacing:0">(sent with every prompt, kept across runs)</span></h3>
    <ul id="rlist" class="rl"></ul>
-   <div class="inline"><input id="newrule" class="grow" placeholder="e.g. red things are wires"><button id="rulebtn" class="btn" data-h-title="add_rule">Add rule</button></div>
+   <div class="inline"><input id="newrule" class="grow" placeholder="e.g. red things go in LEFT"><button id="rulebtn" class="btn" data-h-title="add_rule">Add rule</button></div>
    <div class="help" data-h="add_rule"></div>
    <div class="inline"><span class="note" style="margin:0">one-shot hints: <span id="hints" class="mono">none</span></span>
     <button id="b-clearhints" class="btn sm" data-h-title="clear_hints">Clear hints</button></div>
@@ -630,7 +630,7 @@ function renderRules(rl){if(!rl)return;const sig=JSON.stringify(rl);if(sig===rul
  $('rlist').innerHTML=list.map((r,i)=>'<li><span class="rt">'+esc(r)+'</span>'+
   '<a data-mv="'+i+'|up" title="move up (higher priority)">&#8593;</a><a data-mv="'+i+'|down" title="move down">&#8595;</a>'+
   '<a data-del="'+i+'" title="delete this rule">&#10005;</a></li>').join('')
-  ||'<li style="background:none;border:none"><span class="empty">No rules yet - type one below, e.g. "red things are wires".</span></li>';
+  ||'<li style="background:none;border:none"><span class="empty">No rules yet - type one below, e.g. "red things go in LEFT".</span></li>';
  $('rlist').querySelectorAll('a[data-mv]').forEach(a=>a.onclick=()=>{const p=a.dataset.mv.split('|');rulesSig='';act('move_rule',{i:+p[0],dir:p[1]});});
  $('rlist').querySelectorAll('a[data-del]').forEach(a=>a.onclick=()=>{rulesSig='';act('delete_rule',{i:+a.dataset.del});});
  const hints=(rl&&rl.hints)||[];
@@ -960,8 +960,8 @@ def _selftest() -> None:
             wr = np.full((240, 320, 3), 60 * (i + 1), np.uint8)
             hud.update(ov, wr, {"ee_pose": Pose(150, 0, 180), "holding": None, "step": i,
                                 "latency_ms": 1234, "last_call": {"tool": "pick", "args": {"id": 3}},
-                                "say": "picking the red wire", "rules": ["wires go left"],
-                                "voice_queue": ["put sensors in the middle"]})
+                                "say": "picking the red block", "rules": ["red things go left"],
+                                "voice_queue": ["put round things in the middle"]})
         base = f"http://127.0.0.1:{port}"
         post = lambda path, body: json.load(urllib.request.urlopen(urllib.request.Request(  # noqa: E731
             base + path, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"}, method="POST"), timeout=3))

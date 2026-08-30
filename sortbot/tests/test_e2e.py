@@ -26,7 +26,7 @@ def test_e2e(with_hud: bool = True) -> None:
     cfg = cfgmod.load()
     scene = SimScene(MockRobot(cfg), cfg)
     n_objects = len(scene.blobs)
-    voice = VoiceIO(stdin=io.StringIO("put white things in wires\n"), force_text=True)
+    voice = VoiceIO(stdin=io.StringIO("put white things on the left\n"), force_text=True)
     voice.start()
     hud = None
     if with_hud:
@@ -46,7 +46,7 @@ def test_e2e(with_hud: bool = True) -> None:
     assert loop.holding is None and scene.held is None
     for xy, _ in scene.blobs:  # every blob now sits inside some zone
         assert any(z.contains(*xy) for z in cfg.zones), xy
-    assert json.loads(rules_path.read_text()) == ["put white things in wires"]
+    assert json.loads(rules_path.read_text()) == ["put white things on the left"]
     assert [h["tool"] for h in loop.history].count("pick") == n_objects
     # a rejected command is fed back as a history entry, not raised
     world = m.WorldState(objects=[], zones=cfg.zones)

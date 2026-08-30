@@ -335,7 +335,12 @@ def load_calib(path: Path | None = None) -> np.ndarray:
 
 
 def _selftest() -> None:
+    import tempfile
+
     cfg = cfgmod.load()
+    # isolate from the machine's real calib.json: in auto mode a fitted H would silently take over
+    # whenever a tag drops out, and this synthetic scene has nothing to do with that H
+    cfg.calib_file = Path(tempfile.mkdtemp()) / "no_calib.json"
     img, truth = render_mat(cfg.aruco_tags_mm, cfg.aruco_dict)
     h = TableHomography(cfg)
     assert h.update(img), f"tags found: {h.last_centers_px}"

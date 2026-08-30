@@ -113,7 +113,7 @@ errors are reported in the response, never raised):
 * cams: overhead + wrist OpenCV cameras, opened directly (not through the follower)
 * vlm: the OpenAI planner (fails with a clear message if `OPENAI_API_KEY` is missing)
 
-Any combination works, e.g. **cameras with no robot yet** to tune perception with no arm. Device changes are
+Any combination works, e.g. **cameras with no robot yet** for a live preview with no arm. Device changes are
 refused while a run is active (Stop first) and while a calibration session is active (Finish/Cancel first) --
 disconnecting the robot mid-calibration would orphan the teleop thread against a discarded robot.
 

@@ -214,7 +214,7 @@ body.showhelp .help{display:block}
   <div class="sec" id="sec-mode" hidden>
    <h3>1 &middot; Connect the devices</h3>
    <div id="connrows"></div>
-   <div class="note">Cameras work without the robot (tune perception, nothing moves). Sorting needs all three connected.</div>
+   <div class="note">Cameras work without the robot (live preview, nothing moves). Sorting needs all three connected.</div>
    <div class="rowmsg" id="msg-setup"></div>
   </div>
   <div class="sec" id="sec-calib" hidden>
@@ -349,7 +349,7 @@ const CLAIMED=new Set(['connect_robot','connect_cameras','connect_vlm','start','
  'calib_start','calib_touch','calib_capture','calib_undo','calib_finish','calib_cancel','calib_sample']);
 const DEVICES=[
  ['robot','connect_robot','Robot','SO-101 follower arm. Torque comes on when connected; the arm moves only on your actions.'],
- ['cams','connect_cameras','Cameras','Overhead + wrist. Works without the robot for perception tuning.'],
+ ['cams','connect_cameras','Cameras','Overhead + wrist. Works without the robot for a live preview.'],
  ['vlm','connect_vlm','Vision model','The OpenAI planner (needs OPENAI_API_KEY in .env).']];
 const GUIDE=[
  'Put the green ball (or any bright object) in the gripper, then <b>click it in the overhead image</b>. A green circle confirms the target is locked.',
@@ -946,7 +946,7 @@ def _selftest() -> None:
             ov = np.zeros((360, 640, 3), np.uint8); ov[:, :, i] = 200
             wr = np.full((240, 320, 3), 60 * (i + 1), np.uint8)
             hud.update(ov, wr, {"ee_pose": Pose(150, 0, 180), "holding": None, "step": i,
-                                "latency_ms": 1234, "last_call": {"tool": "pick", "args": {"id": 3}},
+                                "latency_ms": 1234, "last_call": {"tool": "pick_at", "args": {"x_cm": 25.0, "y_cm": 12.0}},
                                 "say": "picking the red block", "rules": ["red things go left"],
                                 "voice_queue": ["put round things in the middle"]})
         base = f"http://127.0.0.1:{port}"

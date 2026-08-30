@@ -188,7 +188,9 @@ def _selftest() -> None:
     st = _state_text(world, hist)
     assert "RULES" in st and "put red things" in st
     assert "cm" in st and "ZONES" in st and "27.5" in st, st  # zone drops reported in cm
-    assert "object" not in SYSTEM_PROMPT.lower() or "numbered" not in SYSTEM_PROMPT.lower()
+    low = SYSTEM_PROMPT.lower()
+    for banned in ("numbered", "object id", "object list", "detected object", "detector"):
+        assert banned not in low, f"detector-era phrase {banned!r} back in the system prompt"
     c = estimate_cost_usd("gpt-5", 10_000, 1_000)
     assert c is not None and abs(c - 0.0225) < 1e-9, c
     assert estimate_cost_usd("gpt-5-mini-2025", 1000, 0) == 0.00025

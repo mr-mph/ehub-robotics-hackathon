@@ -1,7 +1,7 @@
 """Server-first entry point: `python -m sortbot.main` starts the HUD immediately with NOTHING connected;
 the real devices are connected from the Setup tab (RUN group: connect_robot / connect_cameras / connect_vlm).
 
-Devices (any combination; "cameras + no robot yet" works for tuning perception without an arm):
+Devices (any combination; "cameras + no robot yet" gives a live preview without an arm):
   robot: the SO101 follower arm    cams: overhead + wrist OpenCV    vlm: the OpenAI planner (needs OPENAI_API_KEY)
 
 The Loop is startable/pausable/stoppable from the page repeatedly without restarting the process.
@@ -586,7 +586,7 @@ class Session:
         h.register("connect_robot", self.connect_robot, "Connect robot", "run",
                    help="Connect the SO-101 follower arm (connect=false disconnects). Torque comes on; nothing moves until you act.")
         h.register("connect_cameras", self.connect_cameras, "Connect cameras", "run",
-                   help="Open the overhead + wrist cameras (connect=false disconnects). Works with no robot, for tuning perception.")
+                   help="Open the overhead + wrist cameras (connect=false disconnects). Works with no robot, for a live preview.")
         h.register("connect_vlm", self.connect_vlm, "Connect vision model", "run",
                    help="Connect the OpenAI planner (needs OPENAI_API_KEY in .env; connect=false disconnects).")
         h.register("start", self.start, "Start", "run",

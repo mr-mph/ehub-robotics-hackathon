@@ -324,7 +324,9 @@ class _KinematicBase:
     def pick(self, x_mm: float, y_mm: float) -> ExecResult:
         x, y = float(x_mm), float(y_mm)
         zg = max(self.cfg.grasp_z_mm, self.cfg.table_z_mm + self.cfg.gripper_clearance_mm)
-        return self._run(f"picked at ({x:.0f},{y:.0f})",
+        # label carries no bare coordinates: failure strings reach the VLM, whose surface is cm
+        # (the inner SafetyError text stays mm but always says "mm" explicitly)
+        return self._run("pick",
                          self.open_gripper,
                          lambda: self.move_to(x, y, zg),
                          self.close_gripper,
@@ -332,7 +334,7 @@ class _KinematicBase:
 
     def place_at(self, x: float, y: float) -> ExecResult:
         zp = max(self.cfg.grasp_z_mm, self.cfg.table_z_mm + self.cfg.gripper_clearance_mm) + 10.0
-        return self._run(f"placed at ({x:.0f},{y:.0f})",
+        return self._run("place",  # no bare mm coordinates in the label (see pick)
                          lambda: self.move_to(x, y, zp),
                          self.open_gripper,
                          lambda: self.move_to(x, y, self.cfg.travel_z_mm))
@@ -455,7 +457,9 @@ def _selftest() -> None:
     assert r.pick(300.0, 120.0).ok and not r.gripper_open
     zs = [r.fk_table(q)[2, 3] for q in r.log[n0:]]
     assert min(zs) >= cfg.gripper_clearance_mm - 2.0, min(zs)
-    assert r.place_at(*cfg.zone("MIDDLE").drop_point_mm).ok and r.gripper_open
+    # fixed point, NOT a zone drop: drop points are user-tunable runtime config (set_zone_drop persists
+    # them into config.yaml), so the selftest must not depend on where the user last put them
+    assert r.place_at(275.0, 0.0).ok and r.gripper_open
     p = r.get_ee_pose()
     assert abs(p.x - 275) < IK_TOL_MM and abs(p.y) < IK_TOL_MM and abs(p.z - cfg.travel_z_mm) < IK_TOL_MM, p
 

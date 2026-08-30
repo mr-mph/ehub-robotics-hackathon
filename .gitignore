@@ -5,3 +5,6 @@
 __pycache__/
 *.pyc
 sortbot/out/
+sortbot/calib/calib.json
+sortbot/calib/calib.json.bak
+sortbot/calib/rules.json

@@ -235,6 +235,9 @@ def test_hud_actions() -> None:
         assert not hammer_errs, hammer_errs[:1]
         c = get("/state")["calibration"]
         assert c["n"] >= 4 and c["residual_mean_mm"] is not None and c["residual_mean_mm"] < 3.0, c
+        assert c["coverage_pct"] > 10 and c["coverage_verdict"], c  # live sample-coverage feedback
+        assert isinstance(c.get("residuals_mm"), list) and c.get("worst_i") is not None, c
+        assert c.get("loaded") and "points" in c["loaded"], c  # persistence made obvious once not running
         assert session._calib_out is not None and session._calib_out.exists()
         # a click on the bare mat (gray pixel) must be rejected, keeping the previous target
         r = post("calib_sample", {"u": 5, "v": 5})

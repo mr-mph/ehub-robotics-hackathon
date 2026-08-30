@@ -87,6 +87,12 @@ class Homography:
     def method(self) -> str:
         return "ball" if self.tracker is None else self.tracker.method
 
+    @property
+    def region_px(self) -> np.ndarray | None:
+        """Convex hull (overhead px) of the calibration samples: where px<->mm is trustworthy.
+        None for a fixed/injected H (tests) or an old calib.json without stored points."""
+        return None if self.tracker is None else getattr(self.tracker, "region_px", None)
+
     def update(self, frame: np.ndarray) -> np.ndarray | None:
         if self.fixed is not None:
             return self.fixed
@@ -194,6 +200,7 @@ class Loop:
         self.last_overhead: np.ndarray | None = None
         self.frame_sink = None  # optional callable(overhead) so the Session sees the latest raw frame
         self.dlog: DecisionLog | None = None
+        self._H: np.ndarray | None = None  # homography of the current step (extrapolation guard)
         self._overlay: np.ndarray | None = None  # overlay at decision time (log thumbnails)
         self._t0: float | None = None
         self._pose_cache: Pose | None = None  # last pose read under the bus lock; hud_update NEVER reads the bus
@@ -258,6 +265,20 @@ class Loop:
                           frame=self._overlay)
 
     # ---- validate + execute ----
+    def _extrapolation_err(self, x_mm: float, y_mm: float) -> str | None:
+        """A homography is only trustworthy where it was sampled: refuse xy targets whose overhead pixel
+        falls outside the calibrated sample hull (+20% margin). No hull (mock H / old calib.json) = no guard."""
+        region = self.homog.region_px
+        if region is None or self._H is None:
+            return None
+        from sortbot.calibration import in_calibrated_region
+        u, v = perception.mm_to_px(self._H, [(x_mm, y_mm)])[0]
+        if in_calibrated_region(region, u, v):
+            return None
+        return (f"({x_mm / 10:g}, {y_mm / 10:g}) cm is outside the calibrated camera area (the outlined "
+                f"region on the overhead image) — positions read there are unreliable; recalibrate with "
+                f"wider coverage to work there")
+
     def validate(self, cmd: Command, world: WorldState) -> str | None:
         """Coordinate tools are validated against the workspace AABB + the zone names; rejection
         messages are written in CENTIMETERS (the VLM's units — it must be able to react to them)."""
@@ -282,6 +303,9 @@ class Loop:
             if not (lo[0] <= x <= hi[0] and lo[1] <= y <= hi[1]):
                 return (f"({x / 10:g}, {y / 10:g}) cm is outside the reachable workspace "
                         f"x [{lo[0] / 10:g}, {hi[0] / 10:g}] cm, y [{lo[1] / 10:g}, {hi[1] / 10:g}] cm")
+            err = self._extrapolation_err(x, y)
+            if err and t != "move_to":  # xy targets must lie where the camera calibration is trustworthy
+                return err
             if t == "move_to":
                 z = m.get("z")
                 if z is None or not (lo[2] <= z <= hi[2]):
@@ -389,9 +413,11 @@ class Loop:
                 self.hud_update(overhead, wrist, step, t0, "no homography - calibrate")
                 time.sleep(0.5)
                 continue
+            self._H = H
             rules = ([f"GOAL: {self.task}"] if self.task else []) + self.rules.list() + self.hints
             world = WorldState(self.cfg.zones, self._read_pose(), self.robot.gripper_open, self.holding, rules)
-            overlay = perception.render_overlay(overhead, H, self.cfg.zones, world.ee_pose, rules)
+            overlay = perception.render_overlay(overhead, H, self.cfg.zones, world.ee_pose, rules,
+                                                calib_region_px=self.homog.region_px)
             self._overlay = overlay
             self.hud_update(overlay, wrist, step, t0, "planning")
             try:
@@ -639,7 +665,16 @@ class Session:
                             ("calib_finish", "Finish"), ("calib_cancel", "Cancel"), ("calib_sample", None)):
             self.hud.register(name, no, label, "calibration", params=[],
                               help="Calibration needs a robot: connect it in Setup first.")
-        self.hud.add_state_source("calibration", lambda: {"state": "idle", "n": 0, "message": "connect a robot first"})
+
+        def idle_state() -> dict:
+            try:
+                from sortbot.calibration import calib_summary_file
+                loaded = calib_summary_file(self.cfg.calib_file) or "no saved calibration yet"
+            except Exception:  # noqa: BLE001
+                loaded = None
+            return {"state": "idle", "n": 0, "message": "connect a robot first", "loaded": loaded}
+
+        self.hud.add_state_source("calibration", idle_state)
 
     # ------------------------------------------------ mode / devices
     def _running(self) -> bool:
@@ -948,7 +983,8 @@ class Session:
         H = self._current_H()
         if H is None:
             return
-        overlay = perception.render_overlay(frame, H, self.cfg.zones, None, self.rules.list())
+        overlay = perception.render_overlay(frame, H, self.cfg.zones, None, self.rules.list(),
+                                            calib_region_px=self.homog.region_px if self.homog else None)
         self._overlay_hold = (time.time() + 5.0, overlay)
         if self.hud is not None and not self._running():
             self.hud.update(overlay, None, {})
@@ -982,6 +1018,12 @@ class Session:
         H = self._current_H()
         if H is None:
             return {"ok": False, "message": "no homography (connect cameras / calibrate first)", "data": None}
+        region = self.homog.region_px if self.homog is not None else None
+        if region is not None:
+            from sortbot.calibration import in_calibrated_region
+            if not in_calibrated_region(region, float(u), float(v)):
+                return {"ok": False, "message": "that point is outside the calibrated area — positions there "
+                                                "are unreliable; recalibrate with wider coverage", "data": None}
         x, y = perception.px_to_mm(H, [(float(u), float(v))])[0]
         return {"ok": True, "message": f"({u}, {v}) px -> ({x:.1f}, {y:.1f}) mm",
                 "data": {"x": round(float(x), 1), "y": round(float(y), 1)}}

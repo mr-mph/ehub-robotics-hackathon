@@ -186,12 +186,24 @@ the HUD of a running `main` with the robot connected. A background thread teleop
    `config.yaml calibration.target`. Among same-coloured blobs the roundest large one wins.
 2. **Touch table** (once): rest the fingertip on the table and press *Touch table* / `t`. FK z there is the table
    plane -> `base_z_offset_mm` (the only non-identity part of `table_T_base`). Skipped = 0 (or the previous value).
-3. **Capture** (`space`) at >= 4 well-spread positions (>= 15 mm apart, `min_sample_spacing_mm`); ~8 over the whole
-   pick area is good. Each sample pairs the target's pixel centroid with the FK base xyz; after 4 samples the
-   homography is refitted on every capture and the residuals are shown live. *Undo* (`u`) drops the last sample.
-4. **Finish** (`enter`): RANSAC fit `H_px_to_mm`, per-point residual table, written to `calib/calib.json` together
-   with `plane_z_mm` (mean target-centre height), `target`, `method: "teleop"`, `points`, `residuals_mm`.
-   *Cancel* (`q`) writes nothing. The leader is released and the loop resumes with the reloaded homography.
+3. **Capture** (`space`) at >= 4 well-spread positions (>= 15 mm apart, `min_sample_spacing_mm`); ~8 spread
+   across the WHOLE camera view is good — aim for the corners. Each sample pairs the target's pixel centroid
+   with the FK base xyz; after 4 samples the homography is refitted on every capture, the residuals + a
+   **coverage %** (convex hull of the samples / frame area, with a plain-language verdict) are shown live,
+   every sample is drawn as a numbered dot with the hull outline (worst residual in red — *Undo* it), and the
+   **fitted cm grid renders live on the image** so you can see whether the projection lines up with the table.
+4. **Finish** (`enter`): RANSAC fit `H_px_to_mm`, per-point residual table, written to `calib/calib.json`
+   together with `plane_z_mm`, `target`, `method: "teleop"`, `points`, `residuals_mm`, `frame_wh` and
+   `saved_at`; the previous file is kept as `calib.json.bak`. Clustered (< 10% coverage) or near-collinear
+   sample sets are refused with an explanation — press Finish again (or pass `force`) to save anyway; those
+   fits look fine in residual but extrapolate garbage off-hull. *Cancel* (`q`) writes nothing. The leader is
+   released and the loop resumes with the reloaded homography.
+
+The calibration **persists**: it is written only on Finish, auto-loads on startup (a summary line —
+points / residuals / coverage / age — is logged and shown in the Setup tab), and nothing else ever
+overwrites it. At runtime the sampled area is drawn as a subtle outline on the overlay and coordinates
+outside it (+20% margin) are refused ("outside the calibrated area — recalibrate with wider coverage"),
+because the homography is only trustworthy where it was sampled.
 
 After that the **table frame is the base frame** in xy (x fwd, y left, mm). `H` is exact for object centroids at
 `plane_z_mm`; taller objects project slightly outward from the camera nadir, lower ones inward (a few mm at most).

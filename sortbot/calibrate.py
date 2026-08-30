@@ -28,8 +28,9 @@ import cv2
 import numpy as np
 
 from sortbot import config as cfgmod
-from sortbot.calibration import (ColorTarget, _ip, detect_target, fit_px_to_mm, load_calib_dict,
-                                 save_ball_calib)
+from sortbot.calibration import (ColorTarget, _ip, calib_summary_file, collinearity_ratio, coverage_pct,
+                                 coverage_verdict, detect_target, fit_px_to_mm, load_calib_dict,
+                                 sample_hull_px, save_ball_calib)
 
 MOTORS = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
 TELEOP_HZ, DETECT_EVERY = 30.0, 3  # detection runs every DETECT_EVERY teleop ticks
@@ -81,6 +82,7 @@ class CalibSession:
         self.H = self.res = None
         self.det = self.fk = None
         self.frame_rgb: np.ndarray | None = None
+        self.frame_wh: tuple[int, int] | None = None  # for sample-coverage feedback
         self.state, self.message = "idle", ""
         self._lock, self._stop = threading.RLock(), threading.Event()
         # Serializes ALL motor-bus / follower access. Share the caller's robot lock so no other thread
@@ -116,6 +118,7 @@ class CalibSession:
         with self._bus:  # frame may come through the follower; joints always do
             self.frame_rgb = self.rig.frame()
             self.fk = self.rig.fk_base_mm(self.rig.read_joints())
+        self.frame_wh = (self.frame_rgb.shape[1], self.frame_rgb.shape[0])
         self.det = detect_target(self.frame_rgb, self.target)
         if self.on_frame:
             self.on_frame(self.annotated())
@@ -161,12 +164,29 @@ class CalibSession:
             self.message = f"table plane: base_link origin is {self.z_off:.1f} mm above the table"
             return _r(True, self.message, {"z_offset_mm": self.z_off})
 
-    def finish(self) -> dict:
+    def finish(self, force: bool = False) -> dict:
         with self._lock:
             if self.state != "running":
                 return _r(False, f"not running ({self.state})")
             if len(self.samples) < 4:
                 return _r(False, f"need >= 4 samples, have {len(self.samples)}")
+            px_now = [s["px"] for s in self.samples]
+            cov = coverage_pct(px_now, self.frame_wh)
+            ratio = collinearity_ratio(px_now)
+            if not force and (cov < 10.0 or ratio < 0.15):
+                # a clustered/near-collinear fit LOOKS fine in residual but extrapolates garbage off-hull
+                sig = (len(self.samples), None if self.z_off is None else round(float(self.z_off), 3))
+                if getattr(self, "_finish_blocked_sig", None) == sig:
+                    force = True  # a second Finish with nothing changed is the operator's override
+                else:
+                    self._finish_blocked_sig = sig
+                    why = ("samples are nearly on one line" if ratio < 0.15
+                           else f"samples cover only {cov:.0f}% of the camera view")
+                    self.message = (f"not saved: {why} — the fit would be way off everywhere else. "
+                                    f"Capture more spread-out samples (aim for the corners), or press "
+                                    f"Finish again to save anyway.")
+                    return _r(False, self.message, {"force_needed": True, "coverage_pct": round(cov, 1),
+                                                    "collinearity": round(ratio, 3)})
             if self.z_off is None:
                 print("[calibrate] no touch-table step: assuming base_link origin is on the table plane (z offset 0)")
                 self.z_off = 0.0
@@ -175,11 +195,14 @@ class CalibSession:
                 return _r(False, self.message or "fit failed; capture more spread-out samples")
             px, mm = self._arrays()
             plane_z = float(mm[:, 2].mean() + self.z_off)
-            save_ball_calib(self.out, self.H, px, mm[:, :2], self.res, plane_z, self.target, self.z_off, method="teleop")
+            save_ball_calib(self.out, self.H, px, mm[:, :2], self.res, plane_z, self.target, self.z_off,
+                            method="teleop", frame_wh=self.frame_wh)
             self.state = "fitted"
-            self.message = f"fitted {len(px)} pts: residual mean {self.res.mean():.2f} max {self.res.max():.2f} mm, plane z {plane_z:.0f} mm -> {self.out}"
+            self.message = (f"fitted {len(px)} pts: residual mean {self.res.mean():.2f} max {self.res.max():.2f} mm, "
+                            f"coverage {cov:.0f}%, plane z {plane_z:.0f} mm -> {self.out} (previous kept as .bak)")
             self._stop_teleop()
-            return _r(True, self.message, {"residuals_mm": self.res.tolist(), "plane_z_mm": plane_z})
+            return _r(True, self.message, {"residuals_mm": self.res.tolist(), "plane_z_mm": plane_z,
+                                           "coverage_pct": round(cov, 1)})
 
     def cancel(self) -> dict:
         with self._lock:
@@ -221,21 +244,52 @@ class CalibSession:
                 self.message = f"fit failed: {e}"
 
     def status(self) -> dict:
+        px = [s["px"] for s in self.samples]
+        cov = coverage_pct(px, self.frame_wh)
+        res = None if self.res is None else [round(float(r), 2) for r in self.res]
+        worst_i = None if not res else int(np.argmax(self.res))
+        med = None if not res else float(np.median(self.res))
+        outliers = [] if not res else [i for i, r in enumerate(self.res)
+                                       if med is not None and med > 1e-6 and r > 3.0 * med]
         return {"state": self.state, "message": self.message, "n": len(self.samples),
                 "fk_mm": None if self.fk is None else [round(float(v), 1) for v in self.fk],
                 "det": None if self.det is None else [round(float(v), 1) for v in self.det],
                 "residual_mean_mm": None if self.res is None else round(float(self.res.mean()), 2),
                 "residual_max_mm": None if self.res is None else round(float(self.res.max()), 2),
+                "residuals_mm": res, "worst_i": worst_i, "outlier_i": outliers,
+                "coverage_pct": round(cov, 1), "coverage_verdict": coverage_verdict(cov),
                 "z_offset_mm": self.z_off, "target": self.target.to_dict(),
                 "samples": [[round(v, 1) for v in (*s["px"], *s["base_mm"])] for s in self.samples]}
 
     def annotated(self) -> np.ndarray:
+        """Live calibration view: every sample as a numbered dot (worst residual in red), the samples'
+        convex hull, the detection circle and a status line with coverage — so it is visible at a glance
+        where has and has NOT been sampled. As soon as a fit exists (4+ samples) the cm grid of the
+        CURRENT fit is drawn live, so it is obvious while calibrating whether the projection lines up
+        with the table (it refits on every capture)."""
         img = self.frame_rgb.copy()
-        for s in self.samples:
-            cv2.drawMarker(img, _ip(s["px"]), (255, 200, 0), cv2.MARKER_TILTED_CROSS, 10, 1)
+        if self.H is not None:
+            from sortbot import perception  # grid under the sample markers: how the current fit looks
+            try:
+                img = perception.render_overlay(img, self.H, [], None, [])
+            except Exception as e:  # noqa: BLE001 - a degenerate interim fit must not kill the teleop view
+                cv2.putText(img, f"grid preview unavailable: {e}", (8, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 80, 80), 1, cv2.LINE_AA)
+        px = [s["px"] for s in self.samples]
+        hull = sample_hull_px(px)
+        if hull is not None:
+            cv2.polylines(img, [hull.round().astype(np.int32).reshape(-1, 1, 2)], True, (255, 200, 0), 1, cv2.LINE_AA)
+        worst_i = None if self.res is None or not len(self.res) else int(np.argmax(self.res))
+        for i, s in enumerate(self.samples):
+            col = (255, 60, 60) if i == worst_i and self.res is not None and self.res[worst_i] > 3.0 else (255, 200, 0)
+            cv2.circle(img, _ip(s["px"]), 5, col, -1)
+            cv2.putText(img, str(i + 1), (_ip(s["px"])[0] + 6, _ip(s["px"])[1] - 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1, cv2.LINE_AA)
         if self.det:
             cv2.circle(img, _ip(self.det), int(self.det[2]), (0, 255, 0), 2)
-        txt = f"{self.state} n={len(self.samples)}" + (f" res {self.res.mean():.1f}/{self.res.max():.1f}mm" if self.res is not None else "")
+        cov = coverage_pct(px, self.frame_wh)
+        txt = f"{self.state} n={len(self.samples)} coverage {cov:.0f}%" + (
+            f" res {self.res.mean():.1f}/{self.res.max():.1f}mm" if self.res is not None else "")
         cv2.putText(img, txt, (8, img.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1, cv2.LINE_AA)
         return img
 
@@ -306,11 +360,11 @@ class CalibController:
                 self.on_done(self.session)
         return r
 
-    def trigger(self, fn_name: str) -> dict:
+    def trigger(self, fn_name: str, **kw) -> dict:
         """capture | undo | touch_table | finish | cancel on the current session."""
         if self.session is None:
             return _r(False, "no calibration session; press Start")
-        r = getattr(self.session, fn_name)()
+        r = getattr(self.session, fn_name)(**kw)
         return self._end(r) if fn_name in ("finish", "cancel") else r
 
     def sample(self, u: float, v: float) -> dict:
@@ -333,8 +387,25 @@ class CalibController:
 
     def status(self) -> dict:
         if self.session is None:
-            return {"state": "idle", "message": "press Start (gripper must hold the target)", "n": 0, "target": self.target.to_dict()}
-        return self.session.status()
+            return {"state": "idle", "message": "press Start (gripper must hold the target)", "n": 0,
+                    "target": self.target.to_dict(), "loaded": self._loaded_summary()}
+        st = self.session.status()
+        if self.session.state != "running":
+            st["loaded"] = self._loaded_summary()
+        return st
+
+    def _loaded_summary(self) -> str:
+        """One line about the SAVED calibration (persists in calib.json and auto-loads on startup) --
+        shown in the Setup tab so nobody re-calibrates just because they doubt it stuck. Cached on mtime."""
+        try:
+            mt = self.out.stat().st_mtime
+        except OSError:
+            mt = None
+        cache = getattr(self, "_sum_cache", None)
+        if cache is None or cache[0] != mt:
+            s = calib_summary_file(self.out) if mt is not None else None
+            self._sum_cache = (mt, s or "no saved calibration yet — run the calibration steps below")
+        return self._sum_cache[1]
 
     def register(self, hud) -> None:
         self.hud = hud
@@ -347,8 +418,10 @@ class CalibController:
                      help="Capture a sample: pairs the target's pixel position with the arm's FK position (spacebar). Need 4+, spread out.")
         hud.register("calib_undo", lambda: self.trigger("undo"), "Undo", g,
                      help="Drop the last captured sample.")
-        hud.register("calib_finish", lambda: self.trigger("finish"), "Finish", g,
-                     help="Fit the homography from the samples (4+, well spread over the mat) and save calib.json.")
+        hud.register("calib_finish", lambda force=False: self.trigger("finish", force=bool(force)), "Finish", g,
+                     help="Fit the homography from the samples (4+, spread over the WHOLE camera view) and save "
+                          "calib.json (previous file kept as .bak). Clustered or collinear samples block the save; "
+                          "press Finish again to save anyway.")
         hud.register("calib_cancel", lambda: self.trigger("cancel"), "Cancel", g,
                      help="Abandon the calibration session; nothing is written.")
         hud.register("calib_sample", lambda u, v: self.sample(float(u), float(v)), None, g,  # click-to-pick (no button)

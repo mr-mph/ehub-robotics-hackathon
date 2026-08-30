@@ -351,7 +351,7 @@ const GUIDE=[
  'Put the green ball (or any bright object) in the gripper, then <b>click it in the overhead image</b>. A green circle confirms the target is locked.',
  'Press <b>Start calibration</b> &mdash; the leader arm now drives the follower. Move it gently by hand.',
  'Move the ball somewhere over the mat, hold it still, press <b>Capture</b> (spacebar).',
- 'Repeat at <b>6+ spots spread over the whole mat</b> &mdash; not a line! Residual under 5 mm is good: <span id="g-res">no fit yet</span>.',
+ 'Repeat at <b>6+ spots spread across the whole camera view</b> &mdash; not a line, aim for the corners (numbered dots + coverage % show on the image; the fitted cm grid appears live after 4 samples &mdash; check it lines up with the table). Residual under 5 mm is good: <span id="g-res">no fit yet</span>.',
  'Rest the fingertip on the table and press <b>Touch table</b> (records the table height).',
  'Press <b>Finish</b> to save. <b>Cancel</b> writes nothing.'];
 let ACT={},actsig='',S={},curTab='setup';
@@ -405,7 +405,12 @@ function buildCalib(){
   '<button class="btn'+(a.name==='calib_start'?' primary':'')+(a.name==='calib_capture'?' big':'')+'" data-n="'+esc(a.name)+
   '" title="'+esc(a.help||'')+'">'+esc(a.label)+(a.name==='calib_capture'?' (space)':'')+'</button>').join('')+
   rows.map(a=>'<div class="help">'+esc(a.label)+': '+esc(a.help||'')+'</div>').join('');
- wireRows($('calbtns'));}
+ wireRows($('calbtns'));
+ const fb=$('calbtns').querySelector('button[data-n="calib_finish"]');
+ if(fb){let armed=false;fb.onclick=async()=>{
+  const j=await act('calib_finish',armed?{force:true}:{},fb);
+  if(!j.ok&&j.data&&j.data.force_needed){armed=true;fb.textContent='Finish anyway (low coverage)';}
+  else{armed=false;fb.textContent='Finish';}};}}
 function buildJog(){const JOGS=[['x','+'],['x','-'],['y','+'],['y','-'],['z','+'],['z','-'],['roll','+'],['roll','-']];
  $('jogpad').innerHTML=JOGS.map(([ax,sg])=>'<button class="btn" data-ax="'+ax+'" data-sg="'+sg+'">'+ax+' '+sg+'</button>').join('');
  $('jogpad').querySelectorAll('button').forEach(b=>b.onclick=()=>{
@@ -691,7 +696,8 @@ async function tick(){let s;
   const tgt=cal.target||{};
   $('calstat').textContent='state '+cal.state+'   samples '+(cal.n??0)+'   '+res+
    '\ntarget '+(tgt.name||'-')+'   z offset '+(cal.z_offset_mm==null?'not measured':cal.z_offset_mm.toFixed(1)+' mm')+
-   '\n'+(cal.message||'');
+   (cal.coverage_pct!=null&&cal.state==='running'?('\ncoverage '+cal.coverage_pct+'% - '+(cal.coverage_verdict||'')):'')+
+   '\n'+(cal.message||'')+(cal.loaded?('\n'+cal.loaded):'');
   renderGuide(cal);
   if(cal.state==='running'){ring=cal.det||null;drawRing();}}
  else if(!$('sec-calib').hidden){$('calstat').textContent='no calibration session';renderGuide(null);}

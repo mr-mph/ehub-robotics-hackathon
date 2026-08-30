@@ -14,6 +14,7 @@ sortbot/calibrate.py and stored in calib.json.
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -21,6 +22,85 @@ import cv2
 import numpy as np
 
 from sortbot import config as cfgmod
+
+
+# ---------------------------------------------------------------- sample-coverage helpers
+# A homography fitted from samples that cover only a small patch of the camera view extrapolates
+# wildly everywhere else ("the projected plane looks way off"). These helpers quantify coverage,
+# feed the live calibration UI, gate Finish, and guard runtime conversions outside the sampled area.
+
+
+def sample_hull_px(px) -> np.ndarray | None:
+    """Convex hull (Nx2 float, overhead px) of the sample pixels; None with < 3 points."""
+    px = np.asarray(px, np.float32).reshape(-1, 2)
+    if len(px) < 3:
+        return None
+    return cv2.convexHull(px).reshape(-1, 2).astype(float)
+
+
+def coverage_pct(px, frame_wh) -> float:
+    """Convex-hull area of the sample pixels as a percentage of the frame area."""
+    hull = sample_hull_px(px)
+    if hull is None or not frame_wh:
+        return 0.0
+    return 100.0 * cv2.contourArea(hull.astype(np.float32)) / float(frame_wh[0] * frame_wh[1])
+
+
+def coverage_verdict(pct: float) -> str:
+    if pct < 15.0:
+        return "samples are clustered — spread them to the corners of the camera view"
+    return "ok — wider is better" if pct <= 40.0 else "good coverage"
+
+
+def collinearity_ratio(px) -> float:
+    """2nd/1st singular value of the centred sample pixels: ~0 = the samples lie on one line
+    (the fit LOOKS fine in residual but is garbage off that line)."""
+    px = np.asarray(px, float).reshape(-1, 2)
+    if len(px) < 3:
+        return 0.0
+    s = np.linalg.svd(px - px.mean(0), compute_uv=False)
+    return float(s[1] / s[0]) if s[0] > 1e-9 else 0.0
+
+
+def expand_hull(hull: np.ndarray, margin: float = 0.2) -> np.ndarray:
+    """Hull grown about its centroid by `margin` (20% default) — the runtime trust region."""
+    c = hull.mean(0)
+    return c + (np.asarray(hull, float) - c) * (1.0 + margin)
+
+
+def in_calibrated_region(hull_px: np.ndarray | None, u: float, v: float, margin: float = 0.2) -> bool:
+    """Is overhead pixel (u, v) inside the calibrated sample hull grown by `margin`? True when no
+    hull is known (old calib.json / mock H): the guard only fires with real coverage data."""
+    if hull_px is None:
+        return True
+    big = expand_hull(hull_px, margin).astype(np.float32).reshape(-1, 1, 2)
+    return cv2.pointPolygonTest(big, (float(u), float(v)), False) >= 0
+
+
+def calib_summary(d: dict) -> str | None:
+    """One human line about the saved calibration, or None when there is no fitted H."""
+    if d.get("H_px_to_mm") is None:
+        return None
+    pts = (d.get("points") or {}).get("px") or []
+    res = np.asarray(d.get("residuals_mm") or [], float)
+    parts = [f"calibration loaded: {len(pts)} points"]
+    if res.size:
+        parts.append(f"residual mean {res.mean():.1f} / max {res.max():.1f} mm")
+    if d.get("frame_wh"):
+        parts.append(f"coverage {coverage_pct(pts, d['frame_wh']):.0f}%")
+    if d.get("saved_at"):
+        age = max(0.0, time.time() - float(d["saved_at"]))
+        ago = f"{age / 60:.0f} min" if age < 3600 else (f"{age / 3600:.0f} h" if age < 86400 else f"{age / 86400:.0f} d")
+        parts.append(f"saved {ago} ago")
+    return ", ".join(parts)
+
+
+def calib_summary_file(path: Path | None = None) -> str | None:
+    """calib_summary straight from calib.json; None when absent/unfitted."""
+    try:
+        return calib_summary(load_calib_dict(path))
+    except Exception:  # noqa: BLE001
+        return None
 
 # ---------------------------------------------------------------- ArUco homography
 
@@ -40,15 +120,23 @@ class TableHomography:
         self.H: np.ndarray | None = None  # px -> mm
         self.H_inv: np.ndarray | None = None
         self.H_fixed: np.ndarray | None = None
+        self.region_px: np.ndarray | None = None  # sample hull: where the fitted H is trustworthy
+        self.summary: str | None = None  # human line about the loaded calibration (or None)
         self.last_centers_px: dict[int, tuple[float, float]] = {}
         self.method = "aruco"  # which source produced self.H
         if self.mode != "aruco":
             self.reload()
 
     def reload(self, path: Path | None = None) -> bool:
-        """(Re)load the fitted H from calib.json (ball mode). Returns True if one was found."""
+        """(Re)load the fitted H from calib.json (ball mode). Returns True if one was found. Also loads
+        the sample hull (`region_px`, the area where the fit is trustworthy) and logs a summary so it is
+        obvious the saved calibration persisted and was picked up."""
         d = load_calib_dict(path or self.cfg.calib_file)
         self.H_fixed = d.get("H_px_to_mm")
+        self.region_px = sample_hull_px((d.get("points") or {}).get("px") or [])
+        self.summary = calib_summary(d)
+        if self.summary:
+            print(f"[calibration] {self.summary}")
         if self.H_fixed is not None and self.mode != "aruco":
             self._set(self.H_fixed, "ball")
         return self.H_fixed is not None
@@ -297,8 +385,14 @@ def save_calib(path: Path, T: np.ndarray, base_m=None, table_mm=None, extra: dic
 
 
 def save_ball_calib(path: Path, H: np.ndarray, px, mm, residuals, plane_z_mm: float, target: ColorTarget,
-                    base_z_offset_mm: float, method: str = "teleop") -> None:
-    """calib.json for ball mode: table_T_base = identity xy + z offset; H_px_to_mm maps overhead px -> table mm."""
+                    base_z_offset_mm: float, method: str = "teleop", frame_wh=None,
+                    saved_at: float | None = None) -> None:
+    """calib.json for ball mode: table_T_base = identity xy + z offset; H_px_to_mm maps overhead px -> table mm.
+    Writing only ever happens here (on Finish); the previous file is kept as calib.json.bak so a bad
+    calibration run can never destroy a good one."""
+    path = Path(path)
+    if path.exists():  # timestamped safety net: one Finish must not clobber the only good calibration
+        path.with_suffix(path.suffix + ".bak").write_bytes(path.read_bytes())
     T = np.eye(4)
     T[2, 3] = base_z_offset_mm
     save_calib(path, T, extra={
@@ -306,6 +400,8 @@ def save_ball_calib(path: Path, H: np.ndarray, px, mm, residuals, plane_z_mm: fl
         "target": target.to_dict(), "base_z_offset_mm": float(base_z_offset_mm),
         "points": {"px": np.asarray(px).tolist(), "table_mm": np.asarray(mm).tolist()},
         "residuals_mm": np.asarray(residuals).tolist(),
+        "frame_wh": None if frame_wh is None else [int(frame_wh[0]), int(frame_wh[1])],
+        "saved_at": float(saved_at if saved_at is not None else time.time()),
         "note": "H exact for object centroids at plane_z_mm; taller objects project slightly outward from the camera nadir"})
 
 
@@ -406,6 +502,28 @@ def _selftest() -> None:
     old = Path(tempfile.mkdtemp()) / "old.json"
     save_calib(old, np.eye(4))
     assert load_calib_dict(old)["H_px_to_mm"] is None and load_calib_dict(old)["method"] == "aruco"
+
+    # coverage / persistence helpers: hull, coverage, collinearity, trust region, summary, .bak backup
+    save_ball_calib(tmp, Hf, pxs, mms, res, 38.0, GREEN_BALL, 12.0, frame_wh=(640, 480))
+    assert tmp.with_name("calib.json.bak").exists(), "previous calib.json not backed up on save"
+    dd = load_calib_dict(tmp)
+    assert dd["frame_wh"] == [640, 480] and dd["saved_at"] > 0
+    summ = calib_summary(dd)
+    assert summ and "9 points" in summ and "coverage" in summ and "saved" in summ, summ
+    assert calib_summary({"H_px_to_mm": None}) is None and calib_summary_file(tmp) == summ
+    hull = sample_hull_px(pxs)
+    assert hull is not None and len(hull) >= 3
+    assert in_calibrated_region(hull, *pxs.mean(0))          # centre of the sampled area
+    assert not in_calibrated_region(hull, -200.0, -200.0)    # far outside the sampled area
+    assert in_calibrated_region(None, -200.0, -200.0)        # no hull recorded -> guard disabled
+    pct = coverage_pct(pxs, (640, 480))
+    assert 10.0 < pct <= 100.0, pct
+    assert "clustered" in coverage_verdict(5.0) and "good" in coverage_verdict(50.0)
+    line_px = np.array([[10.0 * i, 5.0 * i + 50] for i in range(6)])
+    assert collinearity_ratio(line_px) < 0.01 < collinearity_ratio(pxs)
+    hb2 = TableHomography(cfgmod.load(), mode="ball")
+    hb2.cfg.calib_file = tmp
+    assert hb2.reload(tmp) and hb2.region_px is not None and hb2.summary == summ
     for mode in ("ball", "auto"):
         cfg_b = cfgmod.load(); cfg_b.calib_file = tmp
         hb = TableHomography(cfg_b, mode=mode)

@@ -148,6 +148,11 @@ class VoiceIO:
         self._mic_ok = bool(self._client and shutil.which("ffmpeg") and sys.platform == "darwin")
         self._mic_thread = None
         self._player = next((p for p in ("afplay", "ffplay") if shutil.which(p)), None)
+        # ONE speech worker: synth + playback are serialized so the bot never talks over itself,
+        # and the sorting loop never blocks on the TTS network call. Backlog is capped: stale
+        # lines are dropped rather than droning on long after the moment has passed.
+        self._speak_q: queue.Queue[str] = queue.Queue()
+        self._speak_thread: threading.Thread | None = None
         log.info("VoiceIO mode=%s tts=%s player=%s", self.mode, bool(self._client), self._player)
 
     # -- lifecycle
@@ -258,16 +263,34 @@ class VoiceIO:
 
     # -- speaking
     def speak(self, text: str) -> None:
+        """Non-blocking: queues the line for the single speech worker (serialized synth + playback)."""
         print(f"[robot says] {text}", flush=True)
         if not self._client or not self._player:
             return
-        try:
-            audio = b"".join(self._client.text_to_speech.convert(
-                self.voice_id, text=text, model_id=self.tts_model, output_format="mp3_22050_32"))
-        except Exception as e:  # noqa: BLE001
-            log.warning("TTS failed: %s", e)
-            return
-        threading.Thread(target=self._play, args=(audio,), daemon=True).start()
+        while self._speak_q.qsize() >= 2:  # keep speech current: drop the oldest unspoken lines
+            try:
+                dropped = self._speak_q.get_nowait()
+                log.info("TTS backlog: dropping %r", dropped)
+            except queue.Empty:
+                break
+        self._speak_q.put(text)
+        if self._speak_thread is None or not self._speak_thread.is_alive():
+            self._speak_thread = threading.Thread(target=self._speak_loop, daemon=True, name="voice-tts")
+            self._speak_thread.start()
+
+    def _speak_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                text = self._speak_q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                audio = b"".join(self._client.text_to_speech.convert(
+                    self.voice_id, text=text, model_id=self.tts_model, output_format="mp3_22050_32"))
+            except Exception as e:  # noqa: BLE001
+                log.warning("TTS failed: %s", e)
+                continue
+            self._play(audio)  # blocking on purpose: one utterance at a time, never talking over itself
 
     def _play(self, audio: bytes) -> None:
         try:

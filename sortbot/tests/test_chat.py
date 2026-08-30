@@ -103,6 +103,19 @@ def test_directive_queue() -> None:
     assert t.clear() == 3 and t.entries() == []
 
 
+def test_push_dedupe() -> None:
+    """q_heard: push-to-talk and the Listening stream can hear the same sentence -- it must arrive once."""
+    v = VoiceIO(force_text=True)
+    v.push("put the red ones on the left")
+    v.push("Put the red ones on the left  ")  # same sentence, different casing/spacing, moments later
+    assert v.peek() == ["put the red ones on the left"], v.peek()
+    v.push("and the blue ones on the right")
+    assert len(v.peek()) == 2, v.peek()
+    v._last_push = (v._last_push[0], 0.0)  # pretend the window has passed
+    v.push("and the blue ones on the right")
+    assert len(v.peek()) == 3, "a genuine repeat after the window must still get through"
+
+
 def test_speak_priority() -> None:
     """q_say: ONE worker (the bot never talks over itself) and a fresh reply drops the stale backlog."""
     v = VoiceIO(force_text=True)
@@ -256,6 +269,33 @@ def test_chat_worker() -> None:
         )
         assert not session.chat.last_error, session.chat.last_error
 
+        # --- 2b. URGENT ON AN INTERIM TRANSCRIPT: fires mid-sentence, before endpointing ---
+        # (session.vlm is still BoomChatVLM: any model call here fails the test)
+        session.ctl.stop_ev.clear()
+        session.ctl.pause_ev.clear()
+        session.chat._last_ack = None
+        before = len(session.transcript.entries())
+        n0 = session.chat.urgent_from_partials
+        session.voice._on_partial("luna, sto")        # not recognisable yet -> nothing happens
+        assert not session.ctl.stop_ev.is_set() and session.chat.urgent_from_partials == n0
+        t0 = time.time()
+        session.voice._on_partial("luna, stop")       # the word lands -> stop, right now
+        assert session.ctl.stop_ev.is_set(), "an interim 'stop' did not fire the stop path"
+        assert time.time() - t0 < 0.5, "the interim urgent path must be synchronous"
+        assert session.chat.urgent_from_partials == n0 + 1
+        assert session.voice.last_said == "Stopping."
+        session.voice._on_partial("luna, stop right now please")  # same utterance -> fires once
+        assert session.chat.urgent_from_partials == n0 + 1, "the urgent fired twice for one utterance"
+        # no transcript line from the partial: the endpointed sentence adds it, in the right order
+        assert len(session.transcript.entries()) == before, session.transcript.entries()[before:]
+        # ... and when the endpointed sentence arrives, it is NOT acknowledged out loud a second time
+        session.voice.speak("something else")
+        session.chat.handle("luna, stop!")
+        assert session.ctl.stop_ev.is_set()
+        assert session.voice.last_said == "something else", "the stop was acknowledged twice"
+        said = [e["text"] for e in session.transcript.entries()[before:]]
+        assert said.count("Stopping.") == 1 and any(s.startswith("luna, stop") for s in said), said
+
         # a pause is urgent too, and is also regex-only
         session.ctl.stop_ev.clear()
         session.chat.handle("hold on a second")  # synchronous: no race here
@@ -319,6 +359,7 @@ def test_chat() -> None:
     assert urgent_kind("what are you doing") == "none"
     assert bare_command("open") == "open" and bare_command("what is open") is None
     test_directive_queue()
+    test_push_dedupe()
     test_speak_priority()
     test_chat_worker()
 

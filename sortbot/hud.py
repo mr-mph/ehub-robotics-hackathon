@@ -134,6 +134,7 @@ h1{font-size:15px;margin:0;letter-spacing:3px;color:var(--acc);font-weight:700}
 #chatlog .you{align-self:flex-end;background:var(--bg2);border:1px solid var(--line2)}
 #chatlog .luna{align-self:flex-start;background:rgba(55,177,131,.13);border:1px solid var(--acc2)}
 #chatlog .thinking{align-self:flex-start;color:var(--tx2);font-style:italic;border:none;background:none}
+#chatlog .interim{align-self:flex-end;color:var(--tx1);font-style:italic;border:1px dashed var(--line2);background:none}
 #graspnote.bad{color:#ffb3b5}
 #graspnote.good{color:var(--acc)}
 input,select{background:#0b0f14;color:var(--tx);border:1px solid var(--line2);border-radius:var(--rs);padding:9px 10px;min-height:40px;font:12px var(--mono);width:80px}
@@ -659,14 +660,16 @@ function renderModels(){const d=window._models;if(!d)return;const cur=d.current|
   showMsg(sl,j);window._models=null;loadModels();});}
 // ---------- conversation transcript (newest last, auto-scrolling) ----------
 let chatSig='';
-function renderChat(c){
+function renderChat(c,v){
  const box=$('chatlog');if(!box)return;
  const lines=(c&&c.transcript)||[];
- const sig=lines.map(l=>l.i).join(',')+'|'+((c&&c.thinking)?'1':'0');
+ const interim=(v&&v.last_partial)||'';
+ const sig=lines.map(l=>l.i).join(',')+'|'+((c&&c.thinking)?'1':'0')+'|'+interim;
  if(sig===chatSig)return;chatSig=sig;
  const near=box.scrollHeight-box.scrollTop-box.clientHeight<60;
  box.innerHTML=lines.map(l=>'<div class="cl '+(l.who==='luna'?'luna':'you')+'"><span class="who">'+
    (l.who==='luna'?'Luna':'you')+' &middot; '+new Date(l.t*1000).toLocaleTimeString()+'</span>'+esc(l.text)+'</div>').join('')
+  +(interim?'<div class="cl interim">'+esc(interim)+' ...</div>':'')
   +((c&&c.thinking)?'<div class="cl thinking">Luna is thinking...</div>':'')
   ||'<span class="empty">Say something to Luna - ask what she is doing, or tell her a new rule.</span>';
  if(near||lines.length)box.scrollTop=box.scrollHeight;}
@@ -830,7 +833,8 @@ async function tick(){let s;
  // mic chip + toggle
  const listening=!!(s.voice&&s.voice.listening);
  $('micchip').hidden=!listening;
- $('mictoggle').textContent=listening?'● Listening: ON':'Listening: OFF';
+ const sm=(s.voice&&s.voice.stt_mode)||'';
+ $('mictoggle').textContent=listening?('● Listening: ON'+(sm==='stream'?' (live)':(sm==='chunk'?' (4s chunks)':''))):'Listening: OFF';
  $('mictoggle').classList.toggle('live',listening);
  renderChecklist();
  // readout bar (fixed-height, mono: no layout shift)
@@ -871,7 +875,7 @@ async function tick(){let s;
  if(s.voice){$('vqueue').textContent=(s.voice.queue||[]).join(' | ')||'none';
   if(s.voice.last_transcript&&!$('transcript').textContent.startsWith('!!')&&$('transcript').textContent!=='transcribing...')
    $('transcript').textContent='heard: "'+s.voice.last_transcript+'"';}
- renderChat(s.chat);
+ renderChat(s.chat,s.voice);
  renderGrasp(s.grasp);
  if(s.chat&&s.chat.model)$('chatmdl').textContent=s.chat.model+(s.chat.last_latency_ms!=null?'  '+s.chat.last_latency_ms+' ms':'');
  renderRules(s.rules);

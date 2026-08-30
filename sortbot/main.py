@@ -265,6 +265,10 @@ class ChatWorker:
 
     POLL_S = 0.05
     ACKS = {"stop": "Stopping.", "pause": "Pausing."}
+    #: an urgent utterance is normally seen TWICE -- once as an interim transcript (which is what makes
+    #: the stop instant) and again as the endpointed sentence. The events are idempotent, but the spoken
+    #: acknowledgement must not be said twice, so a repeat of the same kind inside this window is silent.
+    URGENT_ACK_S = 4.0
 
     def __init__(self, voice: VoiceIO, directives: DirectiveQueue, transcript: Transcript,
                  vlm_fn, ctx_fn, frames_fn, urgent_fn=None, log_fn=None):
@@ -275,6 +279,8 @@ class ChatWorker:
         self.last_error = ""
         self.busy = False
         self.replies = 0
+        self.urgent_from_partials = 0
+        self._last_ack: tuple[str, float] | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -361,7 +367,15 @@ class ChatWorker:
                      say=reply, latency_ms=self.last_latency_ms)
         return d
 
-    def _urgent(self, kind: str, text: str, speak: bool = True) -> None:
+    def urgent_from_partial(self, kind: str, text: str) -> None:
+        """Called by voice.py from an INTERIM transcript, mid-sentence: the control events are set the
+        moment the word is recognised, without waiting for endpointing and without any model call.
+        No transcript line is written here -- the endpointed sentence adds it a moment later, in order."""
+        self.urgent_from_partials += 1
+        self._urgent(kind, text, transcript=False, why="partial transcript, mid-sentence")
+
+    def _urgent(self, kind: str, text: str, speak: bool = True, transcript: bool = True,
+                why: str = "regex pre-filter") -> None:
         """Take effect IMMEDIATELY: set the control events, then talk about it."""
         if self.urgent_fn is not None:
             try:
@@ -370,12 +384,19 @@ class ChatWorker:
                 log.warning("urgent %s: %s", kind, e)
         if kind == "stop":
             self.directives.put("stop", text)
-        ack = self.ACKS[kind]
-        if speak:
-            self.transcript.add("luna", ack)
+        ack, now = self.ACKS[kind], time.time()
+        # the same urgent seen twice (interim then endpointed) is acknowledged once
+        repeat = self._last_ack is not None and self._last_ack[0] == kind \
+            and now - self._last_ack[1] < self.URGENT_ACK_S
+        if speak and not repeat:
+            self._last_ack = (kind, now)
             self.voice.speak(ack, priority=True)
-        self._record("chat", {"heard": text}, f"URGENT {kind} (regex pre-filter, no model call)",
-                     ok=False, say=ack if speak else "")
+        if transcript:
+            # written once, by the ENDPOINTED sentence (the interim pass sets transcript=False), so the
+            # panel reads "you: luna, stop!" then "Luna: Stopping." even though the stop already happened
+            self.transcript.add("luna", ack)
+        self._record("chat", {"heard": text}, f"URGENT {kind} ({why}, no model call)",
+                     ok=False, say="" if repeat else ack)
 
     def _record(self, tool, args, result, ok=True, say="", latency_ms=None) -> None:
         if self.log_fn is not None:
@@ -988,6 +1009,8 @@ class Session:
         self.transcript = Transcript()
         self.chat = ChatWorker(self.voice, self.directives, self.transcript, lambda: self.vlm,
                                self._chat_context, self._chat_frames, self._chat_urgent, self._chat_log)
+        # a stop heard mid-sentence must not wait for the sentence to end (see voice._on_partial)
+        self.voice.urgent_hook = self.chat.urgent_from_partial
         self._shutdown = threading.Event()
         import sortbot.robot as _rb
         if _rb.large_trim(cfg):
@@ -1679,7 +1702,8 @@ class Session:
         v = self.voice
         # "queue" = everything heard but not yet acted on by the loop: q_heard not yet taken by the chat
         # worker, plus the q_directives it has already distilled and handed on.
-        return {"mode": v.mode, "listening": v.listening,
+        return {"mode": v.mode, "listening": v.listening, "stt_mode": v.stt_mode,
+                "last_partial": v.last_partial, "stream_model": v.stream_model,
                 "queue": v.peek() + [d["text"] for d in self.directives.peek() if d["text"]],
                 "say_queue": v.pending_say(), "last_said": v.last_said,
                 "last_transcript": v.last_transcript,

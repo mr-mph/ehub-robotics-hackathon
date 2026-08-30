@@ -20,6 +20,17 @@ sensibly. There are no zones: the VLM chooses coordinates.
  calibrate.py:   teleoperated calibration session (leader arm + coloured target in the gripper), HUD buttons + keys
 ```
 
+**Hearing you.** With the Listening toggle on, the mic streams straight to ElevenLabs realtime STT over a
+WebSocket (`scribe_v2_realtime`): interim transcripts arrive *while* you are still talking and the finished
+sentence is endpointed by VAD ~0.6 s after you stop, instead of waiting for a fixed 4-second recording to
+end. The old chunked path is still there and takes over automatically if the socket cannot be opened (no
+key, no network, an API error, an older SDK); `GET /state` `voice.stt_mode` says which one is live
+(`stream` / `chunk`) and the Listening button shows it. The mic still NEVER starts unless you toggle it.
+**Interim transcripts are read only by the urgent pre-filter**: "stop" / "wait" fires the Control events the
+moment the word is recognised -- measured firing *127 ms before the speaker finished the sentence* -- while
+only the endpointed sentence reaches `q_heard`. Push-to-talk is unchanged, and an identical utterance
+arriving from both paths within 2.5 s is dropped as a double delivery.
+
 **Two threads, four queues.** The action loop (perception -> one planner call -> one tool) is far too slow
 to hold a conversation, so talking and acting are split. `q_heard` (everything you say) is drained by the
 **`luna-chat`** thread, which answers in ONE fast call (`vlm.chat_model`) within a second or so and pushes the

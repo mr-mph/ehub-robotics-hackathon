@@ -16,6 +16,8 @@ else the text is just logged.
 """
 from __future__ import annotations
 
+import asyncio
+import base64
 import json
 import logging
 import os
@@ -26,6 +28,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -37,7 +40,18 @@ RULES_FILE = REPO_ROOT / "sortbot" / "calib" / "rules.json"
 DEFAULT_VOICE_ID = "21m00Tcm4TlvDq8ikWAM"
 DEFAULT_TTS_MODEL = "eleven_turbo_v2_5"
 DEFAULT_STT_MODEL = "scribe_v2"
-CHUNK_SECONDS = 4.0
+CHUNK_SECONDS = 4.0            # legacy fallback: fixed-length ffmpeg captures, transcribed one at a time
+STREAM_MODEL = "scribe_v2_realtime"   # WebSocket streaming STT (partial + endpointed committed transcripts)
+STREAM_SAMPLE_RATE = 16000
+STREAM_CHUNK_BYTES = 3200      # 100 ms of pcm_s16le @ 16 kHz
+#: How long VAD must hear silence before it endpoints the utterance (API range 0.3 .. 3.0 s). Measured:
+#: 0.5 s -> the transcript lands ~520 ms after you stop talking, 0.8 s -> ~650 ms. 0.7 is the compromise:
+#: the extra ~130 ms buys tolerance for a mid-sentence pause, and a sentence split in half costs a whole
+#: extra reply (and Luna answering only the second half), which is far more visible than 130 ms.
+STREAM_VAD_SILENCE_S = 0.7
+#: an identical utterance arriving twice inside this window is a double delivery (push-to-talk firing
+#: while the Listening stream is also running), not the human saying the same thing twice
+DEDUPE_S = 2.5
 
 
 # ---------------------------------------------------------------- classifier
@@ -211,6 +225,16 @@ class VoiceIO:
         self.mode = "text"  # mic NEVER auto-starts; toggle with mic_on()/mic_off()
         self._mic_ok = bool(self._client and shutil.which("ffmpeg") and sys.platform == "darwin")
         self._mic_thread = None
+        # --- streaming STT (see _stream_loop): which path the mic is actually using right now ---
+        self.stt_mode = ""              # "" (mic off) | "stream" | "chunk"
+        self.last_partial = ""          # newest interim transcript, for the HUD
+        #: fired from an INTERIM transcript the moment stop/pause-shaped speech is recognised, so an
+        #: E-STOP never waits for endpointing, let alone for a model. Set by main.Session.
+        self.urgent_hook = None         # callable(kind: "stop"|"pause", text: str)
+        self._partial_urgent = None     # the urgent kind already fired for the utterance in progress
+        self._last_push: tuple[str, float] = ("", 0.0)
+        self._stream_proc = None
+        self.stream_model = STREAM_MODEL
         self._player = next((p for p in ("ffplay", "afplay") if shutil.which(p)), None)
         # ONE speech worker: synth + playback are serialized so the bot never talks over itself,
         # and the sorting loop never blocks on the TTS network call. Backlog is capped: stale
@@ -248,8 +272,11 @@ class VoiceIO:
     def mic_off(self) -> str:
         if self._mic_thread:
             getattr(self, "_mic_stop", self._stop).set()
+            # the streaming path blocks on ffmpeg's stdout: killing the capture is what unblocks it
+            self._kill_stream_proc()
             self._mic_thread.join(timeout=CHUNK_SECONDS + 2)
             self._mic_thread = None
+        self.stt_mode = ""
         self.mode = "text"
         return "mic off"
 
@@ -262,9 +289,21 @@ class VoiceIO:
                 return out
 
     def push(self, text: str) -> None:
-        """Inject a command (HUD / tests)."""
-        if text.strip():
-            self._q.put(text.strip())
+        """q_heard: inject an utterance (streaming STT, push-to-talk, the HUD text box, tests).
+
+        Push-to-talk and the Listening stream can both hear the same sentence (holding the mic button
+        while the toggle is on), so an identical utterance repeated inside DEDUPE_S is dropped as a
+        double delivery. A human really saying the same thing twice that fast is not a case worth
+        serving, and a duplicate would cost a second model call and a second spoken reply."""
+        text = text.strip()
+        if not text:
+            return
+        now, key = time.time(), " ".join(text.lower().split())
+        if key == self._last_push[0] and now - self._last_push[1] < DEDUPE_S:
+            log.info("dropping duplicate utterance %r (heard twice within %.1fs)", text, DEDUPE_S)
+            return
+        self._last_push = (key, now)
+        self._q.put(text)
 
     def peek(self) -> list[str]:
         """Snapshot of pending (undrained) commands, oldest first."""
@@ -277,7 +316,139 @@ class VoiceIO:
                 break
             self.push(line)
 
+    # ---------------------------------------------------------------- listening
     def _mic_loop(self) -> None:
+        """The Listening toggle's thread. Prefers STREAMING STT and falls back to the fixed-chunk path
+        if the socket cannot be opened or dies -- the toggle keeps working either way, and the mode in
+        use is logged and served in /state (voice.stt_mode)."""
+        if self._stream_ok():
+            try:
+                asyncio.run(self._stream_loop())
+                self.stt_mode = ""
+                return
+            except Exception as e:  # noqa: BLE001 - any streaming failure falls back, never kills the mic
+                log.warning("streaming STT unavailable (%s); falling back to %.0f s chunks",
+                            e, CHUNK_SECONDS)
+            finally:
+                self._kill_stream_proc()
+        stop = getattr(self, "_mic_stop", self._stop)
+        if stop.is_set() or self._stop.is_set():
+            self.stt_mode = ""
+            return
+        self.stt_mode = "chunk"
+        log.info("mic: fixed %.0f s chunks (transcript arrives on the chunk boundary)", CHUNK_SECONDS)
+        self._chunk_loop()
+        self.stt_mode = ""
+
+    def _stream_ok(self) -> bool:
+        """Streaming needs a key, ffmpeg, macOS avfoundation and an SDK new enough to have realtime STT."""
+        if not (self._client and shutil.which("ffmpeg") and sys.platform == "darwin"):
+            return False
+        try:
+            from elevenlabs.realtime.connection import RealtimeEvents  # noqa: F401
+            from elevenlabs.realtime.scribe import AudioFormat, CommitStrategy  # noqa: F401
+        except Exception as e:  # noqa: BLE001
+            log.info("realtime STT not available in this elevenlabs SDK (%s)", e)
+            return False
+        return True
+
+    # -- streaming path
+    async def _stream_loop(self) -> None:
+        """Continuous ffmpeg capture -> ElevenLabs realtime STT over a WebSocket.
+
+        Two kinds of transcript come back and they are used for DIFFERENT things:
+          partial_transcript   -- interim, arrives WHILE the human is still talking. Only the urgent
+                                  pre-filter reads these: "stop" must fire the moment the word is
+                                  recognised, not after endpointing and certainly not after a model call.
+          committed_transcript -- endpointed by VAD once they stop talking (~0.3 s), the real utterance.
+                                  This is what goes onto q_heard for the chat worker.
+        """
+        from elevenlabs.client import AsyncElevenLabs
+        from elevenlabs.realtime.connection import RealtimeEvents
+        from elevenlabs.realtime.scribe import AudioFormat, CommitStrategy
+
+        stop = getattr(self, "_mic_stop", self._stop)
+        client = AsyncElevenLabs(api_key=os.environ.get("ELEVENLABS_API_KEY"))
+        conn = await client.speech_to_text.realtime.connect({
+            "model_id": self.stream_model,
+            "audio_format": AudioFormat.PCM_16000,
+            "sample_rate": STREAM_SAMPLE_RATE,
+            "commit_strategy": CommitStrategy.VAD,
+            "vad_silence_threshold_secs": STREAM_VAD_SILENCE_S,
+        })
+        conn.on(RealtimeEvents.PARTIAL_TRANSCRIPT, lambda d: self._on_partial(str(d.get("text", ""))))
+        conn.on(RealtimeEvents.COMMITTED_TRANSCRIPT, lambda d: self._on_final(str(d.get("text", ""))))
+        for ev in (RealtimeEvents.ERROR, RealtimeEvents.AUTH_ERROR, RealtimeEvents.QUOTA_EXCEEDED,
+                   RealtimeEvents.TRANSCRIBER_ERROR, RealtimeEvents.INVALID_REQUEST):
+            conn.on(ev, lambda d, ev=ev: log.warning("streaming STT %s: %s", ev.value, str(d)[:200]))
+        self.stt_mode = "stream"
+        log.info("mic: STREAMING STT (%s), endpointed after %.1f s of silence",
+                 self.stream_model, STREAM_VAD_SILENCE_S)
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-loglevel", "error", "-f", "avfoundation", "-i", ":0",
+            "-ar", str(STREAM_SAMPLE_RATE), "-ac", "1", "-f", "s16le", "pipe:1",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        self._stream_proc = proc
+        try:
+            while not (self._stop.is_set() or stop.is_set()):
+                chunk = await proc.stdout.read(STREAM_CHUNK_BYTES)
+                if not chunk:
+                    raise RuntimeError("mic capture ended (ffmpeg closed the stream)")
+                await self.feed_audio(conn, chunk)
+        finally:
+            self._kill_stream_proc()
+            try:
+                await conn.close()
+            except Exception as e:  # noqa: BLE001
+                log.debug("streaming STT close: %s", e)
+
+    @staticmethod
+    async def feed_audio(conn, pcm: bytes) -> None:
+        """One pcm_s16le @ 16 kHz chunk to the socket. Split out so a test (and the latency probe) can
+        drive the real connection with recorded audio instead of a microphone."""
+        await conn.send({"audio_base_64": base64.b64encode(pcm).decode()})
+
+    def _kill_stream_proc(self) -> None:
+        proc, self._stream_proc = self._stream_proc, None
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+            except Exception as e:  # noqa: BLE001
+                log.debug("ffmpeg kill: %s", e)
+
+    def _on_partial(self, text: str) -> None:
+        """INTERIM transcript. The ONLY thing allowed to act on it is the urgent pre-filter -- a partial
+        is not a finished sentence, so it never reaches q_heard, but "stop" cannot wait for the sentence
+        to finish. Fires at most once per utterance per kind."""
+        text = text.strip()
+        if not text:
+            return
+        self.last_partial = text
+        kind = urgent_kind(text)
+        if kind == "none" or kind == self._partial_urgent:
+            return
+        self._partial_urgent = kind
+        log.warning("URGENT %r heard mid-sentence: %r", kind, text)
+        hook = self.urgent_hook
+        if hook is not None:
+            try:
+                hook(kind, text)
+            except Exception as e:  # noqa: BLE001 - the mic must survive a bad hook
+                log.warning("urgent hook: %s", e)
+
+    def _on_final(self, text: str) -> None:
+        """Endpointed utterance -> q_heard, exactly like a push-to-talk clip."""
+        self._partial_urgent = None
+        self.last_partial = ""
+        text = text.strip()
+        if not text:
+            return
+        self.last_transcript = text
+        log.info("heard: %s", text)
+        self.push(text)
+
+    # -- fallback path (pre-streaming behaviour, unchanged)
+    def _chunk_loop(self) -> None:
         stop = getattr(self, "_mic_stop", self._stop)
         while not (self._stop.is_set() or stop.is_set()):
             wav = self._record(CHUNK_SECONDS)

@@ -1,4 +1,5 @@
-"""End-to-end mock run: `python -m sortbot.tests.test_e2e_mock` or pytest."""
+"""End-to-end run with the test doubles injected straight into the Loop (no mock mode exists in
+the app; the doubles live in sortbot/testing.py): `python -m sortbot.tests.test_e2e` or pytest."""
 from __future__ import annotations
 
 import io
@@ -10,8 +11,7 @@ from pathlib import Path
 
 from sortbot import config as cfgmod
 from sortbot import main as m
-from sortbot.robot import MockRobot
-from sortbot.vlm import MockVLM
+from sortbot.testing import MockRobot, MockVLM, SimScene
 from sortbot.voice import RulesStore, VoiceIO
 
 
@@ -21,10 +21,10 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-def test_e2e_mock(with_hud: bool = True) -> None:
+def test_e2e(with_hud: bool = True) -> None:
     logging.disable(logging.WARNING)
     cfg = cfgmod.load()
-    scene = m.SimScene(MockRobot(cfg), cfg)
+    scene = SimScene(MockRobot(cfg), cfg)
     n_objects = len(scene.blobs)
     voice = VoiceIO(stdin=io.StringIO("put white things in wires\n"), force_text=True)
     voice.start()
@@ -56,4 +56,4 @@ def test_e2e_mock(with_hud: bool = True) -> None:
 
 
 if __name__ == "__main__":
-    test_e2e_mock()
+    test_e2e()

@@ -117,19 +117,11 @@ body.showhelp .help{display:block}
 .note{color:var(--tx2);font-size:11.5px;margin-top:6px;line-height:1.5}
 .mono{font:12px/1.5 var(--mono);color:var(--tx1);white-space:pre-wrap;word-break:break-word}
 .empty{color:var(--tx2);font-style:italic;font-size:12px}
-.cards{display:flex;flex-direction:column;gap:8px}
-.mcard{display:block;text-align:left;background:var(--bg2);border:1px solid var(--line2);border-radius:var(--r);padding:12px 40px 12px 14px;cursor:pointer;font:inherit;color:var(--tx);min-height:44px;position:relative;width:100%}
-.mcard:hover{border-color:#4a5a72}
-.mcard.sel{border-color:var(--acc);outline:1px solid var(--acc)}
-.mcard.sel::after{content:'\2713';position:absolute;right:14px;top:12px;color:var(--acc);font-weight:800;font-size:16px}
-.mcard .mt{font-weight:700;font-size:14px;margin-bottom:2px}
-.mcard .md{color:var(--tx1);font-size:12px}
-.adv{margin-top:8px}
-.adv summary{color:var(--tx2);cursor:pointer;font-size:12px;padding:6px 0}
-.pillgrp{display:flex;align-items:center;gap:4px;margin:4px 0}
-.pillgrp .lbl{color:var(--tx2);font-size:11px;text-transform:uppercase;width:46px}
-.pill{background:var(--bg2);border:1px solid var(--line2);color:var(--tx1);border-radius:14px;padding:6px 12px;min-height:32px;cursor:pointer;font:12px inherit}
-.pill.sel{background:#173627;border-color:var(--acc);color:#c9f5e2}
+.crow{display:flex;align-items:center;gap:10px;margin:8px 0;flex-wrap:wrap}
+.crow .cn{font-weight:700;font-size:13px;width:110px}
+.crow .cd{color:var(--tx1);font-size:11.5px;flex:1;min-width:120px}
+.crow .cst{font:11px var(--mono);color:var(--tx2);width:78px;text-align:right}
+.crow .cst.on{color:var(--acc)}
 .guide{margin:8px 0;padding:0;list-style:none;counter-reset:g}
 .guide li{position:relative;padding:7px 8px 7px 36px;color:var(--tx1);border-radius:var(--rs);counter-increment:g;font-size:12.5px;line-height:1.45;margin:2px 0}
 .guide li::before{content:counter(g);position:absolute;left:7px;top:8px;width:20px;height:20px;border-radius:50%;background:var(--bg2);border:1px solid var(--line2);display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:var(--tx1)}
@@ -195,7 +187,7 @@ body.showhelp .help{display:block}
 </header>
 <div id="checklist" hidden>
  <span class="ttl">First run</span>
- <a class="st" id="ck1" href="#"><span class="n">1</span>Choose mode</a><span class="sep">&rarr;</span>
+ <a class="st" id="ck1" href="#"><span class="n">1</span>Connect devices</a><span class="sep">&rarr;</span>
  <a class="st" id="ck2" href="#"><span class="n">2</span>Calibrate</a><span class="sep">&rarr;</span>
  <a class="st" id="ck3" href="#"><span class="n">3</span>Start sorting</a>
  <button id="ckx" title="Hide this checklist">&#10005;</button>
@@ -220,10 +212,9 @@ body.showhelp .help{display:block}
 
  <section class="tabsec" id="tab-setup">
   <div class="sec" id="sec-mode" hidden>
-   <h3>1 &middot; Choose what to run</h3>
-   <div class="cards" id="modecards"></div>
-   <div class="help" data-h="set_mode"></div>
-   <details class="adv"><summary>Advanced: pick each device separately</summary><div id="pills"></div></details>
+   <h3>1 &middot; Connect the devices</h3>
+   <div id="connrows"></div>
+   <div class="note">Cameras work without the robot (tune perception, nothing moves). Sorting needs all three connected.</div>
    <div class="rowmsg" id="msg-setup"></div>
   </div>
   <div class="sec" id="sec-calib" hidden>
@@ -360,16 +351,16 @@ const $=id=>document.getElementById(id);
 const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const TABS=['setup','operate','tune','debug'];
 const TABOF={run:'operate',robot:'debug',perception:'tune',calibration:'setup',voice:'operate',rules:'operate',models:'tune',log:'debug'};
-const CLAIMED=new Set(['set_mode','start','pause','resume','stop','step_once','set_max_steps','set_task',
+const CLAIMED=new Set(['connect_robot','connect_cameras','connect_vlm','start','pause','resume','stop','step_once','set_max_steps','set_task',
  'home','open_gripper','close_gripper','jog','goto','torque_off','torque_on',
  'say_to_bot','say_to_robot','transcribe','speak','mic_on','mic_off',
  'add_rule','delete_rule','move_rule','clear_hints','get_models','set_model',
  'set_detector_params','redetect','toggle_mask','set_zone_drop','px_to_mm','log_clear',
  'calib_start','calib_touch','calib_capture','calib_undo','calib_finish','calib_cancel','calib_sample']);
-const PRESETS=[
- ['Simulation','Mock robot, synthetic camera and planner. Safe to try everything, no hardware needed.',{robot:'mock',cams:'sim',vlm:'mock'}],
- ['Real robot','SO-101 arm + both cameras + live vision model. The arm will move!',{robot:'real',cams:'real',vlm:'live'}],
- ['Cameras only','Real cameras with a mock arm: check detection and tune perception, nothing moves.',{robot:'mock',cams:'real',vlm:'mock'}]];
+const DEVICES=[
+ ['robot','connect_robot','Robot','SO-101 follower arm. Torque comes on when connected; the arm moves only on your actions.'],
+ ['cams','connect_cameras','Cameras','Overhead + wrist. Works without the robot for perception tuning.'],
+ ['vlm','connect_vlm','Vision model','The OpenAI planner (needs OPENAI_API_KEY in .env).']];
 const GUIDE=[
  'Put the green ball (or any bright object) in the gripper, then <b>click it in the overhead image</b>. A green circle confirms the target is locked.',
  'Press <b>Start calibration</b> &mdash; the leader arm now drives the follower. Move it gently by hand.',
@@ -413,13 +404,13 @@ function genericRow(a,showName){const ins=(a.params||[]).map(p=>{const d=p.defau
 function wireRows(root){root.querySelectorAll('button[data-n]').forEach(b=>b.onclick=()=>{const body={};
  b.parentElement.querySelectorAll('input').forEach(i=>{const v=i.value.trim();if(v!=='')body[i.dataset.p]=numify(v);});
  act(b.dataset.n,body,b);});}
-function buildCards(){const mc=$('modecards');mc.innerHTML=PRESETS.map((p,i)=>
- '<button class="mcard" data-i="'+i+'"><div class="mt">'+esc(p[0])+'</div><div class="md">'+esc(p[1])+'</div></button>').join('');
- mc.querySelectorAll('.mcard').forEach(b=>b.onclick=()=>act('set_mode',PRESETS[+b.dataset.i][2],b));
- $('pills').innerHTML=[['robot',['mock','real','off']],['cams',['sim','real','off']],['vlm',['mock','live','off']]].map(([k,vs])=>
-  '<span class="pillgrp"><span class="lbl">'+k+'</span>'+vs.map(v=>
-  '<button class="pill" data-k="'+k+'" data-v="'+v+'">'+v+'</button>').join('')+'</span>').join('');
- $('pills').querySelectorAll('.pill').forEach(b=>b.onclick=()=>act('set_mode',{[b.dataset.k]:b.dataset.v},b));}
+function buildConn(){$('connrows').innerHTML=DEVICES.map(([k,a,t,d])=>
+ '<div class="crow"><span class="cn">'+esc(t)+'</span><span class="cst" data-ck="'+k+'">off</span>'+
+ '<button class="btn" data-ca="'+esc(a)+'" data-ck="'+k+'" title="'+esc(helpOf(a))+'">Connect</button>'+
+ '<span class="cd">'+esc(d)+'</span><div class="help">'+esc(helpOf(a))+'</div></div>').join('');
+ $('connrows').querySelectorAll('button[data-ca]').forEach(b=>b.onclick=()=>{
+  const on=!!(((S.run&&S.run.connected)||{})[b.dataset.ck]);
+  act(b.dataset.ca,{connect:!on},b);});}
 function buildCalib(){
  $('calguide').innerHTML=GUIDE.map(g=>'<li>'+g+'</li>').join('');
  const order=['calib_start','calib_capture','calib_touch','calib_undo','calib_finish','calib_cancel'];
@@ -453,7 +444,7 @@ function applyHelp(){document.querySelectorAll('[data-h]').forEach(el=>{el.textC
  document.querySelectorAll('[data-h-title]').forEach(el=>{const h=helpOf(el.dataset.hTitle);if(h)el.title=h;});}
 function renderAll(){
  const has=n=>!!ACT[n];
- $('sec-mode').hidden=!has('set_mode');
+ $('sec-mode').hidden=!has('connect_robot');
  $('sec-calib').hidden=!has('calib_start');
  $('sec-task').hidden=!has('set_task');
  $('sec-run').hidden=!has('start');
@@ -465,7 +456,7 @@ function renderAll(){
  $('sec-robot').hidden=!has('home');
  $('sec-log').hidden=!has('log_clear');
  $('mictoggle').hidden=!has('mic_on');
- if(has('set_mode'))buildCards();
+ if(has('connect_robot'))buildConn();
  if(has('calib_start'))buildCalib();
  if(has('set_detector_params'))buildSliders();
  if(has('home'))buildJog();
@@ -604,7 +595,7 @@ function bannerInfo(){
  if(ph==='done')return['Done - '+(r.result||'finished')+' Start again from Operate.','ok','operate'];
  if(ph==='stopped')return['Stopped'+(r.result?' - '+r.result:'')+'. Start again from Operate.','','operate'];
  const miss=['robot','cams','vlm'].filter(k=>!c[k]);
- if(miss.length)return['Not connected ('+miss.join(', ')+') - choose a mode in Setup.','amber','setup'];
+ if(miss.length)return['Not connected ('+miss.join(', ')+') - connect the devices in Setup.','amber','setup'];
  if(S.perception&&S.perception.calibrated===false)return['Not calibrated - open Setup and run the camera calibration.','amber','setup'];
  return['Ready - set a task and press Start in Operate.','ok','operate'];}
 function renderChecklist(){
@@ -614,7 +605,7 @@ function renderChecklist(){
  el.hidden=false;
  const c=r.connected||{},cal=S.calibration;
  const d1=!!(c.robot&&c.cams&&c.vlm);
- const d2=(r.mode&&r.mode.cams==='sim')||!!(S.perception&&S.perception.calibrated)||!!(cal&&cal.state==='fitted');
+ const d2=!!(S.perception&&S.perception.calibrated)||!!(cal&&cal.state==='fitted');
  const cur=!d1?1:(!d2?2:3);
  [[1,d1],[2,d1&&d2],[3,false]].forEach(([i,done])=>{const st=$('ck'+i);
   st.classList.toggle('done',!!done);st.classList.toggle('cur',i===cur);});}
@@ -658,7 +649,7 @@ function updateEnables(){
  const r=S.run;if(!r)return;
  const c=r.connected||{},ph=r.phase,running=ph==='running',paused=ph==='paused',active=running||paused;
  const miss=['robot','cams','vlm'].filter(k=>!c[k]);
- const needs='needs '+miss.join(' + ')+' connected - pick a mode in Setup';
+ const needs='needs '+miss.join(' + ')+' connected - connect the devices in Setup';
  const toff=S.robot&&S.robot.torque===false;
  dis($('b-start'),active?'already running - Stop first':(miss.length?needs:null));
  dis($('b-pause'),running?null:'no run in progress');
@@ -667,32 +658,32 @@ function updateEnables(){
  dis($('b-step'),(running&&!paused)?'pause first to single-step':(miss.length&&!active?needs:null));
  $('why-run').textContent=(!active&&miss.length)?('Start '+needs):(paused&&toff?'Resume is blocked: torque is off (E-STOP) - press Torque on first':'');
  const noRobot=!c.robot;
- const rWhy=noRobot?'needs a robot connected - pick a mode in Setup':
+ const rWhy=noRobot?'needs a robot connected - connect it in Setup':
   (running&&!paused?'the sorting loop is running - pause it first':(toff?'torque is off (E-STOP) - press Torque on':null));
  ['b-home','b-open','b-close','b-goto'].forEach(id=>dis($(id),rWhy));
  const jw=noRobot?rWhy:(running&&!paused?rWhy:(toff?rWhy:null));
  document.querySelectorAll('#jogpad button').forEach(b=>dis(b,jw));
- dis($('b-ton'),noRobot?'needs a robot connected - pick a mode in Setup':null);
+ dis($('b-ton'),noRobot?'needs a robot connected - connect it in Setup':null);
  $('why-robot').textContent=rWhy||'';
  const cal=S.calibration,calRun=cal&&cal.state==='running';
  $('calbtns').querySelectorAll('button[data-n]').forEach(b=>{const n=b.dataset.n;
-  if(n==='calib_start')dis(b,calRun?'calibration is already running':(noRobot&&ACT.set_mode?'needs a robot connected - step 1 above':null));
+  if(n==='calib_start')dis(b,calRun?'calibration is already running':(noRobot&&ACT.connect_robot?'needs a robot connected - step 1 above':null));
   else dis(b,calRun?null:'press Start calibration first');});
- $('why-calib').textContent=calRun?'':(noRobot&&ACT.set_mode?'Calibration needs a robot - finish step 1 above.':'');
- $('modecards').querySelectorAll('.mcard').forEach(b=>{const p=PRESETS[+b.dataset.i][2],m=r.mode||{};
-  b.classList.toggle('sel',p.robot===m.robot&&p.cams===m.cams&&p.vlm===m.vlm);
-  dis(b,active?'stop the run before changing mode':null);});
- $('pills').querySelectorAll('.pill').forEach(b=>{b.classList.toggle('sel',(r.mode||{})[b.dataset.k]===b.dataset.v);
-  dis(b,active?'stop the run before changing mode':null);});}
+ $('why-calib').textContent=calRun?'':(noRobot&&ACT.connect_robot?'Calibration needs a robot - finish step 1 above.':'');
+ $('connrows').querySelectorAll('button[data-ca]').forEach(b=>{const on=!!c[b.dataset.ck];
+  b.textContent=on?'Disconnect':'Connect';b.classList.toggle('primary',!on);
+  dis(b,active?'stop the run before connecting or disconnecting':(calRun?'finish or cancel the calibration first':null));});
+ $('connrows').querySelectorAll('.cst').forEach(el=>{const on=!!c[el.dataset.ck];
+  el.textContent=on?'connected':'off';el.classList.toggle('on',on);});}
 async function tick(){let s;
  try{s=await(await fetch('/state')).json();}catch(e){return;}
  S=s;
  const r=s.run,rb=s.robot,cal=s.calibration;
  if(s.frame_wh){frameW=s.frame_wh[0];frameH=s.frame_wh[1];haveWH=true;}
  // header: connection dots
- const modes=(r&&r.mode)||{},conn=(r&&r.connected)||{};
+ const conn=(r&&r.connected)||{};
  [['robot','cd-robot'],['cams','cd-cams'],['vlm','cd-vlm']].forEach(([k,id])=>{const el=$(id);
-  el.classList.toggle('on',!!conn[k]);el.querySelector('.cv').textContent=modes[k]||'off';});
+  el.classList.toggle('on',!!conn[k]);el.querySelector('.cv').textContent=conn[k]?'on':'off';});
  // banner
  const b=bannerInfo();
  $('banner').textContent=b[0];$('banner').title=b[0];$('banner').className=b[1];$('banner').dataset.tab=b[2];

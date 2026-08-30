@@ -1,4 +1,5 @@
-"""Robot layer: SO101Robot (real SO101Follower) and MockRobot (kinematic sim), both satisfy RobotAPI.
+"""Robot layer: SO101Robot (real SO101Follower via lerobot), satisfies RobotAPI; _KinematicBase carries the
+frame math, safety envelope and motion planning (sortbot/testing.py's MockRobot subclasses it for tests).
 
 Table frame = mm, origin at base on tabletop, x fwd, y left, z up. Base frame = meters (URDF base_link,
 whose origin is ~2 mm above the base's underside, so identity is a sane uncalibrated default).
@@ -322,31 +323,6 @@ class _KinematicBase:
         time.sleep(s)
 
 
-class MockRobot(_KinematicBase):
-    """Pure kinematic sim: joint state in memory, real FK, blank frames. `log` keeps every commanded q."""
-
-    def __init__(self, cfg: cfgmod.Config | None = None, realtime: bool = False):
-        super().__init__(cfg or cfgmod.load())
-        self.realtime = realtime
-        self.q = HOME_JOINTS.copy()
-        self.log: list[np.ndarray] = []
-
-    def _read_joints(self) -> np.ndarray:
-        return self.q.copy()
-
-    def _write_joints(self, q: np.ndarray) -> None:
-        self.q = np.asarray(q, float).copy()
-        self.log.append(self.q)
-
-    def _sleep(self, s: float) -> None:
-        if self.realtime:
-            time.sleep(s)
-
-    def capture(self, name: str) -> np.ndarray:
-        cam = self.cfg.overhead_cam if name == "overhead" else self.cfg.wrist_cam
-        return np.zeros((cam.height, cam.width, 3), np.uint8)
-
-
 class SO101Robot(_KinematicBase):
     """Real arm via lerobot SO101Follower; cameras 'overhead' and 'wrist' are read through the follower."""
 
@@ -416,6 +392,9 @@ class Cameras:
 
 
 def _selftest() -> None:
+    import sortbot.robot as _robot  # run as __main__, the fixture raises sortbot.robot.SafetyError, not ours
+    from sortbot.testing import MockRobot  # test fixture; only reachable from this selftest
+
     cfg = cfgmod.load()
     r = MockRobot(cfg)
     assert isinstance(r, RobotAPI)
@@ -455,7 +434,7 @@ def _selftest() -> None:
         assert not r.move_to(*bad).ok, bad
         try:
             r.check_target(*bad)
-        except SafetyError:
+        except (SafetyError, _robot.SafetyError):
             pass
         else:
             raise AssertionError(bad)

@@ -4,7 +4,7 @@ Drives the arm to N points, reads FK base-frame xyz (meters) and the table-mm po
 in the gripper as seen by the overhead camera (HSV detect with parallax correction, or manual entry), then solves
 the rigid table_T_base with Kabsch. Requires the 4 ArUco tags from config.yaml to be visible.
 
-    ./run.sh -m sortbot.calibrate --mode aruco --mock             # synthetic rig, writes calib.json
+    ./run.sh -m sortbot.calibrate --mode aruco --selftest          # synthetic rig, writes a temp calib.json
     ./run.sh -m sortbot.calibrate --mode aruco --cam-height 700    # real hardware
     ./run.sh -m sortbot.calibrate --mode aruco --manual            # type table mm instead of ball detection
 
@@ -34,37 +34,6 @@ def make_fk(cfg: cfgmod.Config):
     return lambda joints_deg: k.forward_kinematics(np.asarray(joints_deg, float))[:3, 3]
 
 
-class _FakeRig:
-    """--mock: move_to(x, y, z) executes in the *base* frame (identity prior); the hidden transform says where
-    that really is on the table, and the overhead frame is rendered with the ball there."""
-
-    def __init__(self, cfg, cam_h, cam_xy, r_mm):
-        ang = np.deg2rad(4.0)
-        self.T_true = np.eye(4)
-        self.T_true[:3, :3] = [[np.cos(ang), -np.sin(ang), 0], [np.sin(ang), np.cos(ang), 0], [0, 0, 1]]
-        self.T_true[:3, 3] = [8.0, -3.0, 25.0]
-        self.cfg, self.cam_h, self.cam_xy, self.r_mm = cfg, cam_h, cam_xy, r_mm
-        self.mat, self.truth = render_mat(cfg.aruco_tags_mm, cfg.aruco_dict)
-        self.q_mm = self.p_mm = np.zeros(3)
-
-    def move_to(self, x, y, z):
-        self.q_mm = np.array([x, y, z], float)
-        self.p_mm = self.T_true[:3, :3] @ self.q_mm + self.T_true[:3, 3]
-
-    def fk_base_m(self):
-        return self.q_mm / 1000.0
-
-    def frame(self):
-        s = (self.cam_h - self.p_mm[2]) / self.cam_h
-        plane = self.cam_xy + (self.p_mm[:2] - self.cam_xy) / s
-        img = self.mat.copy()
-        cv2.circle(img, tuple(int(round(v)) for v in self.truth(*plane)), 30, (255, 150, 20), -1)
-        return img
-
-    def touch_z_base_m(self):
-        return -self.T_true[2, 3] / 1000.0
-
-
 def measure_base_z_offset(a, fake, robot, fk) -> float:
     if a.base_z_offset_mm is not None:
         return float(a.base_z_offset_mm)
@@ -85,7 +54,7 @@ def measure_base_z_offset(a, fake, robot, fk) -> float:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mock", action="store_true")
+    ap.add_argument("--selftest", action="store_true", help="no hardware: synthetic rig from sortbot/testing.py")
     ap.add_argument("--manual", action="store_true")
     ap.add_argument("--cam-height", type=float, default=700.0)
     ap.add_argument("--cam-xy", type=float, nargs=2, default=None)
@@ -99,11 +68,19 @@ def main(argv=None) -> int:
     tags = np.array(list(cfg.aruco_tags_mm.values()))
     cam_xy = np.array(a.cam_xy if a.cam_xy else tags.mean(0))
     points = [tuple(map(float, p.split(","))) for p in a.points.split(";")] if a.points else DEFAULT_POINTS
-    out = a.out or cfg.calib_file
+    if a.out:
+        out = a.out
+    elif a.selftest:
+        import tempfile
+        from pathlib import Path
+        out = Path(tempfile.mkdtemp()) / "calib_selftest.json"  # NEVER the real calib.json
+    else:
+        out = cfg.calib_file
 
     fake = None
-    if a.mock:
-        fake = robot = _FakeRig(cfg, a.cam_height, cam_xy, a.ball_radius)
+    if a.selftest:
+        from sortbot.testing import ArucoFakeRig  # test fixture; only reachable from this selftest
+        fake = robot = ArucoFakeRig(cfg, a.cam_height, cam_xy, a.ball_radius)
         fk, frame_fn = None, fake.frame
     else:
         from sortbot.robot import SO101Robot
@@ -119,7 +96,7 @@ def main(argv=None) -> int:
     for i, (x, y, z) in enumerate(points):
         print(f"[{i + 1}/{len(points)}] move_to({x:.0f}, {y:.0f}, {z:.0f})")
         robot.move_to(x, y, z)
-        if not a.mock and input("  settle, then Enter (or 's' to skip): ").strip().lower() == "s":
+        if not a.selftest and input("  settle, then Enter (or 's' to skip): ").strip().lower() == "s":
             continue
         frame = frame_fn()
         if not homog.update(frame):
@@ -133,7 +110,7 @@ def main(argv=None) -> int:
             if det:
                 xy = ball_table_xy(homog, det[0], det[1], tz, a.cam_height, tuple(cam_xy))
                 print(f"  ball px=({det[0]:.0f},{det[1]:.0f}) r={det[2]:.0f} -> table ({xy[0]:.1f}, {xy[1]:.1f}) mm")
-        if xy is None and not a.mock:
+        if xy is None and not a.selftest:
             s = input("  table x,y mm of the ball (blank = skip): ").strip()
             if s:
                 xy = tuple(map(float, s.split(",")))
@@ -156,9 +133,9 @@ def main(argv=None) -> int:
     print(f"wrote {out}")
     if fake is not None:
         e_rot, e_t = np.abs(T[:3, :3] - fake.T_true[:3, :3]).max(), np.abs(T[:3, 3] - fake.T_true[:3, 3]).max()
-        print(f"[mock] rotation err {e_rot:.4f}, translation err {e_t:.2f} mm")
-        assert e_rot < 0.005 and e_t < 1.0 and res.max() < 2.0, "mock calibration did not recover ground truth"
-        print("calibrate aruco mock selftest OK")
+        print(f"[selftest] rotation err {e_rot:.4f}, translation err {e_t:.2f} mm")
+        assert e_rot < 0.005 and e_t < 1.0 and res.max() < 2.0, "selftest calibration did not recover ground truth"
+        print("calibrate aruco selftest OK")
     return 0
 
 

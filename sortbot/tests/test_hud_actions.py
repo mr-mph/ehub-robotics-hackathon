@@ -1,7 +1,8 @@
-"""HTTP tests for the HUD action endpoints (server-first main, RUN/ROBOT/VOICE/RULES/MODELS groups), all in mock mode.
+"""HTTP tests for the HUD action endpoints (server-first main, RUN/ROBOT/VOICE/RULES/MODELS groups).
 
 `python -m sortbot.tests.test_hud_actions` or pytest. Every feature is exercised over POST /action/<name>
-against a live HUD server, exactly as the page drives it.
+against a live HUD server, exactly as the page drives it. No hardware: the test doubles from
+sortbot/testing.py are injected through the Session(factories=...) seam.
 """
 from __future__ import annotations
 
@@ -18,6 +19,7 @@ from argparse import Namespace
 from pathlib import Path
 
 from sortbot import main as m
+from sortbot import testing
 
 
 def _free_port() -> int:
@@ -56,10 +58,10 @@ def test_hud_actions() -> None:
     tmp = Path(tempfile.mkdtemp())
     cfg_copy = tmp / "config.yaml"  # set_model persists here, never into the real config.yaml
     shutil.copy(Path(m.__file__).parent / "config.yaml", cfg_copy)
-    args = Namespace(mock=False, real=False, max_steps=40, no_hud=False, no_voice=True, hud_port=port,
-                     live_vlm=False, rules_file=str(tmp / "rules.json"), config=str(cfg_copy))
-    session = m.serve(args)
-    session.step_delay_s = 0.3  # slow the mock loop enough that pause/stop hit it mid-run
+    args = Namespace(max_steps=40, no_voice=True, hud_port=port,
+                     rules_file=str(tmp / "rules.json"), config=str(cfg_copy))
+    session = m.serve(args, factories=testing.session_factories())
+    session.step_delay_s = 0.3  # slow the loop enough that pause/stop hit it mid-run
     get, post = _mk(f"http://127.0.0.1:{port}")
     try:
         # --- server-first: HUD is up with NOTHING connected ---
@@ -68,7 +70,8 @@ def test_hud_actions() -> None:
         assert st["run"]["connected"] == {"robot": False, "cams": False, "vlm": False}
         assert st["robot"] is None
         acts = {a["name"]: a for a in get("/actions")}
-        for name, group in (("set_mode", "run"), ("start", "run"), ("pause", "run"), ("resume", "run"),
+        for name, group in (("connect_robot", "run"), ("connect_cameras", "run"), ("connect_vlm", "run"),
+                            ("start", "run"), ("pause", "run"), ("resume", "run"),
                             ("stop", "run"), ("step_once", "run"), ("set_max_steps", "run"), ("set_task", "run"),
                             ("home", "robot"), ("open_gripper", "robot"), ("close_gripper", "robot"),
                             ("jog", "robot"), ("goto", "robot"), ("torque_off", "robot"), ("torque_on", "robot"),
@@ -80,16 +83,24 @@ def test_hud_actions() -> None:
         assert not r["ok"] and "not connected" in r["message"], r
         assert not post("home")["ok"] and not post("torque_off")["ok"]
 
-        # --- set_mode: bad values are reported, not raised ---
-        r = post("set_mode", {"robot": "banana"})
-        assert not r["ok"] and "banana" in r["message"], r
+        # --- connect errors are reported in the response, never raised ---
+        vlm_factory = session.factories["vlm"]
 
-        # --- connect mock robot + sim cams + mock vlm ---
-        r = post("set_mode", {"robot": "mock", "cams": "sim", "vlm": "mock"})
-        assert r["ok"], r
+        def _boom(s):
+            raise RuntimeError("no key configured")
+
+        session.factories["vlm"] = _boom
+        r = post("connect_vlm")
+        assert not r["ok"] and "no key configured" in r["message"], r
+        assert get("/state")["run"]["connected"]["vlm"] is False
+        session.factories["vlm"] = vlm_factory
+
+        # --- connect the (injected double) devices: robot, cameras, vlm ---
+        assert post("connect_robot")["ok"]
+        assert post("connect_cameras")["ok"]
+        assert post("connect_vlm")["ok"]
         st = get("/state")
         assert st["run"]["connected"] == {"robot": True, "cams": True, "vlm": True}
-        assert st["run"]["mode"] == {"robot": "mock", "cams": "sim", "vlm": "mock"}
         assert st["robot"]["torque"] is True and st["robot"]["gripper_open"] is True
         assert st["calibration"]["state"] == "idle" and "target" in st["calibration"]
 
@@ -175,7 +186,7 @@ def test_hud_actions() -> None:
         assert post("step_once")["ok"]
         _wait(lambda: get("/state")["run"]["step"] == 2 and get("/state")["run"]["phase"] == "paused",
               what="paused after 2 steps")
-        r = post("set_mode", {"vlm": "mock"})  # mode change refused while a run is up
+        r = post("connect_vlm")  # device change refused while a run is up
         assert not r["ok"] and "stop" in r["message"], r
 
         # --- resume to completion ---
@@ -213,7 +224,7 @@ def test_hud_actions() -> None:
         # --- voice from the page ---
         assert post("say_to_robot", {"text": "put white things in wires"})["ok"]
 
-        # --- calibration from the page while idle (mock teleop session, temp calib file) ---
+        # --- calibration from the page while idle (fixture teleop session, temp calib file) ---
         assert post("calib_start")["ok"]
         _wait(lambda: get("/state")["calibration"]["state"] == "running", what="calibration running")
         # hammer /state while the teleop session runs: the single bus lock + cached pose must keep every
@@ -233,9 +244,9 @@ def test_hud_actions() -> None:
 
         hammer = threading.Thread(target=_hammer, daemon=True)
         hammer.start()
-        r = post("set_mode", {"robot": "off"})  # refused while calibrating: the teleop thread owns the arm
+        r = post("connect_robot", {"connect": False})  # refused while calibrating: the teleop thread owns the arm
         assert not r["ok"] and "calibration" in r["message"], r
-        assert get("/state")["calibration"]["state"] in ("running", "fitted"), "calibration must survive set_mode"
+        assert get("/state")["calibration"]["state"] in ("running", "fitted"), "calibration must survive device changes"
         _wait(lambda: get("/state")["calibration"]["state"] == "fitted", timeout=40, what="calibration fitted")
         hammer_stop.set()
         hammer.join(timeout=5)
@@ -246,7 +257,7 @@ def test_hud_actions() -> None:
         # a click on the bare mat (gray pixel) must be rejected, keeping the previous target
         r = post("calib_sample", {"u": 5, "v": 5})
         assert not r["ok"] and "target" in r["message"].lower() and r["data"]["det"] is None, r
-        r = post("set_mode", {"vlm": "mock"})  # the guard releases once the session has finished
+        r = post("connect_vlm")  # the guard releases once the session has finished (reconnect is fine)
         assert r["ok"], r
 
         # --- VOICE group: say_to_bot / transcribe / speak (fake ElevenLabs client; the HTTP path is real) ---
@@ -352,7 +363,7 @@ def test_hud_actions() -> None:
         assert "# indices verified" in ytext, "config.yaml comments were clobbered"
         d = post("get_models")["data"]
         assert d["openai"][0] == "gpt-4o" and d["current"]["elevenlabs_voice"] == "v2", d
-        assert get("/state")["vlm"]["model"] == "mock"  # mock vlm is connected; latency card present
+        assert get("/state")["vlm"]["model"] == "mock"  # injected test VLM; latency card present
 
         # --- LOG group: ring buffer of decisions + events at GET /log, newest first ---
         lg = get("/log")
@@ -361,7 +372,7 @@ def test_hud_actions() -> None:
                    for e in lg), lg[0]
         assert lg[0]["i"] > lg[-1]["i"], "log not newest-first"
         tools = [e["tool"] for e in lg]
-        assert "set_mode" in tools and "voice" in tools and "set_zone_drop" in tools, tools
+        assert "connect_robot" in tools and "voice" in tools and "set_zone_drop" in tools, tools
         picks = [e for e in lg if e["tool"] == "pick"]
         assert picks and any(e["thumb_b64"] for e in picks), "no pick decisions with overlay thumbnails"
         assert any(e["thumb_b64"] and e["thumb_b64"].startswith("/9j/") for e in lg), "thumb is not a jpeg"
@@ -376,7 +387,7 @@ def test_hud_actions() -> None:
         assert not missing_help, f"actions without help text: {missing_help}"
         st = get("/state")
         assert st["voice"]["listening"] is False, "mic must be OFF by default"
-        assert st["perception"]["calibrated"] is True, st["perception"]  # sim cams: always calibrated
+        assert st["perception"]["calibrated"] is True, st["perception"]  # injected fixed H: always calibrated
         session.voice._mic_ok = False  # never start a real ffmpeg mic capture from tests
         r = post("mic_on")
         assert r["ok"] and "unavailable" in r["message"], r

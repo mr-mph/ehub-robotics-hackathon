@@ -1,4 +1,4 @@
-"""VLM planner: one tool call per step via the OpenAI Responses API, plus a deterministic MockVLM.
+"""VLM planner: one tool call per step via the OpenAI Responses API.
 
 plan_step(overhead_overlay_png, wrist_png, world, history) -> Command. Images are PNG bytes.
 history = list of dicts {"tool": str, "args": dict, "result": str} of prior steps (last 10 sent).
@@ -130,27 +130,6 @@ class VLM:
         return Command(TOOL_TO_CMD.get(c.name, c.name), json.loads(c.arguments or "{}"))
 
 
-class MockVLM:
-    """Deterministic: pick lowest id -> place in zones round-robin -> done when no objects remain."""
-
-    def __init__(self, model: str | None = None):
-        self.model = model or "mock"
-        self._zone_i = 0
-        self.last_latency_ms: int | None = None
-        self.last_usage = self.last_cost_usd = None
-
-    def plan_step(self, overhead_overlay_png: bytes, wrist_png: bytes, world: WorldState, history: list) -> Command:
-        if world.holding is not None:
-            if not world.zones:
-                return Command("place_at", {"x_mm": 275.0, "y_mm": 0.0})
-            z = world.zones[self._zone_i % len(world.zones)]
-            self._zone_i += 1
-            return Command("place_in_zone", {"zone": z.name})
-        if world.objects:
-            return Command("pick", {"id": min(o.id for o in world.objects)})
-        return Command("done", {"summary": f"sorted {self._zone_i} objects"})
-
-
 def _synthetic_png(w: int = 320, h: int = 240) -> bytes:
     import cv2
     import numpy as np
@@ -174,6 +153,8 @@ def _demo_world() -> WorldState:
 
 
 def _selftest() -> None:
+    from sortbot.testing import MockVLM  # test fixture; only reachable from this selftest
+
     world, png = _demo_world(), _synthetic_png()
     vlm, seq, hist = MockVLM(), [], []
     for _ in range(10):

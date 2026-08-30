@@ -27,7 +27,7 @@ each iteration into a persistent RULES list sent with every prompt.
 | file | owner | role |
 |---|---|---|
 | `types.py`, `config.py`, `config.yaml` | scaffold | shared contracts (do not edit) |
-| `robot.py` | robot | `RobotAPI` real + mock; safety envelope, lift-translate-descend, IK sanity |
+| `robot.py` | robot | `RobotAPI` real SO101; safety envelope, lift-translate-descend, IK sanity |
 | `calibration.py` | calib | colour-target detector, homography px->mm (fitted or ArUco), `table_T_base`, calib.json I/O |
 | `calibrate.py`, `calibrate_aruco.py` | calib | teleop calibration session/controller (HUD actions), legacy ArUco+Kabsch flow |
 | `perception.py` | perception | segment candidates, `DetectedObject`s, overlay render |
@@ -35,7 +35,8 @@ each iteration into a persistent RULES list sent with every prompt.
 | `voice.py` | voice | ElevenLabs/mic in, keyboard fallback, queue of corrections, `transcribe_bytes` for HUD push-to-talk |
 | `models.py` | models | selectable OpenAI/ElevenLabs model listings (cached 5 min) + `yaml_set` config.yaml persistence |
 | `hud.py` | hud | FastAPI status page + generic action registry (`register(name, fn, label, group, params, help)` -> `POST /action/{name}`; `help` is served in `GET /actions` for tooltips) |
-| `main.py` | main | server-first Session (modes, RUN/ROBOT actions, E-STOP) + the loop |
+| `main.py` | main | server-first Session (device connects, RUN/ROBOT actions, E-STOP) + the loop |
+| `testing.py` | — | test fixtures (MockRobot, MockVLM, SimScene, FakeRig, VirtualLeader, `session_factories()`) — not reachable from the app; imported only by `tests/*` and `--selftest` blocks |
 
 ## Frames
 
@@ -47,36 +48,31 @@ each iteration into a persistent RULES list sent with every prompt.
 ## Running
 
 ```
-./run.sh -m sortbot.main                                     # SERVER-FIRST (default): HUD on :8765 with nothing connected;
-                                                             #   pick robot/cams/vlm from the header pills, then Start
+./run.sh -m sortbot.main                                     # SERVER-FIRST (the only entry point): HUD on :8765 with nothing
+                                                             #   connected; connect robot/cams/vlm in Setup, then Start
 ./run.sh -m sortbot.config                                   # print config (selftest)
-./run.sh -m sortbot.main --mock                              # shortcut: pre-selects robot=mock cams=sim vlm=mock and auto-starts
-./run.sh -m sortbot.main --mock --live-vlm                   # same, but real OpenAI planning (needs OPENAI_API_KEY)
-./run.sh -m sortbot.main --mock --no-hud --no-voice --max-steps 12   # headless (exits when the run finishes)
-./run.sh -m sortbot.tests.test_e2e_mock                      # e2e mock test (HUD on a random port)
-./run.sh -m sortbot.tests.test_hud_actions                   # HTTP tests for every /action endpoint (mock, random port)
+./run.sh -m sortbot.tests.test_e2e                           # e2e test, doubles injected into the Loop (HUD on a random port)
+./run.sh -m sortbot.tests.test_hud_actions                   # HTTP tests for every /action endpoint (injected doubles, random port)
 ./run.sh -m sortbot.calibrate                                # hardware: teleoperated target calibration -> calib/calib.json (see below)
-./run.sh -m sortbot.calibrate --mock                         # same flow with MockRobot + virtual leader (selftest, < 1 mm)
 ./run.sh -m sortbot.calibrate --mode aruco                   # legacy ArUco mat + Kabsch rigid transform
 ./run.sh -m sortbot.calibration --check-target green         # grab one overhead frame, detect the preset -> out/target_check.png
-./run.sh -m sortbot.main --real                              # shortcut: robot=real cams=real vlm=live, auto-start (+ mic if key set)
-./run.sh -m sortbot.<module> --selftest                      # per-module smoke test
+./run.sh -m sortbot.<module> --selftest                      # per-module smoke test (calibrate: scripted no-hardware run -> temp file)
 ```
 
-`main` flags: `--max-steps N` (default 40), `--no-hud` (headless, needs `--mock`/`--real`), `--hud-port P`,
-`--no-voice`, `--rules-file PATH` (default `sortbot/calib/rules.json`, persistent across runs; delete it to
-forget rules), `--config PATH`.
+`main` flags: `--max-steps N` (default 40), `--hud-port P`, `--no-voice`, `--rules-file PATH` (default
+`sortbot/calib/rules.json`, persistent across runs; delete it to forget rules), `--config PATH`. There is no
+mock/sim mode in the app: tests inject the doubles from `sortbot/testing.py` through `Session(factories=...)`.
 
 ## HUD (browser page, everything works without the terminal)
 
 Layout (redesigned around what an operator is trying to do): sticky header with connection dots
-(robot / cams / vlm), a plain-words status banner ("Not connected -- choose a mode in Setup",
+(robot / cams / vlm), a plain-words status banner ("Not connected -- connect the devices in Setup",
 "Sorting -- step 7/30 ..."; clicking it jumps to the relevant tab), a pulsing red **MIC LIVE** chip whenever the
 microphone is listening, and the red **E-STOP** (always visible, key `e`). Below: the overhead stream as the hero
 (~65% width) with the wrist cam picture-in-picture on its corner, and four intent tabs on the right:
 
-* **SETUP** -- mode selection as big labeled cards (Simulation / Real robot / Cameras only; per-device
-  robot/cams/vlm pills under "Advanced"), then the calibration flow with a numbered, state-driven how-to
+* **SETUP** -- one Connect/Disconnect row per device (Robot / Cameras / Vision model, with live status and
+  clear connect errors), then the calibration flow with a numbered, state-driven how-to
   (current step highlighted, live residuals, collinear-samples warning, when-to-recalibrate note).
 * **OPERATE** -- task text, big Start/Pause/Resume/Stop (+ Step once / max steps), corrections (text box,
   push-to-talk, and the **Listening** toggle mapped to `mic_on`/`mic_off` -- the mic NEVER runs unless that
@@ -85,9 +81,9 @@ microphone is listening, and the red **E-STOP** (always visible, key `e`). Below
 * **DEBUG** -- manual arm control (home / gripper / jog pad / go-to / torque), the decision log, and a raw
   list of every registered action.
 
-A dismissible 3-step first-run checklist (1 Choose mode -> 2 Calibrate -> 3 Start sorting, current step
+A dismissible 3-step first-run checklist (1 Connect devices -> 2 Calibrate -> 3 Start sorting, current step
 highlighted, steps link to their tabs) sits under the header and disappears once a run starts. Disabled controls
-say why in one line ("needs a robot connected -- pick a mode in Setup") instead of being greyed out silently.
+say why in one line ("needs a robot connected -- connect it in Setup") instead of being greyed out silently.
 The "?" button in the tab bar reveals every control's one-line `help` text (all registered actions carry
 `help=`, also served as title tooltips). Buttons show a pending spinner then a tick / inline error (no
 alert()s); the bot's say() lines and safety rejections pop up as toasts. **Demo** (header button) is a
@@ -95,29 +91,29 @@ fullscreen judging view -- stream + status + last decision + rules ticker, no co
 `e` = E-STOP, `p` = pause/resume, `space` = capture while calibrating. Groups still come dynamically from
 `GET /actions`: known groups map onto the four tabs, and any new group/action renders as generic button rows
 (unknown groups land in Debug). `GET /state` `perception.calibrated` reports whether a px->mm homography exists
-for the current cams (sim: always; real: fitted H in calib.json) -- it drives the "Not calibrated" banner and
+for the current cams (fitted H in calib.json) -- it drives the "Not calibrated" banner and
 checklist step 2. While no run is active a preview thread keeps the camera streams live.
 
-Modes (`set_mode`, header pills; devices are connected lazily and connect errors are reported in the response):
+Devices (`connect_robot` / `connect_cameras` / `connect_vlm`, RUN group; `connect=false` disconnects; connect
+errors are reported in the response, never raised):
 
-* `robot`: `mock` (kinematic sim) | `real` (SO101 follower) | `off`
-* `cams`: `sim` (synthetic SimScene blobs) | `real` (overhead+wrist OpenCV, opened directly) | `off`
-* `vlm`: `mock` (deterministic) | `live` (OpenAI) | `off`
+* robot: the SO101 follower arm
+* cams: overhead + wrist OpenCV cameras, opened directly (not through the follower)
+* vlm: the OpenAI planner (fails with a clear message if `OPENAI_API_KEY` is missing)
 
-Any combination works, e.g. **real cams + mock robot** to tune perception with no arm. Mode changes are refused
-while a run is active (Stop first) and while a calibration session is active (Finish/Cancel first) -- disconnecting
-the robot mid-calibration would orphan the teleop thread against a discarded robot.
+Any combination works, e.g. **cameras with no robot yet** to tune perception with no arm. Device changes are
+refused while a run is active (Stop first) and while a calibration session is active (Finish/Cancel first) --
+disconnecting the robot mid-calibration would orphan the teleop thread against a discarded robot.
 
 RUN group: `start` / `pause` / `resume` / `stop` / `step_once` (from idle: starts paused and runs exactly one
 step) / `set_max_steps(n)` / `set_task(text)` (free-text goal, e.g. "sort it however makes sense" -- prepended
-to the VLM prompt as `GOAL: ...`). Runs are restartable from the page without restarting the process (fresh
-SimScene per start in sim cams). `GET /state` carries `run: {mode, phase, step, max_steps, task, last_error,
-result, connected: {robot, cams, vlm}}`.
+to the VLM prompt as `GOAL: ...`). Runs are restartable from the page without restarting the process.
+`GET /state` carries `run: {phase, step, max_steps, task, last_error, result, connected: {robot, cams, vlm}}`.
 
 ROBOT group (all through the normal safety envelope; refused while the loop is running -- pause first):
 `home`, `open_gripper`, `close_gripper`, `jog(axis: x|y|z|roll, delta)` (mm, or degrees for roll),
-`goto(x, y, z)`, `torque_on`, and `torque_off` = **E-STOP** (always visible in the header): real arm
-`bus.disable_torque()`, mock sets a flag; either way every motion raises/returns a torque error until
+`goto(x, y, z)`, `torque_on`, and `torque_off` = **E-STOP** (always visible in the header):
+`bus.disable_torque()` plus a flag; every motion raises/returns a torque error until
 `torque_on`, and the loop is paused. `GET /state` carries `robot: {ee_pose, joints_deg, gripper_open, holding,
 torque}`.
 
@@ -173,11 +169,12 @@ zone at start are treated as sorted.
 
 Put the calibration target (the green ball; or anything with a distinct colour) in the follower's gripper, then
 `./run.sh -m sortbot.calibrate` (leader + follower + overhead cam; HUD on :8765) or press **Start calibration** in
-the HUD of a running `main --real`. A background thread teleoperates the follower from the leader arm (config
+the HUD of a running `main` with the robot connected. A background thread teleoperates the follower from the leader arm (config
 `leader:`); the sorting loop pauses at its next step boundary. Then:
 
 1. **Pick the target colour** (optional): click the target in the HUD overhead image. The server samples a tolerant
-   HSV window (`ColorTarget.from_sample`, hue wraps for reds), runs the detector and draws the detection circle.
+   HSV window (`ColorTarget.from_sample`, hue wraps for reds), runs the detector and draws the detection circle; a click that
+   sampled a gray/brown surface or detects an implausibly large blob is rejected and the previous target kept.
    Presets: `--target green|orange|hsv:lo_h,lo_s,lo_v,hi_h,hi_s,hi_v` or `--sample U V`; default from
    `config.yaml calibration.target`. Among same-coloured blobs the roundest large one wins.
 2. **Touch table** (once): rest the fingertip on the table and press *Touch table* / `t`. FK z there is the table

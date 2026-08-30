@@ -9,8 +9,8 @@ table_T_base is identity apart from the z offset from the TOUCH-TABLE step (FK z
 
     ./run.sh -m sortbot.calibrate                    # leader + follower + overhead cam, HUD on :8765 (buttons) + keys
     ./run.sh -m sortbot.calibrate --target orange    # or hsv:lo_h,lo_s,lo_v,hi_h,hi_s,hi_v, or --sample U V (from a frame)
-    ./run.sh -m sortbot.calibrate --mock             # MockRobot + virtual leader + rendered frames; asserts < 1 mm
     ./run.sh -m sortbot.calibrate --mode aruco       # legacy: ArUco mat + Kabsch rigid transform (sortbot.calibrate_aruco)
+    ./run.sh -m sortbot.calibrate --selftest         # no hardware: scripted run against sortbot/testing.py fixtures
 
 Keys (terminal): space = capture, u = undo, t = touch table, enter = finish, q = cancel. HUD: same as buttons.
 Height: H is exact for centroids at plane_z_mm (mean target-centre height of the samples); taller objects project
@@ -56,60 +56,6 @@ class RobotRig:
 
     def frame(self) -> np.ndarray:
         return self.frame_fn()
-
-
-class FakeRig(RobotRig):
-    """--mock: MockRobot follower, overhead frames rendered with the target at the *true* projection of the FK
-    xy (hidden ground-truth H_true: base mm -> px) on top of `background` (or a dark mat)."""
-
-    def __init__(self, robot, H_true_mm_to_px: np.ndarray, background=None, z_offset_true_mm: float = 25.0,
-                 target: ColorTarget | None = None):
-        super().__init__(robot)
-        self.H_true, self.z_off_true, self.bg = np.asarray(H_true_mm_to_px, float), z_offset_true_mm, background
-        self.color = (40, 220, 60) if target is None or target.name == "green" else (255, 150, 20)
-        self.w, self.h = robot.cfg.overhead_cam.width, robot.cfg.overhead_cam.height
-
-    def frame(self) -> np.ndarray:
-        img = self.bg() if callable(self.bg) else (self.bg.copy() if self.bg is not None else np.full((self.h, self.w, 3), 30, np.uint8))
-        p = self.fk_base_mm(self.read_joints())
-        u, v = cv2.perspectiveTransform(np.array([[[p[0], p[1]]]]), self.H_true).ravel()
-        cv2.circle(img, _ip((u, v)), 16, self.color, -1)
-        return img
-
-
-class VirtualLeader:
-    """Scripted 'human' for --mock: get_action() returns the joints of the current scripted pose (base-frame
-    IK on the follower); drive(session) walks the poses, capturing each, and finishes."""
-
-    def __init__(self, robot, poses_base_mm, touch_z_base_mm: float):
-        self.robot = robot
-        self.poses = [self._ik(*p) for p in poses_base_mm]
-        self.touch = self._ik(180.0, 0.0, touch_z_base_mm)
-        self.q = self.robot._read_joints()
-
-    def _ik(self, x, y, z) -> np.ndarray:
-        q5, err = self.robot.ik.solve(x, y, z, 0.0)
-        assert err < 5.0, (x, y, z, err)
-        return np.array([*q5, 20.0])
-
-    def get_action(self) -> dict[str, float]:
-        return {f"{m}.pos": float(v) for m, v in zip(MOTORS, self.q)}
-
-    def goto(self, q: np.ndarray, settle_s: float = 0.15) -> None:
-        self.q = q
-        time.sleep(settle_s)
-
-    def drive(self, ctrl: "CalibController", dwell_s: float = 0.15) -> None:
-        """Script the human against the controller (so HUD status / on_done fire exactly as with real triggers)."""
-        self.goto(self.touch, dwell_s)
-        print("  " + ctrl.trigger("touch_table")["message"])
-        for q in self.poses:
-            self.goto(q, dwell_s)
-            print("  " + ctrl.trigger("capture")["message"])
-        print("  " + ctrl.trigger("finish")["message"])
-
-    def disconnect(self) -> None:
-        pass
 
 
 def open_leader(cfg: cfgmod.Config):
@@ -443,25 +389,6 @@ class KeyReader(threading.Thread):
                     break
 
 
-MOCK_POSES_MM = [(180, -120, 40), (180, 120, 40), (290, 80, 40), (290, -80, 40),  # a quad first: 4th sample fits
-                 (180, 0, 40), (240, -120, 40), (240, 0, 45), (240, 120, 40), (210, 60, 60)]
-MOCK_Z_OFF_TRUE = 25.0
-
-
-def mock_rig(cfg: cfgmod.Config, robot=None, H_mm_to_px: np.ndarray | None = None, background=None,
-             target: ColorTarget | None = None) -> tuple[FakeRig, VirtualLeader]:
-    """MockRobot follower + FakeRig frames + VirtualLeader. Default H_true: 2 px/mm, x fwd = up, y left = left,
-    plus a little perspective so a true homography (not an affinity) is being recovered."""
-    from sortbot.robot import MockRobot
-
-    robot = robot or MockRobot(cfg)
-    if H_mm_to_px is None:
-        w, h = cfg.overhead_cam.width, cfg.overhead_cam.height
-        H_mm_to_px = np.array([[0.0, -2.0, w / 2], [-2.0, 0.0, h / 2 + 2 * 250], [1e-4, 5e-5, 1.0]]) @ np.eye(3)
-    rig = FakeRig(robot, H_mm_to_px, background, MOCK_Z_OFF_TRUE, target)
-    return rig, VirtualLeader(robot, MOCK_POSES_MM, -MOCK_Z_OFF_TRUE)
-
-
 def _print_table(s: CalibSession) -> None:
     print(f"{'#':>2} {'u':>6} {'v':>6} {'base x':>7} {'base y':>7} {'base z':>7} {'res mm':>7}")
     for i, (smp, r) in enumerate(zip(s.samples, s.res), 1):
@@ -473,7 +400,8 @@ def _print_table(s: CalibSession) -> None:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--mode", choices=["teleop", "ball", "aruco"], default="teleop", help="ball = teleop (alias)")
-    ap.add_argument("--mock", action="store_true", help="no hardware: MockRobot + virtual leader + rendered frames")
+    ap.add_argument("--selftest", action="store_true",
+                    help="no hardware: scripted run against the sortbot/testing.py fixtures (writes a temp file)")
     ap.add_argument("--target", default=None, help="green | orange | hsv:lo_h,lo_s,lo_v,hi_h,hi_s,hi_v (default: config)")
     ap.add_argument("--sample", type=float, nargs=2, metavar=("U", "V"), help="pick the target colour at this overhead pixel")
     ap.add_argument("--out", type=str, default=None)
@@ -482,15 +410,18 @@ def main(argv=None) -> int:
     a, rest = ap.parse_known_args(argv)
     if a.mode == "aruco":
         from sortbot import calibrate_aruco
-        return calibrate_aruco.main(rest + (["--mock"] if a.mock else []) + (["--out", a.out] if a.out else []))
+        return calibrate_aruco.main(rest + (["--selftest"] if a.selftest else []) + (["--out", a.out] if a.out else []))
 
     cfg = cfgmod.load()
     target = ColorTarget.parse(a.target or cfg.calib_target)
-    out = Path(a.out or cfg.calib_file)
-    if a.mock:
+    if a.selftest:
+        import tempfile
+        from sortbot.testing import mock_rig  # test fixtures; only reachable from this selftest
+        out = Path(a.out or Path(tempfile.mkdtemp()) / "calib_selftest.json")  # NEVER the real calib.json
         rig, leader = mock_rig(cfg, target=target)
         rig_fn, leader_fn, driver = (lambda: rig), (lambda: leader), (lambda ld, c: ld.drive(c))
     else:
+        out = Path(a.out or cfg.calib_file)
         from sortbot.robot import SO101Robot
         robot = SO101Robot(cfg)
         rig = RobotRig(robot)
@@ -511,7 +442,7 @@ def main(argv=None) -> int:
             print(f"[calibrate] HUD unavailable ({e}); keyboard only")
             hud = None
     print(ctrl.start()["message"])
-    if not a.mock:
+    if not a.selftest:
         print("keys: space=capture  u=undo  t=touch table  enter=finish  q=cancel" + ("  (or use the HUD buttons)" if hud else ""))
         KeyReader(ctrl).start()
     done.wait()
@@ -523,14 +454,15 @@ def main(argv=None) -> int:
         return 1
     _print_table(s)
     print(s.message)
-    if a.mock:
+    if a.selftest:
+        from sortbot.testing import MOCK_Z_OFF_TRUE
         px, _ = s._arrays()
         truth = cv2.perspectiveTransform(px.reshape(-1, 1, 2), np.linalg.inv(rig.H_true)).reshape(-1, 2)
         fit = cv2.perspectiveTransform(px.reshape(-1, 1, 2), s.H).reshape(-1, 2)
         e = np.linalg.norm(fit - truth, axis=1).max()
-        print(f"[mock] max error vs hidden ground truth {e:.3f} mm, z offset err {abs(s.z_off - MOCK_Z_OFF_TRUE):.2f} mm")
-        assert s.res.max() < 1.0 and e < 1.0 and abs(s.z_off - MOCK_Z_OFF_TRUE) < 1.0, "mock calibration did not recover ground truth"
-        print("calibrate mock selftest OK")
+        print(f"[selftest] max error vs hidden ground truth {e:.3f} mm, z offset err {abs(s.z_off - MOCK_Z_OFF_TRUE):.2f} mm")
+        assert s.res.max() < 1.0 and e < 1.0 and abs(s.z_off - MOCK_Z_OFF_TRUE) < 1.0, "selftest calibration did not recover ground truth"
+        print("calibrate selftest OK")
     return 0
 
 

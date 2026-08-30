@@ -48,7 +48,7 @@ zones:
   SENSORS:   {rect: [[150.0, 60.0], [400.0, -60.0]], drop: [275.0, 0.0]}
   ACTUATORS: {rect: [[150.0, -80.0], [400.0, -200.0]], drop: [275.0, -140.0]}
 vlm:
-  model: gpt-5
+  model: gpt-5.6-luna
 voice:
   elevenlabs_voice_id: 21m00Tcm4TlvDq8ikWAM
   tts_model: eleven_turbo_v2_5   # eleven_flash_v2_5 | eleven_turbo_v2_5 | eleven_multilingual_v2 | eleven_v3

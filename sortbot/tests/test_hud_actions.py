@@ -214,10 +214,16 @@ def test_hud_actions() -> None:
 
         # --- calibration from the page while idle (mock teleop session, temp calib file) ---
         assert post("calib_start")["ok"]
+        _wait(lambda: get("/state")["calibration"]["state"] == "running", what="calibration running")
+        r = post("set_mode", {"robot": "off"})  # refused while calibrating: the teleop thread owns the arm
+        assert not r["ok"] and "calibration" in r["message"], r
+        assert get("/state")["calibration"]["state"] in ("running", "fitted"), "calibration must survive set_mode"
         _wait(lambda: get("/state")["calibration"]["state"] == "fitted", timeout=40, what="calibration fitted")
         c = get("/state")["calibration"]
         assert c["n"] >= 4 and c["residual_mean_mm"] is not None and c["residual_mean_mm"] < 3.0, c
         assert session._calib_out is not None and session._calib_out.exists()
+        r = post("set_mode", {"vlm": "mock"})  # the guard releases once the session has finished
+        assert r["ok"], r
 
         # --- VOICE group: say_to_bot / transcribe / speak (fake ElevenLabs client; the HTTP path is real) ---
         class _O:

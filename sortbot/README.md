@@ -105,7 +105,8 @@ Modes (`set_mode`, header pills; devices are connected lazily and connect errors
 * `vlm`: `mock` (deterministic) | `live` (OpenAI) | `off`
 
 Any combination works, e.g. **real cams + mock robot** to tune perception with no arm. Mode changes are refused
-while a run is active (Stop first).
+while a run is active (Stop first) and while a calibration session is active (Finish/Cancel first) -- disconnecting
+the robot mid-calibration would orphan the teleop thread against a discarded robot.
 
 RUN group: `start` / `pause` / `resume` / `stop` / `step_once` (from idle: starts paused and runs exactly one
 step) / `set_max_steps(n)` / `set_task(text)` (free-text goal, e.g. "sort it however makes sense" -- prepended

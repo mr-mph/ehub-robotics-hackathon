@@ -574,6 +574,8 @@ class Session:
         """Lazily (dis)connect devices; errors are reported in the response, never raised."""
         if self._running():
             return {"ok": False, "message": "stop the run before changing mode", "data": None}
+        if self.calib is not None and self.calib.active:
+            return {"ok": False, "message": "finish or cancel the calibration before changing mode", "data": None}
         errs, done = [], []
         for key, val, allowed, fn in (("robot", robot, self.ROBOT_MODES, self._set_robot),
                                       ("cams", cams, self.CAM_MODES, self._set_cams),

@@ -90,9 +90,15 @@ h1{font-size:15px;margin:0;letter-spacing:3px;color:var(--acc);font-weight:700}
 #imgage{position:absolute;left:8px;top:8px;font:11px var(--mono);background:rgba(0,0,0,.55);color:#9fe8c9;padding:3px 8px;border-radius:4px;pointer-events:none;z-index:5}
 #imgage.warn{color:#ffd9a0}
 #imgage.stale{color:#ffb3b5;background:rgba(90,20,22,.7)}
-.pip{position:absolute;right:10px;bottom:10px;width:26%;min-width:120px;border:1px solid var(--line2);border-radius:var(--rs);overflow:hidden;background:#000;box-shadow:var(--sh);cursor:default}
-.pip img{width:100%;display:block;min-height:40px}
-.pip span{position:absolute;left:6px;bottom:4px;font-size:10px;color:#cfd8e3;text-shadow:0 1px 2px #000;text-transform:uppercase;letter-spacing:1px}
+.pip{position:absolute;left:10px;top:10px;width:26%;min-width:120px;border:1px solid var(--line2);border-radius:var(--rs);overflow:hidden;background:#000;box-shadow:var(--sh);cursor:grab;touch-action:none;z-index:6}
+.pip.drag{cursor:grabbing;opacity:.9;border-color:var(--acc)}
+.pip img{width:100%;display:block;min-height:40px;pointer-events:none}
+.pip .plabel{position:absolute;left:6px;bottom:4px;font-size:10px;color:#cfd8e3;text-shadow:0 1px 2px #000;text-transform:uppercase;letter-spacing:1px;pointer-events:none}
+.pip .pbtns{position:absolute;right:3px;top:3px;display:flex;gap:3px;opacity:0;transition:opacity .15s}
+.pip:hover .pbtns,.pip.drag .pbtns{opacity:1}
+.pbtn{background:rgba(0,0,0,.65);border:1px solid var(--line2);color:var(--tx);border-radius:4px;font:11px var(--mono);line-height:1;padding:4px 7px;cursor:pointer;min-height:0}
+.pbtn:hover{background:var(--bg2);border-color:var(--acc)}
+#pipshow{position:absolute;right:10px;bottom:10px;z-index:6}
 #readout{margin-top:10px;padding:8px 12px;background:var(--bg1);border:1px solid var(--line);border-radius:var(--r);font:12px/1.7 var(--mono);color:var(--tx1);min-height:60px;white-space:pre-wrap;word-break:break-word}
 #readout b{color:var(--tx);font-weight:600}
 .panel{background:var(--bg1);border:1px solid var(--line);border-radius:var(--r);overflow:hidden}
@@ -197,7 +203,14 @@ body.showhelp .help{display:block}
   <img id="ov" src="/overhead.mjpg" alt="overhead camera">
   <div id="imgage" title="Age of the overhead image on the server - if this climbs, the stream is stalled">no image yet</div>
   <div id="ring"></div>
-  <div class="pip"><img id="wr" src="/wrist.mjpg" alt="wrist camera"><span>wrist</span></div>
+  <div class="pip" id="pip" title="Drag to move the wrist view (key: w to hide/show)">
+   <img id="wr" src="/wrist.mjpg" alt="wrist camera">
+   <div class="pbtns">
+    <button class="pbtn" id="pipsize" title="Cycle the wrist view size">&#8597;</button>
+    <button class="pbtn" id="piphide" title="Hide the wrist view (key: w)">&#10005;</button>
+   </div>
+   <span class="plabel">wrist</span></div>
+  <button class="pbtn" id="pipshow" title="Show the wrist camera again (key: w)" hidden>&#127909; wrist</button>
  </div>
  <div id="readout">waiting for state...</div>
 </section>
@@ -522,6 +535,38 @@ function drawRing(){const im=$('ov'),el=$('ring');if(!ring){el.style.display='no
  el.style.left=Math.max(0,(u-rad)*sx)+'px';el.style.top=Math.max(0,(v-rad)*sy)+'px';
  el.style.width=Math.min(2*rad*sx,im.clientWidth)+'px';el.style.height=Math.min(2*rad*sy,im.clientHeight)+'px';}
 window.addEventListener('resize',drawRing);
+// ---------- wrist PiP: drag to move, cycle size, hide/show (remembered in this browser) ----------
+const PIPW=[18,26,38],PIPPAD=10;
+let pipS={x:1,y:1,w:1,hidden:false};
+try{const v=JSON.parse(localStorage.getItem('sortbot.pip')||'null');if(v&&typeof v==='object')pipS=Object.assign(pipS,v);}catch(e){}
+function pipSave(){try{localStorage.setItem('sortbot.pip',JSON.stringify(pipS));}catch(e){}}
+const clamp01=v=>Math.min(Math.max(isFinite(v)?v:0,0),1);
+function pipApply(){const el=$('pip'),wrap=$('ovwrap');if(!el||!wrap)return;
+ el.hidden=pipS.hidden;$('pipshow').hidden=!pipS.hidden;
+ if(pipS.hidden)return;
+ el.style.width=PIPW[pipS.w%PIPW.length]+'%';
+ const mx=Math.max(0,wrap.clientWidth-el.offsetWidth-2*PIPPAD),my=Math.max(0,wrap.clientHeight-el.offsetHeight-2*PIPPAD);
+ el.style.left=(PIPPAD+clamp01(pipS.x)*mx)+'px';
+ el.style.top=(PIPPAD+clamp01(pipS.y)*my)+'px';}
+function pipToggle(){pipS.hidden=!pipS.hidden;pipSave();pipApply();}
+$('piphide').onclick=e=>{e.stopPropagation();pipToggle();};
+$('pipshow').onclick=()=>{pipS.hidden=false;pipSave();pipApply();};
+$('pipsize').onclick=e=>{e.stopPropagation();pipS.w=(pipS.w+1)%PIPW.length;pipSave();pipApply();};
+(function(){const el=$('pip');let d=null;
+ const pt=e=>e.touches&&e.touches.length?e.touches[0]:e;
+ const down=e=>{if(e.target.closest('.pbtn'))return;const t=pt(e),r=el.getBoundingClientRect();
+  d={dx:t.clientX-r.left,dy:t.clientY-r.top};el.classList.add('drag');e.preventDefault();};
+ const move=e=>{if(!d)return;const t=pt(e),wr=$('ovwrap').getBoundingClientRect();
+  const mx=Math.max(1,wr.width-el.offsetWidth-2*PIPPAD),my=Math.max(1,wr.height-el.offsetHeight-2*PIPPAD);
+  pipS.x=clamp01((t.clientX-wr.left-d.dx-PIPPAD)/mx);pipS.y=clamp01((t.clientY-wr.top-d.dy-PIPPAD)/my);
+  pipApply();e.preventDefault();};
+ const up=()=>{if(!d)return;d=null;el.classList.remove('drag');pipSave();};
+ el.addEventListener('mousedown',down);el.addEventListener('touchstart',down,{passive:false});
+ document.addEventListener('mousemove',move);document.addEventListener('touchmove',move,{passive:false});
+ document.addEventListener('mouseup',up);document.addEventListener('touchend',up);})();
+window.addEventListener('resize',pipApply);
+$('wr').addEventListener('load',pipApply);
+pipApply();
 // ---------- push to talk ----------
 let rec=null,chunks=[];
 function b64(buf){const u=new Uint8Array(buf);let t='';for(let i=0;i<u.length;i+=0x8000)t+=String.fromCharCode.apply(null,u.subarray(i,i+0x8000));return btoa(t);}
@@ -758,6 +803,7 @@ document.addEventListener('keydown',e=>{
   if(ph==='paused')act('resume');else if(ph==='running')act('pause');}
  else if(k===' '){const cal=S.calibration;
   if(cal&&cal.state==='running'){e.preventDefault();act('calib_capture');}}
+ else if(k==='w'||k==='W')pipToggle();
  else if(k==='Escape')closeDemo();});
 loadActions();setInterval(loadActions,5000);
 tick();setInterval(tick,500);

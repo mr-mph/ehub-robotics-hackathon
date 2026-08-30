@@ -392,6 +392,7 @@ def test_hud_actions() -> None:
         unknown = refs - set(acts)
         assert not unknown, f"page JS calls actions not in /actions: {sorted(unknown)}"
         for frag in ("MIC LIVE", "mic_on", "mic_off", 'id="checklist"', 'id="demo"', "E-STOP",
+                     'id="pip"', 'id="piphide"', 'id="pipshow"', 'id="pipsize"', "sortbot.pip",
                      'data-tab="setup"', 'data-tab="operate"', 'data-tab="tune"', 'data-tab="debug"',
                      "Not a straight line"):
             assert frag in page, f"page missing {frag!r}"

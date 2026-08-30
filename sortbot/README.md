@@ -81,7 +81,9 @@ Layout (redesigned around what an operator is trying to do): sticky header with 
 (robot / cams / vlm), a plain-words status banner ("Not connected -- connect the devices in Setup",
 "Sorting -- step 7/30 ..."; clicking it jumps to the relevant tab), a pulsing red **MIC LIVE** chip whenever the
 microphone is listening, and the red **E-STOP** (always visible, key `e`). Below: the overhead stream as the hero
-(~65% width) with the wrist cam picture-in-picture on its corner, and four intent tabs on the right:
+(~65% width) with the wrist cam as a picture-in-picture -- **drag it anywhere on the stream, cycle its size
+(18/26/38%) with the arrows button, or hide it with x / the `w` key** (a small "wrist" button brings it back;
+position, size and hidden state are remembered per browser) -- and four intent tabs on the right:
 
 * **SETUP** -- one Connect/Disconnect row per device (Robot / Cameras / Vision model, with live status and
   clear connect errors), then the calibration flow with a numbered, state-driven how-to
@@ -100,7 +102,7 @@ The "?" button in the tab bar reveals every control's one-line `help` text (all 
 `help=`, also served as title tooltips). Buttons show a pending spinner then a tick / inline error (no
 alert()s); the bot's say() lines and safety rejections pop up as toasts. **Demo** (header button) is a
 fullscreen judging view -- stream + status + last decision + rules ticker, no controls (Esc exits). Keys:
-`e` = E-STOP, `p` = pause/resume, `space` = capture while calibrating. Groups still come dynamically from
+`e` = E-STOP, `p` = pause/resume, `w` = hide/show the wrist PiP, `space` = capture while calibrating. Groups still come dynamically from
 `GET /actions`: known groups map onto the four tabs, and any new group/action renders as generic button rows
 (unknown groups land in Debug). `GET /state` `perception.calibrated` reports whether a px->mm homography exists
 for the current cams (fitted H in calib.json) -- it drives the "Not calibrated" banner and

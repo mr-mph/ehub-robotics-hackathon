@@ -62,7 +62,14 @@ class RobotRig:
         self.robot._write_joints(np.asarray(q, float))
 
     def fk_base_mm(self, q: np.ndarray) -> np.ndarray:
-        return self.robot.kin.forward_kinematics(np.asarray(q, float))[:3, 3] * 1000.0
+        """Base-frame mm of the TOOL POINT (between the jaws) -- the same point the rest of the app means,
+        and the point the calibration target actually sits at. Using the raw URDF gripper_frame_link here
+        would pair the ball's pixel with somewhere ~8 mm to the side of the ball, and because that offset
+        rotates with shoulder_pan it lands in a DIFFERENT table direction at every sample -- an error no
+        homography can absorb."""
+        T = self.robot.kin.forward_kinematics(np.asarray(q, float))
+        off = np.asarray(getattr(self.robot, "tool_offset_mm", (0.0, 0.0, 0.0)), float)
+        return T[:3, 3] * 1000.0 + T[:3, :3] @ off
 
     def tilt_deg(self, q: np.ndarray) -> float | None:
         """Gripper tilt off vertical, or None if the robot cannot report it (sample-consistency check)."""
@@ -95,6 +102,7 @@ class CalibSession:
         self.samples: list[dict] = []  # {px:(u,v), base_mm:(x,y,z), tilt_deg}
         self.H = self.res = None
         self.inliers = None  # bool mask: which samples the RANSAC fit actually used
+        self.model = None    # "affine" (<8 pts) | "homography"
         self.det = self.fk = self.tilt = None
         self.frame_rgb: np.ndarray | None = None
         self.frame_wh: tuple[int, int] | None = None  # for sample-coverage feedback
@@ -356,10 +364,11 @@ class CalibSession:
 
     def _refit(self) -> None:
         self.H = self.res = self.inliers = None
+        self.model = None
         if len(self.samples) >= 4:
             px, mm = self._arrays()
             try:
-                self.H, self.res, self.inliers = fit_px_to_mm(px, mm[:, :2])
+                self.H, self.res, self.inliers, self.model = fit_px_to_mm(px, mm[:, :2])
             except Exception as e:  # noqa: BLE001
                 self.message = f"fit failed: {e}"
 
@@ -387,6 +396,7 @@ class CalibSession:
                 "z_spread_mm": None if len(zs) < 2 else round(float(np.ptp(zs)), 1),
                 "tilt_spread_deg": None if len(tl) < 2 else round(float(max(tl) - min(tl)), 1),
                 "problems": self._problems() if len(self.samples) >= 4 else [],
+                "model": self.model,
                 "coverage_pct": round(cov, 1), "coverage_verdict": coverage_verdict(cov),
                 "z_offset_mm": self.z_off, "target": self.target.to_dict(),
                 "samples": [[round(v, 1) for v in (*s["px"], *s["base_mm"])] for s in self.samples]}

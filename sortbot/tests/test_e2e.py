@@ -44,13 +44,14 @@ def test_e2e(with_hud: bool = True) -> None:
     assert result.startswith("done"), result
     assert loop.placed == n_objects, (loop.placed, n_objects)
     assert loop.holding is None and scene.held is None
-    for xy, _ in scene.blobs:  # every blob now sits inside some zone
-        assert any(z.contains(*xy) for z in cfg.zones), xy
+    drops_mm = [(x * 10.0, y * 10.0) for x, y in MockVLM.DROPS_CM]
+    for xy, _ in scene.blobs:  # every blob now sits at one of the drop coordinates it was placed at
+        assert min(abs(xy[0] - dx) + abs(xy[1] - dy) for dx, dy in drops_mm) < 5.0, xy
     assert json.loads(rules_path.read_text()) == ["put white things on the left"]
     assert [h["tool"] for h in loop.history].count("pick_at") == n_objects
     # a rejected command is fed back as a history entry, not raised; coordinate tools are validated
-    # against the workspace AABB (cm on the VLM surface) and zone names, not an object-id list
-    world = m.WorldState(zones=cfg.zones)
+    # against the workspace AABB (cm on the VLM surface), not an object-id list
+    world = m.WorldState()
     assert "workspace" in loop.validate(m.Command("pick_at", {"x_cm": 90.0, "y_cm": 0.0}), world)
     assert "cm" in loop.validate(m.Command("pick_at", {"x_cm": 5.0, "y_cm": 0.0}), world)
     assert loop.validate(m.Command("place_at", {"x_cm": 27.5, "y_cm": 0.0}), world)  # not holding anything

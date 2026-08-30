@@ -16,27 +16,10 @@ class Pose:
 
 
 @dataclass
-class Zone:
-    name: str
-    polygon_mm: list[tuple[float, float]]
-    drop_point_mm: tuple[float, float]
-
-    def contains(self, x: float, y: float) -> bool:
-        inside = False
-        pts = self.polygon_mm
-        for i in range(len(pts)):
-            (x0, y0), (x1, y1) = pts[i], pts[(i + 1) % len(pts)]
-            if (y0 > y) != (y1 > y) and x < (x1 - x0) * (y - y0) / (y1 - y0) + x0:
-                inside = not inside
-        return inside
-
-
-@dataclass
 class WorldState:
-    """Seeing is the VLM's job: no detected-object list here. `holding` is a human-readable description
-    of what the gripper holds (e.g. "object picked at (25.0, 12.0) cm"), or None."""
+    """Seeing is the VLM's job: no detected-object list and no zones here. `holding` is a human-readable
+    description of what the gripper holds (e.g. "object picked at (25.0, 12.0) cm"), or None."""
 
-    zones: list[Zone] = field(default_factory=list)
     ee_pose: Pose = field(default_factory=lambda: Pose(0, 0, 0))
     gripper_open: bool = True
     holding: str | None = None
@@ -45,7 +28,7 @@ class WorldState:
 
 @dataclass
 class Command:
-    tool: str  # pick_at | place_in_zone | place_at | done | say | move_to | open | close | turn_to
+    tool: str  # pick_at | place_at | done | say | move_to | open | close | turn_to
     args: dict = field(default_factory=dict)
 
 

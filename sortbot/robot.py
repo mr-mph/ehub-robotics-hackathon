@@ -60,24 +60,30 @@ def load_calib(path: Path) -> np.ndarray:
 
 
 class DownIK:
-    """DLS IK for a down-pointing gripper at (x, y, z) mm in the base frame with fixed wrist roll."""
+    """DLS IK for a down-pointing gripper at (x, y, z) mm in the base frame with fixed wrist roll.
 
-    def __init__(self, kin: RobotKinematics):
+    All positions are the TOOL point (the grasp point between the jaws) = the URDF gripper_frame_link
+    origin plus `tool_offset` expressed in that frame. FK and IK apply the same offset, so they stay
+    mutually consistent."""
+
+    def __init__(self, kin: RobotKinematics, tool_offset: np.ndarray | None = None):
         self.kin = kin
+        self.tool = np.zeros(3) if tool_offset is None else np.asarray(tool_offset, float)
         q, p = [], []
         (l0, l1), (e0, e1), (w0, w1) = (JOINT_LIMITS_DEG[1:].round().astype(int)).tolist()
         for lift in range(l0, l1 + 1, 5):
             for elbow in range(e0, e1 + 1, 5):
                 for wrist in range(w0, w1 + 1, 5):
                     T = kin.forward_kinematics(np.array([0, lift, elbow, wrist, 0, 0], float))
+                    pt = T[:3, 3] * 1000.0 + T[:3, :3] @ self.tool
                     q.append((lift, elbow, wrist))
-                    p.append((T[0, 3] * 1000, T[2, 3] * 1000, math.acos(max(-1.0, min(1.0, -T[2, 2])))))
+                    p.append((pt[0], pt[2], math.acos(max(-1.0, min(1.0, -T[2, 2])))))
         self.seed_q, self.seed_p = np.array(q, float), np.array(p)
 
     def _f(self, q4: np.ndarray, roll: float) -> np.ndarray:
         T = self.kin.forward_kinematics(np.array([*q4, roll, 0.0]))
         tilt = math.atan2(math.hypot(T[0, 2], T[1, 2]), -T[2, 2])
-        return np.array([*(T[:3, 3] * 1000), tilt * TILT_W])
+        return np.array([*(T[:3, 3] * 1000.0 + T[:3, :3] @ self.tool), tilt * TILT_W])
 
     def _dls(self, q: np.ndarray, tgt: np.ndarray, roll: float) -> tuple[float, np.ndarray]:
         lo, hi = JOINT_LIMITS_DEG[:, 0], JOINT_LIMITS_DEG[:, 1]
@@ -126,7 +132,10 @@ class _KinematicBase:
     def __init__(self, cfg: cfgmod.Config):
         self.cfg = cfg
         self.kin = RobotKinematics(str(cfg.urdf), "gripper_frame_link")
-        self.ik = DownIK(self.kin)
+        # What every xyz in this app MEANS: the grasp point between the jaws, not the URDF's
+        # gripper_frame_link dummy (which sits ~7.8 mm off the jaw centreline). See config workspace.
+        self.tool_offset_mm = np.asarray(getattr(cfg, "tool_offset_mm", (0.0, 0.0, 0.0)), float)
+        self.ik = DownIK(self.kin, self.tool_offset_mm)
         self.table_T_base = load_calib(cfg.calib_file)
         self.base_T_table = np.linalg.inv(self.table_T_base)
         self.roll_deg = 0.0
@@ -135,8 +144,9 @@ class _KinematicBase:
 
     # ---- frames ----
     def fk_table(self, q: np.ndarray) -> np.ndarray:
+        """Table-frame pose of the TOOL POINT (between the jaws), in mm -- not the raw URDF frame."""
         T = self.kin.forward_kinematics(q).copy()
-        T[:3, 3] *= 1000.0
+        T[:3, 3] = T[:3, 3] * 1000.0 + T[:3, :3] @ self.tool_offset_mm
         return self.table_T_base @ T
 
     def tilt_deg(self, q: np.ndarray) -> float:
@@ -430,6 +440,17 @@ def _selftest() -> None:
     cfg = cfgmod.load()
     r = MockRobot(cfg)
     assert isinstance(r, RobotAPI)
+
+    # every xyz in the app is the TOOL point (between the jaws), not the raw URDF gripper_frame_link:
+    # FK must be displaced from the URDF frame by exactly |tool_offset|, and IK must agree with FK
+    off = np.asarray(cfg.tool_offset_mm, float)
+    if np.linalg.norm(off) > 0:
+        q0 = HOME_JOINTS.copy()
+        raw = r.kin.forward_kinematics(q0)[:3, 3] * 1000.0
+        tool = r.fk_table(q0)[:3, 3] - r.table_T_base[:3, 3]
+        assert abs(np.linalg.norm(tool - raw) - np.linalg.norm(off)) < 1e-6, (tool, raw, off)
+        q_ik = r.ik_table(HOME_JOINTS, 250.0, 40.0, 60.0, 0.0)  # IK targets the same tool point
+        assert np.linalg.norm(r.fk_table(q_ik)[:3, 3] - [250.0, 40.0, 60.0]) < IK_TOL_MM
     assert r.home().ok
     p = r.get_ee_pose()
     assert math.dist((p.x, p.y, p.z), (cfg.home.x, cfg.home.y, cfg.home.z)) < IK_TOL_MM, p
@@ -457,8 +478,6 @@ def _selftest() -> None:
     assert r.pick(300.0, 120.0).ok and not r.gripper_open
     zs = [r.fk_table(q)[2, 3] for q in r.log[n0:]]
     assert min(zs) >= cfg.gripper_clearance_mm - 2.0, min(zs)
-    # fixed point, NOT a zone drop: drop points are user-tunable runtime config (set_zone_drop persists
-    # them into config.yaml), so the selftest must not depend on where the user last put them
     assert r.place_at(275.0, 0.0).ok and r.gripper_open
     p = r.get_ee_pose()
     assert abs(p.x - 275) < IK_TOL_MM and abs(p.y) < IK_TOL_MM and abs(p.z - cfg.travel_z_mm) < IK_TOL_MM, p

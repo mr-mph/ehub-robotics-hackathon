@@ -1,5 +1,5 @@
 """Overhead overlay rendering: the VLM does the seeing, this module only draws what the VLM (and the
-human) need to read positions off the image — a labelled grid, the zone outlines and the EE marker —
+human) need to read positions off the image — a labelled grid and the EE marker —
 plus the px<->mm coordinate helpers.
 
 homography H (3x3) maps overhead pixel (u, v, 1) -> table-frame (x_mm, y_mm, 1); produced by
@@ -19,6 +19,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from sortbot.calibration import expand_hull
 from sortbot.config import Config
 from sortbot.types import Pose
 
@@ -42,7 +43,7 @@ def mat_polygon_mm(config: Config) -> list[tuple[float, float]]:
 
 # ---------------------------------------------------------------- overlay renderer
 
-_BGR = dict(grid=(120, 120, 120), tick=(60, 235, 255), zone=(0, 200, 255), ee=(255, 80, 255),
+_BGR = dict(grid=(120, 120, 120), tick=(60, 235, 255), ee=(255, 80, 255),
             text=(255, 255, 255), axis=(80, 220, 120), hull=(200, 160, 60))
 
 
@@ -62,8 +63,6 @@ class Overlay:
     when the homography, the frame size, the grid spacing, the calibration anchors or the rules text
     change -- i.e. only when the configuration does, never mid-run for no reason.
 
-    Zones are deliberately NOT drawn: the LEFT/MIDDLE/RIGHT rectangles are bookkeeping for place_in_zone,
-    not physical bins on the table, and painting them over the picture was misleading.
     """
 
     def __init__(self, grid_mm: float = 50.0):
@@ -86,9 +85,10 @@ class Overlay:
             return self._layer, self._mask
         h, w = hw
         img = np.zeros((h, w, 3), np.uint8)
+        grid = np.zeros((h, w, 3), np.uint8)  # grid lines go here first, so they can be dimmed off-hull
         corners = px_to_mm(H, [(0, 0), (w, 0), (w, h), (0, h)])
         (xmin, ymin), (xmax, ymax) = corners.min(0), corners.max(0)
-        line = lambda a, b, col, t=1: cv2.line(img, tuple(map(int, a)), tuple(map(int, b)), col, t, cv2.LINE_AA)
+        line = lambda a, b, col, t=1: cv2.line(grid, tuple(map(int, a)), tuple(map(int, b)), col, t, cv2.LINE_AA)
         g = self.grid_mm
 
         # grid lines every grid_mm, tick labels in CM at BOTH ends of every line (dense on purpose: the
@@ -105,6 +105,14 @@ class Overlay:
             a, b = mm_to_px(H, [(xmin, y), (xmax, y)])
             line(a, b, _BGR["grid"])
             tick(a, b, f"y{y / 10.0:g}")  # mm -> cm label (unit boundary)
+        # Outside the calibrated hull the mapping is EXTRAPOLATED and not to be trusted -- dim the grid
+        # there so "the grid looks off" is immediately attributable to being outside the sampled area
+        # rather than to a broken fit.
+        if region is not None and len(region) >= 3:
+            inside = np.zeros((h, w), np.uint8)
+            cv2.fillPoly(inside, [expand_hull(np.asarray(region, float)).round().astype(np.int32).reshape(-1, 1, 2)], 255)
+            grid[inside == 0] = (grid[inside == 0] * 0.35).astype(np.uint8)
+        img |= grid
         # axis-direction arrows + origin marker (origin = robot base, usually off-frame)
         cx_mm, cy_mm = (xmin + xmax) / 2, (ymin + ymax) / 2
         o = mm_to_px(H, [(cx_mm, cy_mm)])[0]
@@ -125,7 +133,8 @@ class Overlay:
             cv2.polylines(img, [pts], True, _BGR["hull"], 1, cv2.LINE_AA)
             _put(img, "calibrated area", (int(pts[:, 0, 0].min()) + 4, int(pts[:, 0, 1].min()) + 14), _BGR["hull"], 0.38)
         legend = [f"grid {g / 10.0:g} cm | coordinates in cm: x fwd, y left, origin at robot base",
-                  "magenta cross = gripper"] + [f"rule: {r}" for r in rules]
+                  "magenta cross = gripper" + ("  |  dim grid = outside the calibrated area"
+                                               if region is not None and len(region) >= 3 else "")] + [f"rule: {r}" for r in rules]
         for i, t in enumerate(legend):
             _put(img, t, (6, 16 + 15 * i), _BGR["text"])
         self._layer, self._mask, self._key = img, img.any(axis=2), key

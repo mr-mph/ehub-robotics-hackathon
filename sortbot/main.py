@@ -47,12 +47,12 @@ from sortbot.voice import RulesStore, VoiceIO, classify
 
 log = logging.getLogger("sortbot.main")
 
-HIGH_LEVEL = {"pick_at", "place_in_zone", "place_at", "done", "say"}
+HIGH_LEVEL = {"pick_at", "place_at", "done", "say"}
 LOW_LEVEL = {"move_to", "open", "close", "turn_to"}
 
 # ============================== UNIT BOUNDARY (cm <-> mm) ==============================
 # The VLM surface (tool args, overlay grid labels, prompt state, history, rejection messages) is
-# CENTIMETERS; everything internal (robot, config.yaml, calib.json, safety envelope, zones) is
+# CENTIMETERS; everything internal (robot, config.yaml, calib.json, safety envelope) is
 # MILLIMETERS. _mm_args() below is the ONLY place VLM centimeters become internal millimeters
 # (sortbot.vlm._state_text and sortbot.perception's grid labels are the mm -> cm half).
 _CM_KEYS = {"x_cm": "x", "y_cm": "y", "z_cm": "z"}
@@ -288,18 +288,13 @@ class Loop:
                 f"wider coverage to work there")
 
     def validate(self, cmd: Command, world: WorldState) -> str | None:
-        """Coordinate tools are validated against the workspace AABB + the zone names; rejection
-        messages are written in CENTIMETERS (the VLM's units — it must be able to react to them)."""
+        """Coordinate tools are validated against the workspace AABB; rejection messages are written in
+        CENTIMETERS (the VLM's units -- it must be able to react to them)."""
         a, t = cmd.args, cmd.tool
         if t not in HIGH_LEVEL | LOW_LEVEL:
             return f"unknown tool {t!r}"
         lo, hi = self.cfg.aabb_min_mm, self.cfg.aabb_max_mm
-        if t == "place_in_zone":
-            if self.holding is None:
-                return "not holding anything"
-            if self.cfg.zone(str(a.get("zone", ""))) is None:
-                return f"unknown zone {a.get('zone')!r}; zones: {[z.name for z in self.cfg.zones]}"
-        elif t in ("pick_at", "place_at", "move_to"):
+        if t in ("pick_at", "place_at", "move_to"):
             if t == "pick_at" and self.holding is not None:
                 return f"already holding ({self.holding}); place it first"
             if t == "place_at" and self.holding is None:
@@ -327,14 +322,6 @@ class Loop:
             if res.ok:
                 self.holding = f"object picked at ({a['x'] / 10:g}, {a['y'] / 10:g}) cm"
                 return ExecResult(True, self.holding.replace("object picked", "picked the object"))
-            return res
-        if t == "place_in_zone":
-            z = self.cfg.zone(a["zone"])
-            res = r.place_at(*z.drop_point_mm)
-            if res.ok:
-                self.holding, self.placed = None, self.placed + 1
-                return ExecResult(True, f"placed in {z.name} at its drop point "
-                                        f"({z.drop_point_mm[0] / 10:g}, {z.drop_point_mm[1] / 10:g}) cm")
             return res
         if t == "place_at":
             res = r.place_at(a["x"], a["y"])
@@ -423,14 +410,15 @@ class Loop:
                 continue
             self._H = H
             rules = ([f"GOAL: {self.task}"] if self.task else []) + self.rules.list() + self.hints
-            world = WorldState(self.cfg.zones, self._read_pose(), self.robot.gripper_open, self.holding, rules)
+            world = WorldState(self._read_pose(), self.robot.gripper_open, self.holding, rules)
             overlay = perception.render_overlay(overhead, H, world.ee_pose, rules,
                                                 calib_region_px=self.homog.region_px,
                                                 calib_samples_px=self.homog.samples_px)
             self._overlay = overlay
             self.hud_update(overlay, wrist, step, t0, "planning")
             try:
-                cmd = self.vlm.plan_step(png(overlay), png(wrist), world, self.history)
+                cmd = self.vlm.plan_step(png(overlay), png(wrist), world, self.history,
+                                         workspace_mm=(self.cfg.aabb_min_mm, self.cfg.aabb_max_mm))
             except Exception as e:  # noqa: BLE001
                 log.error("VLM failed: %s", e)
                 self.history.append({"tool": "vlm", "args": {}, "result": f"error {e}"})
@@ -582,7 +570,7 @@ class Session:
         self.calib, self._calib_out = None, None
         self.models = ModelRegistry()
         self.dlog = DecisionLog()
-        self._overlay_hold: tuple[float, np.ndarray] | None = None  # (until_ts, overlay) shown while idle after a zone edit
+        self._overlay_hold: tuple[float, np.ndarray] | None = None  # (until_ts, overlay) held briefly while idle
         self._calib_flag: tuple[float, bool] | None = None  # (calib.json mtime, has fitted H) cache
         self.last_overhead: np.ndarray | None = None
         self._shutdown = threading.Event()
@@ -613,7 +601,7 @@ class Session:
         h.register("set_max_steps", self.set_max_steps, "Set max steps", "run",
                    help="Cap the number of steps for this and future runs (n >= 1).")
         h.register("set_task", self.set_task, "Set task", "run",
-                   help="Free-text goal sent to the VLM as GOAL: ... (empty = sort sensibly into the zones).")
+                   help="Free-text goal sent to the VLM as GOAL: ... (empty = group similar things sensibly).")
         h.register("home", lambda: self._robot_act(lambda r: r.home()), "Home", "robot", params=[],
                    help="Move the arm to its HOME pose above the table.")
         h.register("open_gripper", lambda: self._robot_act(lambda r: r.open_gripper()), "Open gripper", "robot", params=[],
@@ -652,10 +640,8 @@ class Session:
                    help="List selectable OpenAI / ElevenLabs models and voices (OpenAI listing cached 5 min).")
         h.register("set_model", self.set_model, None, "models",
                    help="Hot-swap a model (provider: openai|elevenlabs_tts|elevenlabs_stt|elevenlabs_voice) on the live clients and persist it to config.yaml.")
-        h.register("set_zone_drop", self.set_zone_drop, "Set zone drop", "perception",
-                   help="Move a zone's drop point to table-frame (x, y) mm and persist it to config.yaml zones; or use 'set drop' + click on the overhead image.")
         h.register("px_to_mm", self.px_to_mm, None, "perception",
-                   help="Convert an overhead pixel (u, v) to table-frame mm via the current homography (used by the click-to-set-drop mode).")
+                   help="Convert an overhead pixel (u, v) to table-frame mm via the current homography -- click the overhead image to read a position off it.")
         h.register("log_clear", self.log_clear, "Clear log", "log", params=[],
                    help="Empty the decision log (ring buffer of the last 200 decisions/events, served at GET /log).")
         h.add_state_source("run", self._run_state)
@@ -991,8 +977,8 @@ class Session:
         return self.homog.update(self.last_overhead)
 
     def _refresh_overlay(self) -> None:
-        """Re-render the grid + zone overlay on the latest overhead frame (no robot step); shown for a
-        few seconds while idle so zone-drop edits are visible immediately."""
+        """Re-render the grid overlay on the latest overhead frame (no robot step); held for a few
+        seconds so a config change is visible immediately while idle."""
         frame = self.last_overhead
         if frame is None:
             return
@@ -1005,31 +991,6 @@ class Session:
         self._overlay_hold = (time.time() + 5.0, overlay)
         if self.hud is not None and not self._running():
             self.hud.update(overlay, None, {})
-
-    def set_zone_drop(self, name: str, x: float, y: float) -> dict:
-        """Move a zone's drop point (table mm); persists into config.yaml zones (rect kept as is)."""
-        z = self.cfg.zone(str(name))
-        if z is None:
-            return {"ok": False, "message": f"unknown zone {name!r}; zones: {[q.name for q in self.cfg.zones]}", "data": None}
-        x, y = round(float(x), 1), round(float(y), 1)
-        lo, hi = self.cfg.aabb_min_mm, self.cfg.aabb_max_mm
-        if not (lo[0] <= x <= hi[0] and lo[1] <= y <= hi[1]):
-            return {"ok": False, "message": f"({x}, {y}) outside workspace x[{lo[0]},{hi[0]}] y[{lo[1]},{hi[1]}]", "data": None}
-        z.drop_point_mm = (x, y)
-        warn = "" if z.contains(x, y) else " (note: outside the zone rectangle)"
-        (x0, y0), (x1, y1) = z.polygon_mm[0], z.polygon_mm[2]
-        try:
-            yaml_set(self.cfg.source_path, "zones", z.name,
-                     f"{{rect: [[{x0}, {y0}], [{x1}, {y1}]], drop: [{x}, {y}]}}")
-            persisted = f"persisted to {self.cfg.source_path.name}"
-        except Exception as e:  # noqa: BLE001
-            persisted = f"NOT persisted: {e}"
-        self.dlog.add("set_zone_drop", {"name": z.name, "x": x, "y": y}, f"drop moved{warn}; {persisted}",
-                      step=self.loop.step if self.loop is not None else 0)
-        if not self._running():
-            self._refresh_overlay()  # re-render the overlay with the new drop marker
-        return {"ok": True, "message": f"{z.name} drop -> ({x}, {y}){warn}; {persisted}",
-                "data": {"zones": self._perception_state()["zones"]}}
 
     def px_to_mm(self, u: float, v: float) -> dict:
         H = self._current_H()
@@ -1068,9 +1029,7 @@ class Session:
         return self._calib_flag[1]
 
     def _perception_state(self) -> dict:
-        return {"calibrated": self._calibrated(),
-                "zones": [{"name": z.name, "drop": [z.drop_point_mm[0], z.drop_point_mm[1]],
-                           "rect": [list(z.polygon_mm[0]), list(z.polygon_mm[2])]} for z in self.cfg.zones]}
+        return {"calibrated": self._calibrated()}
 
     # ------------------------------------------------ ROBOT actions
     def _robot_act(self, fn, allow_while_running: bool = False) -> dict:

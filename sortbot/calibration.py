@@ -323,22 +323,36 @@ def detect_ball(frame_rgb: np.ndarray, hsv_lo=BALL_HSV_LO, hsv_hi=BALL_HSV_HI, m
     return detect_target(frame_rgb, ColorTarget(hsv_lo, hsv_hi), min_r_px)
 
 
-def fit_px_to_mm(px, mm, ransac_thresh_mm: float = 5.0) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Homography overhead px -> table mm from paired points (Nx2 each), RANSAC.
-    Returns (H, residuals_mm, inlier_mask). The mask matters: RANSAC silently drops samples that do not
-    fit, so a fit can look perfect on 5 points while 2 rejected ones sit 17 mm out -- the caller must be
-    able to SAY which samples were ignored instead of reporting a mean residual mixed from both groups."""
+def fit_px_to_mm(px, mm, ransac_thresh_mm: float = 5.0,
+                 min_pts_for_homography: int = 8) -> tuple[np.ndarray, np.ndarray, np.ndarray, str]:
+    """Overhead px -> table mm from paired points (Nx2 each). Returns (H, residuals_mm, inliers, model).
+
+    MODEL CHOICE MATTERS MORE THAN THE FIT. A full homography has 8 degrees of freedom, so from 4 points
+    it is an exact interpolation of whatever noise those 4 points carry -- residual 0.0 and a projection
+    that shears and converges wildly a few centimetres away (the classic "the grid looks way off" result).
+    An affine fit has 6, is over-determined from 4 points, and cannot invent perspective. For an overhead
+    camera looking near-straight down the true perspective term is tiny, so below `min_pts_for_homography`
+    points affine is both stabler AND closer to the truth. With 8+ points the full homography is justified
+    and is used.
+    """
     px, mm = np.asarray(px, np.float64).reshape(-1, 2), np.asarray(mm, np.float64).reshape(-1, 2)
     if len(px) < 4:
         raise ValueError(f"need >= 4 points for a homography, got {len(px)}")
-    if len(px) < 6:
-        print(f"[calibration] warning: only {len(px)} points; fit is unverified (no redundancy)")
-    H, mask = cv2.findHomography(np.float32(px), np.float32(mm), cv2.RANSAC, ransac_thresh_mm)
+    if len(px) >= min_pts_for_homography:
+        H, mask = cv2.findHomography(np.float32(px), np.float32(mm), cv2.RANSAC, ransac_thresh_mm)
+        model = "homography"
+    else:
+        A, mask = cv2.estimateAffine2D(np.float32(px), np.float32(mm), method=cv2.RANSAC,
+                                       ransacReprojThreshold=ransac_thresh_mm)
+        H = None if A is None else np.vstack([A, [0.0, 0.0, 1.0]])
+        model = "affine"
+        print(f"[calibration] {len(px)} points: fitting a 6-DOF affine (a homography needs "
+              f"{min_pts_for_homography}+ to be meaningful)")
     if H is None:
-        raise RuntimeError("findHomography failed (degenerate points?)")
+        raise RuntimeError("fit failed (degenerate points?)")
     proj = cv2.perspectiveTransform(px.reshape(-1, 1, 2), H).reshape(-1, 2)
     inliers = np.ones(len(px), bool) if mask is None else mask.ravel().astype(bool)
-    return H, np.linalg.norm(proj - mm, axis=1), inliers
+    return H, np.linalg.norm(proj - mm, axis=1), inliers, model
 
 
 def ball_table_xy(homog: TableHomography, u: float, v: float, ball_radius_mm: float,
@@ -496,14 +510,20 @@ def _selftest() -> None:
     Ht = np.array([[-0.5, 0.01, 400.0], [0.02, -0.52, 190.0], [1e-5, 2e-5, 1.0]])
     pxs = np.random.default_rng(1).uniform([50, 50], [600, 400], (9, 2))
     mms = cv2.perspectiveTransform(pxs.reshape(-1, 1, 2), Ht).reshape(-1, 2)
-    Hf, res, inl = fit_px_to_mm(pxs, mms + np.random.default_rng(2).normal(0, 0.2, mms.shape))
+    Hf, res, inl, model = fit_px_to_mm(pxs, mms + np.random.default_rng(2).normal(0, 0.2, mms.shape))
+    assert model == 'homography', model  # 9 points -> full 8-DOF fit
     assert inl.all(), inl  # clean synthetic data: nothing may be silently dropped
     chk = np.array([[100.0, 100.0], [500.0, 350.0]]).reshape(-1, 1, 2)
     assert res.max() < 1.0 and np.allclose(cv2.perspectiveTransform(chk, Hf), cv2.perspectiveTransform(chk, Ht), atol=1.0), (res, Hf)
     bad = mms.copy()
     bad[2] += 40.0  # one wrecked sample must be REPORTED as an outlier, not quietly averaged in
-    _, res_b, inl_b = fit_px_to_mm(pxs, bad)
+    _, res_b, inl_b, _ = fit_px_to_mm(pxs, bad)
     assert not inl_b[2] and inl_b.sum() >= 6 and res_b[2] > 20.0, (inl_b, res_b)
+    # few points -> affine (6 DOF), which cannot invent the wild perspective an 8-DOF fit would
+    Ha, _, _, model_a = fit_px_to_mm(pxs[:5], mms[:5])
+    assert model_a == "affine" and np.allclose(Ha[2], [0, 0, 1]), (model_a, Ha[2])
+    chk5 = np.array([[120.0, 120.0], [520.0, 360.0]]).reshape(-1, 1, 2)
+    assert np.allclose(cv2.perspectiveTransform(chk5, Ha), cv2.perspectiveTransform(chk5, Ht), atol=12.0)
     try:
         fit_px_to_mm(pxs[:3], mms[:3])
         raise AssertionError("accepted 3 points")

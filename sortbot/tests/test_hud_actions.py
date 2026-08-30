@@ -128,32 +128,22 @@ def test_hud_actions() -> None:
         assert post("torque_on")["ok"] and get("/state")["robot"]["torque"] is True
         assert post("home")["ok"]
 
-        # --- PERCEPTION group is overlay-only now (the VLM does the seeing): zone drops + px->mm.
-        # No detector actions may exist at all.
+        # --- PERCEPTION group is overlay-only now (the VLM does the seeing): just px->mm.
+        # No detector and no zone actions may exist at all.
         acts = {a["name"]: a for a in get("/actions")}
-        for name, group in (("set_zone_drop", "perception"), ("px_to_mm", "perception"), ("log_clear", "log")):
+        for name, group in (("px_to_mm", "perception"), ("log_clear", "log")):
             assert name in acts and acts[name]["group"] == group, (name, acts.get(name))
             assert acts[name]["help"], f"{name} has no help text in GET /actions"
-        for gone in ("set_detector_params", "redetect", "toggle_mask", "pick"):
+        for gone in ("set_detector_params", "redetect", "toggle_mask", "pick", "set_zone_drop"):
             assert gone not in acts, f"detector-era action {gone!r} still registered"
         p0 = get("/state")["perception"]
         assert "params" not in p0 and "mask" not in p0, p0  # detector state keys are gone
-        assert {z["name"] for z in p0["zones"]} == {"LEFT", "MIDDLE", "RIGHT"}, p0
+        assert "zones" not in p0, p0  # zones are gone entirely
         # px -> mm conversion (drives the click-to-set-drop mode); needs the first preview frame
         _wait(lambda: post("px_to_mm", {"u": 320, "v": 240})["ok"], what="first preview frame for px_to_mm")
         r = post("px_to_mm", {"u": 320, "v": 240})
         assert r["ok"] and 120 <= r["data"]["x"] <= 420 and -220 <= r["data"]["y"] <= 220, r
-        # zone drop points: moved live + persisted (rect untouched)
         import yaml as _y
-        r = post("set_zone_drop", {"name": "MIDDLE", "x": 280, "y": 5})
-        assert r["ok"], r
-        z = next(z for z in get("/state")["perception"]["zones"] if z["name"] == "MIDDLE")
-        assert z["drop"] == [280, 5], z
-        y = _y.safe_load(cfg_copy.read_text())
-        assert y["zones"]["MIDDLE"]["drop"] == [280, 5], y["zones"]
-        assert y["zones"]["MIDDLE"]["rect"] == [[150.0, 60.0], [400.0, -60.0]], y["zones"]
-        assert not post("set_zone_drop", {"name": "NOPE", "x": 280, "y": 5})["ok"]
-        assert not post("set_zone_drop", {"name": "LEFT", "x": 9999, "y": 0})["ok"]
 
         # --- run config ---
         assert post("set_task", {"text": "sort it however makes sense"})["ok"]
@@ -365,13 +355,13 @@ def test_hud_actions() -> None:
                    for e in lg), lg[0]
         assert lg[0]["i"] > lg[-1]["i"], "log not newest-first"
         tools = [e["tool"] for e in lg]
-        assert "connect_robot" in tools and "voice" in tools and "set_zone_drop" in tools, tools
+        assert "connect_robot" in tools and "voice" in tools, tools
         picks = [e for e in lg if e["tool"] == "pick_at"]
         assert picks and any(e["thumb_b64"] for e in picks), "no pick decisions with overlay thumbnails"
         assert all("x_cm" in e["args"] for e in picks), picks  # the VLM surface is coordinates in cm
         assert any(e["thumb_b64"] and e["thumb_b64"].startswith("/9j/") for e in lg), "thumb is not a jpeg"
         assert any(e["tool"] == "torque_off" and e["ok"] is False for e in lg), "E-STOP not logged as red"
-        assert any(e["tool"] == "place_in_zone" and e["ok"] for e in lg), tools
+        assert any(e["tool"] == "place_at" and e["ok"] for e in lg), tools
         assert post("log_clear")["ok"]
         assert get("/log") == []
 
@@ -408,7 +398,7 @@ def test_hud_actions() -> None:
         if session.hud is not None:
             session.hud.stop()
     print("hud actions OK: RUN/ROBOT/PERCEPTION/VOICE/RULES/MODELS/LOG groups, E-STOP, restart, calibration, "
-          "push-to-talk transcribe, model hot-swap, zone drops + px->mm + /log, "
+          "push-to-talk transcribe, model hot-swap, px->mm + /log, "
           "help on every action, mic toggle, page/action cross-check all over HTTP")
 
 

@@ -12,6 +12,13 @@ cameras:
   overhead: {index: 0, width: 640, height: 480, fps: 30}
   wrist: {index: 1, width: 640, height: 480, fps: 30}
 workspace:
+  # Offset from the URDF's gripper_frame_link (what FK returns) to the point BETWEEN the jaws that
+  # actually grasps, in that frame's own coords. Measured from the meshes: the dummy frame sits ~7.8 mm
+  # off the jaw centreline (toward the fixed jaw) and ~3.7 mm back from the fingertips. That offset
+  # rotates with shoulder_pan / wrist_roll, so leaving it in makes every pick miss by up to 8 mm in a
+  # pose-dependent direction AND injects an error the camera homography cannot absorb.
+  # Set to [0, 0, 0] to go back to the raw URDF frame (then recalibrate).
+  tool_offset_mm: [-7.8, 0.0, 3.7]
   table_z_mm: 0.0
   gripper_clearance_mm: 15.0
   travel_z_mm: 120.0
@@ -36,12 +43,6 @@ calibration:
   target: green            # green | orange | hsv:lo_h,lo_s,lo_v,hi_h,hi_s,hi_v   (or click the HUD overhead image)
   ball_radius_mm: 20.0
   min_sample_spacing_mm: 15.0
-zones:
-  # generic bins seen from the robot (y+ is its left). Rename freely: the VLM only sees the names,
-  # and the spoken task / RULES supply what goes where at runtime.
-  LEFT:   {rect: [[150.0, 200.0], [400.0, 80.0]], drop: [170.1, 33.6]}
-  MIDDLE: {rect: [[150.0, 60.0], [400.0, -60.0]], drop: [151.4, -104.9]}
-  RIGHT:  {rect: [[150.0, -80.0], [400.0, -200.0]], drop: [275.0, -140.0]}
 vlm:
   model: gpt-5.6-luna
 voice:

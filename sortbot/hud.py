@@ -138,9 +138,6 @@ body.showhelp .help{display:block}
 .guide li.cur::before{background:var(--acc);border-color:var(--acc);color:#04120c;content:counter(g)}
 .guide li.done{color:var(--acc)}
 .guide li.done::before{content:'\2713';background:transparent;border-color:var(--acc);color:var(--acc)}
-.zrow{display:flex;align-items:center;gap:8px;margin:6px 0;font:12px var(--mono);color:var(--tx1);flex-wrap:wrap}
-.zrow .zn{color:var(--amber);width:82px;font-weight:600}
-.zrow .btn.arm{background:#4d3607;border-color:var(--amber);color:#ffe2ac}
 .mrow{display:flex;align-items:center;gap:8px;margin:8px 0;flex-wrap:wrap}
 .mrow .lbl2{color:var(--tx1);font-size:11px;text-transform:uppercase;width:70px;flex:none}
 #vlmstat{color:var(--amber);font:11.5px var(--mono)}
@@ -238,7 +235,7 @@ body.showhelp .help{display:block}
    <div class="why" id="why-calib"></div>
    <div class="rowmsg" id="msg-calib"></div>
    <div class="note"><b>&#9888; Not a straight line!</b> Samples that lie on one line cannot be fitted &mdash; spread them across the whole mat in both directions.
-   Recalibrate whenever the overhead camera or the robot base is moved or bumped, or the zone outlines stop lining up with the table.</div>
+   Recalibrate whenever the overhead camera or the robot base is moved or bumped, or the grid stops lining up with the table.</div>
   </div>
   <div id="extra-setup"></div>
  </section>
@@ -266,7 +263,7 @@ body.showhelp .help{display:block}
   </div>
   <div class="sec" id="sec-voice" hidden>
    <h3>Talk to the bot</h3>
-   <div class="inline"><input id="corr" class="grow" placeholder='e.g. "shiny things go in the RIGHT zone"'><button id="corrbtn" class="btn">Send</button></div>
+   <div class="inline"><input id="corr" class="grow" placeholder='e.g. "put the shiny things on the left"'><button id="corrbtn" class="btn">Send</button></div>
    <div class="help" data-h="say_to_bot"></div>
    <div class="inline"><button id="ptt" class="btn" data-h-title="transcribe">&#127908; Hold to talk</button>
     <button id="mictoggle" class="btn" hidden>Listening: OFF</button></div>
@@ -296,13 +293,6 @@ body.showhelp .help{display:block}
    <div class="note">last VLM call: <span id="vlmstat">-</span></div>
    <div class="note" id="mnotes"></div>
    <div class="rowmsg" id="msg-models"></div>
-  </div>
-  <div class="sec" id="sec-zones" hidden>
-   <h3>Zone drop points</h3>
-   <div id="zrows"><span class="empty">no zones</span></div>
-   <div class="help" data-h="set_zone_drop"></div>
-   <div class="note">Press a zone's <b>set drop</b>, then click the overhead image where that zone should drop objects. Saved to config.yaml.</div>
-   <div class="rowmsg" id="msg-zones"></div>
   </div>
   <div id="extra-tune"></div>
  </section>
@@ -358,7 +348,7 @@ const CLAIMED=new Set(['connect_robot','connect_cameras','connect_vlm','start','
  'home','open_gripper','close_gripper','jog','goto','torque_off','torque_on',
  'say_to_bot','say_to_robot','transcribe','speak','mic_on','mic_off',
  'add_rule','delete_rule','move_rule','clear_hints','get_models','set_model',
- 'set_zone_drop','px_to_mm','log_clear',
+ 'px_to_mm','log_clear',
  'calib_start','calib_touch','calib_capture','calib_undo','calib_finish','calib_cancel','calib_sample']);
 const DEVICES=[
  ['robot','connect_robot','Robot','SO-101 follower arm. Torque comes on when connected; the arm moves only on your actions.'],
@@ -372,7 +362,7 @@ const GUIDE=[
  '<i>Optional:</i> <b>Set table height</b> &mdash; only needed if you did <i>not</i> capture with the target on the table. It measures the table height (grasp depth) and nothing else; the captures give the x/y mapping, and if they were taken on the table Finish reads the height off them.',
  'Press <b>Finish</b> to save (it refuses a fit it can tell is bad, and tells you why). <b>Cancel</b> writes nothing.'];
 let ACT={},actsig='',S={},curTab='setup';
-let ring=null,frameW=640,frameH=480,haveWH=false,dropZone=null,zoneSig='',rulesSig='',logSig='',tickerSig='';
+let ring=null,frameW=640,frameH=480,haveWH=false,rulesSig='',logSig='',tickerSig='';
 // Frame size for px scaling: prefer the live size from /state (haveWH) — an <img> on an mjpeg stream can keep
 // a stale naturalWidth from before a server restart at another resolution, mis-scaling clicks and the ring.
 function frameWH(im){return haveWH?[frameW,frameH]:[im.naturalWidth||frameW,im.naturalHeight||frameH];}
@@ -453,7 +443,6 @@ function renderAll(){
  $('sec-voice').hidden=!has('say_to_bot');
  $('sec-rules').hidden=!has('add_rule');
  $('sec-models').hidden=!has('get_models');
- $('sec-zones').hidden=!has('set_zone_drop');
  $('sec-robot').hidden=!has('home');
  $('sec-log').hidden=!has('log_clear');
  $('mictoggle').hidden=!has('mic_on');
@@ -514,14 +503,10 @@ $('b-logclear').onclick=async()=>{await act('log_clear',{},$('b-logclear'));logS
 $('mictoggle').onclick=async()=>{const on=S.voice&&S.voice.listening;
  const j=on?await act('mic_off',{},$('mictoggle')):await act('mic_on',{},$('mictoggle'));
  $('micnote').textContent=j.message||'';tick();};
-// ---------- overhead click: zone drop placement or calibration target pick ----------
+// ---------- overhead click: calibration target pick ----------
 $('ov').onclick=async e=>{const im=$('ov'),r=im.getBoundingClientRect();
  const [nw,nh]=frameWH(im);
  const u=Math.round((e.clientX-r.left)/r.width*nw),v=Math.round((e.clientY-r.top)/r.height*nh);
- if(dropZone){const z=dropZone;dropZone=null;zoneSig='';
-  const j=await act('px_to_mm',{u:u,v:v});
-  if(j.ok&&j.data)await act('set_zone_drop',{name:z,x:j.data.x,y:j.data.y});
-  return;}
  const cal=S.calibration;
  if(ACT.calib_sample&&(curTab==='setup'||(cal&&cal.state==='running'))){
   const j=await act('calib_sample',{u:u,v:v});
@@ -665,12 +650,6 @@ function renderRules(rl){if(!rl)return;const sig=JSON.stringify(rl);if(sig===rul
  $('rlist').querySelectorAll('a[data-del]').forEach(a=>a.onclick=()=>{rulesSig='';act('delete_rule',{i:+a.dataset.del});});
  const hints=(rl&&rl.hints)||[];
  $('hints').textContent=hints.length?hints.join(' | '):'none';}
-function renderPerc(pc){if(!pc)return;
- const sig=JSON.stringify([pc.zones,dropZone]);if(sig===zoneSig)return;zoneSig=sig;
- $('zrows').innerHTML=(pc.zones||[]).map(z=>'<div class="zrow"><span class="zn">'+esc(z.name)+'</span><span>drop ('+z.drop[0]+', '+z.drop[1]+')</span>'+
-  '<button class="btn sm'+(dropZone===z.name?' arm':'')+'" data-z="'+esc(z.name)+'">'+(dropZone===z.name?'click the image...':'set drop')+'</button></div>').join('')
-  ||'<span class="empty">no zones configured</span>';
- $('zrows').querySelectorAll('button[data-z]').forEach(b=>b.onclick=()=>{dropZone=dropZone===b.dataset.z?null:b.dataset.z;zoneSig='';renderPerc(S.perception);});}
 function updateEnables(){
  const r=S.run;if(!r)return;
  const c=r.connected||{},ph=r.phase,running=ph==='running',paused=ph==='paused',active=running||paused;
@@ -766,7 +745,6 @@ async function tick(){let s;
   if(s.voice.last_transcript&&!$('transcript').textContent.startsWith('!!')&&$('transcript').textContent!=='transcribing...')
    $('transcript').textContent='heard: "'+s.voice.last_transcript+'"';}
  renderRules(s.rules);
- renderPerc(s.perception);
  updateEnables();
  // toasts: bot speech, failures, run errors
  if(s.say&&s.say!==lastSay){lastSay=s.say;toast('“'+s.say+'”','say');}

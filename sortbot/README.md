@@ -1,7 +1,8 @@
 # sortbot
 
-VLM-driven pick-and-sort on an SO101 arm: sort the things on the table into the LEFT / MIDDLE / RIGHT zones.
-The app is task-agnostic — your spoken task and RULES say what goes where; with no task it groups similar items sensibly.
+VLM-driven pick-and-place on an SO101 arm: tidy the things on the table into groups.
+The app is task-agnostic — your spoken task and RULES say what goes where; with no task it groups similar items
+sensibly. There are no zones: the VLM chooses coordinates.
 
 ## Architecture
 
@@ -11,7 +12,7 @@ The app is task-agnostic — your spoken task and RULES say what goes where; wit
  overhead cam ─┐              ┌── main.py loop ──┐
  wrist cam  ───┴─> perception.py ─> vlm.py ─> robot.py ─> SO101
                    (cm-grid overlay, (sees the   (safety
-                    zones, EE)        photos, one envelope, IK)
+                    EE marker)       photos, one envelope, IK)
                         │             tool call)  │
                         └── hud.py <──────────────┘   (browser HUD, port 8765)
  calibration.py: overhead px <-> table mm (teleop-fitted H, or ArUco mat) + table_T_base -> calib/calib.json
@@ -20,13 +21,13 @@ The app is task-agnostic — your spoken task and RULES say what goes where; wit
 
 There is NO object detector: the VLM does the seeing itself. Loop: `home()` -> capture overhead + wrist ->
 composite the cached cm-grid overlay -> VLM reads the photos and emits ONE coordinate-based tool call
-(`pick_at(x_cm,y_cm)`, `place_in_zone(zone)`, `place_at(x_cm,y_cm)`, `say(text)`, `done`; low-level
+(`pick_at(x_cm,y_cm)`, `place_at(x_cm,y_cm)`, `say(text)`, `done`; low-level
 `move_to/open_gripper/close_gripper/turn_to` for recovery) -> validate against the workspace envelope
 (rejections go back to the VLM as FAILED tool results) -> execute -> repeat. Voice corrections drain at the
 top of each iteration into a persistent RULES list sent with every prompt.
 
 **Units**: the VLM-facing surface (tool args, overlay grid labels, prompt state, history) is CENTIMETERS;
-everything internal (robot, config.yaml, calib.json, safety envelope, zones) stays MILLIMETERS. The cm->mm
+everything internal (robot, config.yaml, calib.json, safety envelope) stays MILLIMETERS. The cm->mm
 conversion happens in exactly one place (`main._mm_args`; `vlm._state_text` + the overlay labels are the
 mm->cm half). Recalibrating is never needed after unit changes — calib.json is untouched.
 
@@ -91,7 +92,7 @@ position, size and hidden state are remembered per browser) -- and four intent t
 * **OPERATE** -- task text, big Start/Pause/Resume/Stop (+ Step once / max steps), corrections (text box,
   push-to-talk, and the **Listening** toggle mapped to `mic_on`/`mic_off` -- the mic NEVER runs unless that
   toggle is on, and it is off on every start), and the rules editor.
-* **TUNE** -- model dropdowns and zone drop points.
+* **TUNE** -- model dropdowns.
 * **DEBUG** -- manual arm control (home / gripper / jog pad / go-to / torque), the decision log, and a raw
   list of every registered action.
 
@@ -145,14 +146,12 @@ persistent RULES list (same RulesStore the voice path uses; survives restarts vi
 one-shot hints of the current run. The rules tab renders the list with per-rule up/down/delete controls;
 `GET /state` carries `rules: {list, hints}`.
 
-PERCEPTION group (overlay-only -- the VLM does the seeing, there are no detector controls):
-`set_zone_drop(name, x, y)` moves a zone's drop point (table mm, validated against the workspace) and persists it
-into `config.yaml zones` (rect untouched, comments preserved); on the page press a zone's **set drop** then click
-the overhead image -- the click is converted px -> mm via the `px_to_mm(u, v)` action. `GET /state` carries
-`perception: {calibrated, zones: [{name, drop, rect}]}`.
+PERCEPTION group (overlay-only -- the VLM does the seeing, and there are no detector or zone controls):
+`px_to_mm(u, v)` converts an overhead pixel to table-frame mm via the current homography (click the overhead
+image to read a position off it). `GET /state` carries `perception: {calibrated}`.
 
 LOG group: a ring buffer of the last 200 decisions/events -- every loop tool call (with a 160px overlay jpeg
-thumbnail at decision time, latency and the say text), plus voice events, mode changes, zone-drop moves and
+thumbnail at decision time, latency and the say text), plus voice events, mode changes and
 torque on/off -- served newest-first at `GET /log` as
 `{i, step, t, tool, args, result, ok, say, latency_ms, thumb_b64}`. The log tab renders a scrolling list with
 thumbnails; rejections / safety errors / E-STOP (`ok: false`, `FAILED:`/`rejected:`/`safety:` results) are red.
@@ -171,8 +170,8 @@ Loop behaviour: every iteration starts with `home()`, so objects and drop points
 of HOME (with the default config: x 160-300 mm, |y| <= 160 mm). Rejected/unsafe commands are returned to the VLM
 as `FAILED: ...` history entries, never raised. Voice input: "rule"-shaped sentences are persisted to RULES,
 `stop` ends the run, `open`/`close`/`home` execute directly, anything else is passed to the VLM as a `(human) ...` hint.
-What counts as "already sorted" is the VLM's call: the prompt tells it to leave things that already sit in a
-sensible zone alone.
+What counts as "already sorted" is the VLM's call: the prompt tells it to leave things that are already where
+they belong.
 
 ## Calibration (default: teleop / ball mode, no ArUco tags)
 
@@ -212,15 +211,26 @@ the HUD of a running `main` with the robot connected. A background thread teleop
    `force`) to save anyway. *Cancel* (`q`) writes nothing. The leader is released and the loop resumes with
    the reloaded homography.
 
+**Fit model**: below 8 usable points the fit is a **6-DOF affine**, not an 8-DOF homography. A homography from
+4 points is an exact interpolation of those 4 points' noise, which shears and converges wildly a few centimetres
+away — the classic "the grid looks way off". Affine is over-determined from 4 points and cannot invent
+perspective, and for a near-nadir overhead camera the true perspective term is tiny. With 8+ points the full
+homography is used. `GET /state calibration.model` reports which.
+
+**Tool point**: every xyz in the app — FK, IK, the safety envelope and the calibration pairing — refers to the
+grasp point between the jaws, i.e. the URDF `gripper_frame_link` plus `workspace.tool_offset_mm`. That dummy
+frame sits ~7.8 mm off the jaw centreline and ~3.7 mm behind the fingertips; since the offset rotates with
+`shoulder_pan` / `wrist_roll` it lands in a different table direction at every arm pose, so leaving it in makes
+picks miss by up to 8 mm *and* injects a calibration error no homography can absorb. Set it to `[0, 0, 0]` for
+the raw URDF frame (and recalibrate).
+
 The calibration **persists**: it is written only on Finish, auto-loads on startup (a summary line —
 points / residuals / coverage / age — is logged and shown in the Setup tab), and nothing else ever
 overwrites it. The overlay itself is a **cached static layer**: the grid, its cm tick labels, the axis arrows, the
 calibration anchors and the legend are functions of the calibration and the config, not of the picture, so
 they are rendered once and composited unchanged onto every frame -- the overlay only changes when the
 homography, frame size, grid spacing, anchors or rules change (i.e. when the configuration does), never
-frame to frame. The end-effector cross is the one live element. **Zone rectangles are not drawn**: the
-LEFT/MIDDLE/RIGHT boxes are bookkeeping for `place_in_zone`, not physical bins, and painting them over the
-picture was misleading. At runtime the calibration's own anchor points are drawn on the overlay (small diamonds, `c1`, `c2`, ...)
+frame to frame. The end-effector cross is the one live element. At runtime the calibration's own anchor points are drawn on the overlay (small diamonds, `c1`, `c2`, ...)
 next to the sampled-area outline -- the grid is pinned at those anchors and interpolated everywhere else, so
 a visible mismatch tells you immediately whether the fit is bad or you are simply far from any anchor.
 Coordinates outside the sampled area (+20% margin) are refused ("outside the calibrated area — recalibrate with wider coverage"),
@@ -232,7 +242,7 @@ After that the **table frame is the base frame** in xy (x fwd, y left, mm). `H` 
 4 ArUco tags overriding per frame when all are visible.
 
 **Recalibrate** whenever the overhead camera or the robot base is moved/bumped, the camera resolution changes, or
-the HUD overlay grid / zone outlines stop lining up with the table. Old `calib.json` files without the new keys
+the HUD overlay grid stops lining up with the table. Old `calib.json` files without the new keys
 still load (rigid `table_T_base` only, no fixed H).
 
 Keys: `OPENAI_API_KEY` (and optional `ELEVENLABS_API_KEY`) in `.env` at repo root. Without the ElevenLabs key,

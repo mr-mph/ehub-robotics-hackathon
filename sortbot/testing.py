@@ -54,36 +54,40 @@ class MockRobot(_KinematicBase):
 
 class MockVLM:
     """Deterministic coordinate planner (the app's VLM does its own seeing, so this double works from a
-    script): pick_at each target in turn (cm, like the real tool surface) -> place in zones round-robin ->
-    done when the script is exhausted. Default targets: the SIM_OBJECTS positions, so it 'sees' the
-    default SimScene. A pick_at that fails is retried before advancing."""
+    script): pick_at each target in turn, place_at the matching drop coordinate, done when the script is
+    exhausted. All coordinates are cm, like the real tool surface. Default targets: the SIM_OBJECTS
+    positions, so it 'sees' the default SimScene."""
 
-    def __init__(self, model: str | None = None, targets_cm: list[tuple[float, float]] | None = None):
+    #: where picked items are put down (cm) -- three tidy clusters, cycled
+    DROPS_CM = [(27.5, 14.0), (27.5, 0.0), (27.5, -14.0)]
+
+    def __init__(self, model: str | None = None, targets_cm: list[tuple[float, float]] | None = None,
+                 drops_cm: list[tuple[float, float]] | None = None):
         self.model = model or "mock"
         # mm -> cm: the doubles speak the same cm tool surface as the real VLM (see sortbot.vlm)
         self.targets = list(targets_cm) if targets_cm is not None \
             else [(x / 10.0, y / 10.0) for (x, y), _ in SIM_OBJECTS]
+        self.drops = list(drops_cm) if drops_cm is not None else list(self.DROPS_CM)
         self._i = 0
-        self._zone_i = 0
+        self._drop_i = 0
         self.last_latency_ms: int | None = None
         self.last_usage = self.last_cost_usd = None
 
     def reset(self) -> None:
         """Fresh script for a fresh run (Session.start resets every device that supports it)."""
-        self._i = self._zone_i = 0
+        self._i = self._drop_i = 0
 
-    def plan_step(self, overhead_overlay_png: bytes, wrist_png: bytes, world: WorldState, history: list) -> Command:
+    def plan_step(self, overhead_overlay_png: bytes, wrist_png: bytes, world: WorldState, history: list,
+                  workspace_mm=None) -> Command:
         if world.holding is not None:
-            if not world.zones:
-                return Command("place_at", {"x_cm": 27.5, "y_cm": 0.0})
-            z = world.zones[self._zone_i % len(world.zones)]
-            self._zone_i += 1
-            return Command("place_in_zone", {"zone": z.name})
+            x, y = self.drops[self._drop_i % len(self.drops)]
+            self._drop_i += 1
+            return Command("place_at", {"x_cm": float(x), "y_cm": float(y)})
         if self._i < len(self.targets):
             x, y = self.targets[self._i]
             self._i += 1
             return Command("pick_at", {"x_cm": float(x), "y_cm": float(y)})
-        return Command("done", {"summary": f"sorted {self._zone_i} objects"})
+        return Command("done", {"summary": f"sorted {self._drop_i} objects"})
 
 
 # ---------------------------------------------------------------- synthetic scene (robot + camera in one)

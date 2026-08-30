@@ -6,7 +6,7 @@ from pathlib import Path
 
 import yaml
 
-from sortbot.types import Pose, Zone
+from sortbot.types import Pose
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_YAML = Path(__file__).with_name("config.yaml")
@@ -29,6 +29,7 @@ class Config:
     overhead_cam: CameraCfg
     wrist_cam: CameraCfg
     table_z_mm: float
+    tool_offset_mm: tuple[float, float, float]
     gripper_clearance_mm: float
     travel_z_mm: float
     grasp_z_mm: float
@@ -39,7 +40,6 @@ class Config:
     aruco_dict: str
     aruco_tag_size_mm: float
     aruco_tags_mm: dict[int, tuple[float, float]]
-    zones: list[Zone]
     openai_model: str
     elevenlabs_voice_id: str
     hud_port: int
@@ -55,13 +55,7 @@ class Config:
     source_path: Path = DEFAULT_YAML       # yaml file this config was loaded from (set_model persists here)
     raw: dict = field(default_factory=dict, repr=False)
 
-    def zone(self, name: str) -> Zone | None:
-        return next((z for z in self.zones if z.name.upper() == name.upper()), None)
 
-
-def _rect_zone(name: str, d: dict) -> Zone:
-    (x0, y0), (x1, y1) = d["rect"]
-    return Zone(name, [(x0, y0), (x1, y0), (x1, y1), (x0, y1)], tuple(d["drop"]))
 
 
 def load(path: str | Path = DEFAULT_YAML) -> Config:
@@ -76,6 +70,7 @@ def load(path: str | Path = DEFAULT_YAML) -> Config:
         overhead_cam=CameraCfg(**c["overhead"]),
         wrist_cam=CameraCfg(**c["wrist"]),
         table_z_mm=float(w["table_z_mm"]),
+        tool_offset_mm=tuple(float(v) for v in w.get("tool_offset_mm", (0.0, 0.0, 0.0))),
         gripper_clearance_mm=float(w["gripper_clearance_mm"]),
         travel_z_mm=float(w["travel_z_mm"]),
         grasp_z_mm=float(w["grasp_z_mm"]),
@@ -86,7 +81,6 @@ def load(path: str | Path = DEFAULT_YAML) -> Config:
         aruco_dict=a["dict"],
         aruco_tag_size_mm=float(a["tag_size_mm"]),
         aruco_tags_mm={int(k): tuple(v) for k, v in a["tags"].items()},
-        zones=[_rect_zone(n, d) for n, d in raw["zones"].items()],
         openai_model=raw["vlm"]["model"],
         elevenlabs_voice_id=raw["voice"]["elevenlabs_voice_id"],
         hud_port=int(raw["hud"]["port"]),
@@ -107,13 +101,6 @@ def load(path: str | Path = DEFAULT_YAML) -> Config:
 if __name__ == "__main__":
     cfg = load()
     assert cfg.urdf.exists(), cfg.urdf
-    # drop points are user-tunable at runtime (set_zone_drop persists them, possibly outside the zone
-    # rect on purpose) -- only require them inside the workspace, not inside the rectangle
-    lo, hi = cfg.aabb_min_mm, cfg.aabb_max_mm
-    for z in cfg.zones:
-        dx, dy = z.drop_point_mm
-        assert lo[0] <= dx <= hi[0] and lo[1] <= dy <= hi[1], (z.name, z.drop_point_mm)
-    assert cfg.zone("left") is not None
     assert cfg.calib_mode in ("ball", "aruco", "auto") and cfg.leader_port
     print(cfg)
     print("selftest OK")

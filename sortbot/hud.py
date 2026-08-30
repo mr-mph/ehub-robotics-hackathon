@@ -891,7 +891,10 @@ class HUD:
         try:
             body = await request.body()
             kw = json.loads(body) if body else {}
-            r = a["fn"](**kw)
+            # threadpool, NEVER inline on the event loop: a long action (goto, calib_finish) would
+            # otherwise block every other request -- including the E-STOP (torque_off)
+            from starlette.concurrency import run_in_threadpool
+            r = await run_in_threadpool(lambda: a["fn"](**kw))
         except Exception as e:  # noqa: BLE001
             return JSONResponse({"ok": False, "message": f"{name}: {e}", "data": None})
         if isinstance(r, dict) and "ok" in r:

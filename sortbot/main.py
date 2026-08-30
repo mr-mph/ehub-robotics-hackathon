@@ -82,6 +82,7 @@ class Homography:
     def __init__(self, cfg: cfgmod.Config, fixed: np.ndarray | None = None):
         self.cfg, self.fixed = cfg, fixed
         self.tracker = None if fixed is not None else __import__("sortbot.calibration", fromlist=["x"]).TableHomography(cfg)
+        self._lk = threading.Lock()  # update() mutates the tracker; preview + HUD threads both call it
 
     @property
     def method(self) -> str:
@@ -96,12 +97,14 @@ class Homography:
     def update(self, frame: np.ndarray) -> np.ndarray | None:
         if self.fixed is not None:
             return self.fixed
-        return self.tracker.H if self.tracker.update(frame) else None
+        with self._lk:
+            return self.tracker.H if self.tracker.update(frame) else None
 
     def reload(self, path: Path | None = None) -> None:
         """After a calibration: pick up the new H (real) or the fitted one from `path` (mock)."""
         if self.tracker is not None:
-            self.tracker.reload(path)
+            with self._lk:
+                self.tracker.reload(path)
         elif path is not None:
             H = __import__("sortbot.calibration", fromlist=["x"]).load_calib_dict(path)["H_px_to_mm"]
             if H is not None:
@@ -467,7 +470,9 @@ class BusAssertRobot:
     torque_off/_set_torque are deliberately unguarded: the E-STOP is allowed to jump the lock queue."""
 
     BUS_METHODS = frozenset({"home", "open_gripper", "close_gripper", "move_to", "turn_to",
-                             "get_ee_pose", "get_joints_deg", "pick", "place_at", "torque_on"})
+                             "get_ee_pose", "get_joints_deg", "pick", "place_at", "torque_on",
+                             # low-level entry points too: the calibration rig calls these directly
+                             "_read_joints", "_write_joints", "capture", "disconnect"})
 
     def __init__(self, robot, lock, strict: bool = True):
         object.__setattr__(self, "_robot", robot)
@@ -694,7 +699,8 @@ class Session:
         """(Dis)connect one device via its factory; errors are reported in the response, never raised."""
         if self._running():
             return {"ok": False, "message": "stop the run before connecting or disconnecting devices", "data": None}
-        if self.calib is not None and self.calib.active:
+        calib = self.calib
+        if calib is not None and calib.active:
             return {"ok": False, "message": "finish or cancel the calibration before changing devices", "data": None}
         want = str(connect).lower() not in ("false", "0", "off", "no", "")
         self._disconnect(key)
@@ -746,7 +752,10 @@ class Session:
     def _calib_start(self) -> dict:
         if self.calib is None:
             return {"ok": False, "message": "no robot connected", "data": None}
-        if self._running() and self.ctl is not None and not self.ctl.pause_ev.is_set():
+        # start immediately only when the Loop is genuinely parked at a step boundary (phase 'paused',
+        # set inside Control.gate) -- pause_ev alone is set the instant Pause is pressed, while the
+        # current step (and its motion) is still in flight
+        if self._running() and self.ctl is not None and self.ctl.phase != "paused":
             if self.calib.active or (self.loop and self.loop._calib_requested.is_set()):
                 return {"ok": False, "message": "calibration already running/requested", "data": None}
             self.loop._calib_requested.set()
@@ -760,8 +769,9 @@ class Session:
                     self.homog.reload(self._calib_out)
             else:  # real: the z offset may have changed too
                 import sortbot.robot as robot_mod
-                self.robot.table_T_base = robot_mod.load_calib(self.cfg.calib_file)
-                self.robot.base_T_table = np.linalg.inv(self.robot.table_T_base)
+                with self.robot_lock:  # atomic pair: a /state FK between the two writes would be torn
+                    self.robot.table_T_base = robot_mod.load_calib(self.cfg.calib_file)
+                    self.robot.base_T_table = np.linalg.inv(self.robot.table_T_base)
                 if self.homog is not None:
                     self.homog.reload()
         log.info("calibration %s: %s", session.state, session.message)
@@ -1148,7 +1158,8 @@ class Session:
             return None
         # While a calibration teleop session owns the bus, never sync-read the serial port from here
         # (feetech: "Port is in use!"); serve the cached last pose instead.
-        calib_busy = self.calib is not None and self.calib.active
+        calib = self.calib  # local: _disconnect can null the attribute between the two reads
+        calib_busy = calib is not None and calib.active
         if not calib_busy and self.robot_lock.acquire(timeout=0.2):
             try:
                 p = r.get_ee_pose()
@@ -1172,7 +1183,8 @@ class Session:
         through the follower -- the serial bus belongs to the lock holders, see the module invariant)."""
         while not self._shutdown.is_set():
             try:
-                calib_busy = self.calib is not None and self.calib.active
+                calib = self.calib  # local: the attribute can be nulled by a disconnect mid-check
+                calib_busy = calib is not None and calib.active
                 if self.hud is not None and not calib_busy and self.cams is not None:
                     ov, wr = self.cams.read("overhead"), self.cams.read("wrist")
                     self.last_overhead = ov

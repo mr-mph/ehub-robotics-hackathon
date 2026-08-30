@@ -44,6 +44,9 @@ class RobotRig:
 
     def __init__(self, robot, frame_fn=None):
         self.robot = robot
+        # no frame_fn = frames come through the follower (robot.capture -> bus); an injected frame_fn
+        # (the Session passes cams.read) never touches the bus, so it must NOT be read under the bus lock
+        self.frame_via_bus = frame_fn is None
         self.frame_fn = frame_fn or (lambda: robot.capture("overhead"))
 
     def read_joints(self) -> np.ndarray:
@@ -103,6 +106,8 @@ class CalibSession:
             t0 = time.monotonic()
             try:
                 with self._lock:
+                    if self._stop.is_set():  # re-check under the lock: finish()/cancel() may have ended
+                        break                # the session while we were blocked -- no straggler tick
                     with self._bus:
                         a = self.leader.get_action()
                         self.rig.write_joints(np.array([float(a[f"{m}.pos"]) for m in MOTORS]))
@@ -115,9 +120,16 @@ class CalibSession:
             time.sleep(max(0.0, dt - (time.monotonic() - t0)))
 
     def _observe(self) -> tuple[np.ndarray, tuple | None, np.ndarray]:
-        with self._bus:  # frame may come through the follower; joints always do
+        if getattr(self.rig, "frame_via_bus", True):
+            with self._bus:  # frame comes through the follower -> it IS a bus read
+                self.frame_rgb = self.rig.frame()
+                self.fk = self.rig.fk_base_mm(self.rig.read_joints())
+        else:
+            # camera-only frame: never hold the shared bus lock across a (potentially ~1 s) camera
+            # read -- that starved the E-STOP's 1 s lock acquire into its unlocked fallback
             self.frame_rgb = self.rig.frame()
-            self.fk = self.rig.fk_base_mm(self.rig.read_joints())
+            with self._bus:
+                self.fk = self.rig.fk_base_mm(self.rig.read_joints())
         self.frame_wh = (self.frame_rgb.shape[1], self.frame_rgb.shape[0])
         self.det = detect_target(self.frame_rgb, self.target)
         if self.on_frame:
@@ -125,8 +137,12 @@ class CalibSession:
         return self.frame_rgb, self.det, self.fk
 
     def _stop_teleop(self) -> None:
+        """Signal only -- callers hold self._lock, and the teleop thread needs that lock to observe the
+        stop flag, so joining here would always burn the full timeout. _join_teleop() runs after release."""
         self._stop.set()
-        if self._thread and self._thread is not threading.current_thread():
+
+    def _join_teleop(self) -> None:
+        if self._stop.is_set() and self._thread and self._thread is not threading.current_thread():
             self._thread.join(timeout=2)
 
     # ---- triggers ----
@@ -165,6 +181,11 @@ class CalibSession:
             return _r(True, self.message, {"z_offset_mm": self.z_off})
 
     def finish(self, force: bool = False) -> dict:
+        r = self._finish_locked(force)
+        self._join_teleop()  # outside the lock: the teleop thread needs it to see the stop flag
+        return r
+
+    def _finish_locked(self, force: bool = False) -> dict:
         with self._lock:
             if self.state != "running":
                 return _r(False, f"not running ({self.state})")
@@ -208,7 +229,9 @@ class CalibSession:
         with self._lock:
             self.state, self.message = "cancelled", "cancelled (nothing written)"
             self._stop_teleop()
-            return _r(True, self.message)
+            r = _r(True, self.message)
+        self._join_teleop()
+        return r
 
     def sample(self, u: float, v: float) -> dict:
         """Pick the target colour from the latest frame at (u, v). A click that clearly sampled the table /
@@ -244,6 +267,10 @@ class CalibSession:
                 self.message = f"fit failed: {e}"
 
     def status(self) -> dict:
+        with self._lock:  # /state pollers call this from HUD threads while capture/undo/_refit mutate
+            return self._status_locked()
+
+    def _status_locked(self) -> dict:
         px = [s["px"] for s in self.samples]
         cov = coverage_pct(px, self.frame_wh)
         res = None if self.res is None else [round(float(r), 2) for r in self.res]
@@ -337,7 +364,13 @@ class CalibController:
         if self.active:
             return _r(False, "calibration already running")
         try:
-            rig, leader = self.rig_fn(), self.leader_fn()
+            # rig/leader construction can read the follower bus (e.g. the scripted leader seeds itself
+            # from the joints): serialize with every other bus toucher via the shared lock
+            if self.bus_lock is not None:
+                with self.bus_lock:
+                    rig, leader = self.rig_fn(), self.leader_fn()
+            else:
+                rig, leader = self.rig_fn(), self.leader_fn()
         except Exception as e:  # noqa: BLE001
             return _r(False, f"cannot start: {e}")
         prev = load_calib_dict(self.out)

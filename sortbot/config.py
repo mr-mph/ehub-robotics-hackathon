@@ -107,7 +107,13 @@ def load(path: str | Path = DEFAULT_YAML) -> Config:
 if __name__ == "__main__":
     cfg = load()
     assert cfg.urdf.exists(), cfg.urdf
-    assert cfg.zone("left") and cfg.zone("LEFT").contains(*cfg.zone("LEFT").drop_point_mm)
+    # drop points are user-tunable at runtime (set_zone_drop persists them, possibly outside the zone
+    # rect on purpose) -- only require them inside the workspace, not inside the rectangle
+    lo, hi = cfg.aabb_min_mm, cfg.aabb_max_mm
+    for z in cfg.zones:
+        dx, dy = z.drop_point_mm
+        assert lo[0] <= dx <= hi[0] and lo[1] <= dy <= hi[1], (z.name, z.drop_point_mm)
+    assert cfg.zone("left") is not None
     assert cfg.calib_mode in ("ball", "aruco", "auto") and cfg.leader_port
     print(cfg)
     print("selftest OK")

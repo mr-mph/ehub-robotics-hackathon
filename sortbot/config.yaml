@@ -1,0 +1,49 @@
+robot:
+  port: /dev/tty.usbmodem5B8E1155691
+  id: my_awesome_follower_arm
+  calibration_dir: sortbot/calib
+  urdf: SO101/so101_new_calib.urdf
+leader:
+  # SO101 leader arm, used to teleoperate the follower during calibration (sortbot.calibrate / HUD "Start calibration")
+  port: /dev/tty.usbmodem5B790176171
+  id: my_awesome_leader_arm     # motor calibration: robot.calibration_dir/<id>.json
+cameras:
+  # indices verified 2026-08-30 by snapshot: 0 = overhead, 1 = wrist, 2 = OBS virtual cam (ignore). Re-check with lerobot-find-cameras opencv if USB order changes.
+  overhead: {index: 0, width: 640, height: 480, fps: 30}
+  wrist: {index: 1, width: 640, height: 480, fps: 30}
+workspace:
+  table_z_mm: 0.0
+  gripper_clearance_mm: 15.0
+  travel_z_mm: 120.0
+  grasp_z_mm: 8.0
+  max_step_mm: 250.0
+  aabb_mm: {min: [120.0, -220.0, 0.0], max: [420.0, 220.0, 250.0]}
+  home: {x: 150.0, y: 0.0, z: 180.0, roll_deg: 0.0}
+aruco:
+  dict: DICT_4X4_50
+  tag_size_mm: 40.0
+  # 400x300 mm mat; ids in order TL, TR, BR, BL (x fwd, y left)
+  tags:
+    0: [420.0, 200.0]
+    1: [420.0, -200.0]
+    2: [120.0, -200.0]
+    3: [120.0, 200.0]
+calibration:
+  # teleop/ball mode (default for sortbot.calibrate): the follower gripper holds a coloured target, the human moves it
+  # with the leader arm and captures samples; overhead px -> base-frame mm is fitted directly (no ArUco).
+  # mode: ball = always use the fitted H from calib.json; aruco = tags only; auto = fitted H, tags override when all 4 seen
+  mode: auto
+  target: green            # green | orange | hsv:lo_h,lo_s,lo_v,hi_h,hi_s,hi_v   (or click the HUD overhead image)
+  ball_radius_mm: 20.0
+  min_sample_spacing_mm: 15.0
+zones:
+  WIRES:     {rect: [[150.0, 200.0], [400.0, 80.0]], drop: [275.0, 140.0]}
+  SENSORS:   {rect: [[150.0, 60.0], [400.0, -60.0]], drop: [275.0, 0.0]}
+  ACTUATORS: {rect: [[150.0, -80.0], [400.0, -200.0]], drop: [275.0, -140.0]}
+vlm:
+  model: gpt-5
+voice:
+  elevenlabs_voice_id: 21m00Tcm4TlvDq8ikWAM
+hud:
+  port: 8765
+calib_file: sortbot/calib/calib.json

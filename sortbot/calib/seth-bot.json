@@ -1,0 +1,29 @@
+{
+  "name": "seth-bot",
+  "leader_port": "/dev/tty.usbmodem5B790176171",
+  "follower_port": "/dev/tty.usbmodem5B8E1155691",
+  "leader_config": "my_awesome_leader_arm.json",
+  "follower_config": "my_awesome_follower_arm.json",
+  "cameras": [
+    {
+      "id": "camera_1782878207944",
+      "name": "gripper_cam",
+      "type": "opencv",
+      "camera_index": 0,
+      "device_id": "9607a7e5575f76af1614525b312faa45ee9982c071a8d99518d634db03d1c67d",
+      "width": 1920,
+      "height": 1080,
+      "fps": 30
+    },
+    {
+      "id": "camera_1782878214608",
+      "name": "overhead_cam",
+      "type": "opencv",
+      "camera_index": 1,
+      "device_id": "c40f5c08627999c3dccc7fb5948b76c199b9c459ad85e7f0baf9f8dc85576de0",
+      "width": 1920,
+      "height": 1080,
+      "fps": 30
+    }
+  ]
+}

@@ -438,6 +438,10 @@ class Session:
                    help="Push-to-talk: POST base64 audio (webm/opus and friends); ElevenLabs STT transcribes it and the text goes through say_to_bot.")
         h.register("speak", self.speak, "Speak (TTS test)", "voice",
                    help="Say the text aloud via ElevenLabs TTS with the current voice/model (plays on the server machine).")
+        h.register("mic_on", lambda: {"ok": True, "message": self.voice.mic_on()}, "Listening ON", "voice",
+                   help="Start hands-free listening: the mic transcribes continuously until toggled off. A MIC LIVE chip shows while on.")
+        h.register("mic_off", lambda: {"ok": True, "message": self.voice.mic_off()}, "Listening OFF", "voice",
+                   help="Stop hands-free listening. Push-to-talk and the text box keep working.")
         h.register("add_rule", self.add_rule, "Add rule", "rules",
                    help="Append a persistent rule; rules ride along with every VLM prompt and survive restarts.")
         h.register("delete_rule", self.delete_rule, None, "rules",
@@ -865,7 +869,7 @@ class Session:
 
     def _voice_state(self) -> dict:
         v = self.voice
-        return {"mode": v.mode, "queue": v.peek(), "last_transcript": v.last_transcript,
+        return {"mode": v.mode, "listening": v.listening, "queue": v.peek(), "last_transcript": v.last_transcript,
                 "tts_model": v.tts_model, "stt_model": v.stt_model, "voice_id": v.voice_id}
 
     def _rules_state(self) -> dict:
@@ -933,7 +937,7 @@ def serve(args) -> Session:
         hud = HUD(port=args.hud_port or cfg.hud_port)
         hud.start()
     voice = VoiceIO(cfg.elevenlabs_voice_id, stdin=io.StringIO("") if (args.no_voice or args.mock) else None,
-                    force_text=not args.real, tts_model=cfg.tts_model, stt_model=cfg.stt_model)
+                    force_text=True, tts_model=cfg.tts_model, stt_model=cfg.stt_model)  # mic only via explicit mic_on toggle
     voice.start()
     rules = RulesStore(args.rules_file) if args.rules_file else RulesStore()
     return Session(cfg, hud, voice, rules, max_steps=args.max_steps)

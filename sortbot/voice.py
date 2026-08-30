@@ -144,9 +144,9 @@ class VoiceIO:
                 self._client = ElevenLabs(api_key=key)
             except Exception as e:  # noqa: BLE001
                 log.warning("elevenlabs client unavailable: %s", e)
-        self.mode = "text"
-        if not force_text and self._client and shutil.which("ffmpeg") and sys.platform == "darwin":
-            self.mode = "mic"
+        self.mode = "text"  # mic NEVER auto-starts; toggle with mic_on()/mic_off()
+        self._mic_ok = bool(self._client and shutil.which("ffmpeg") and sys.platform == "darwin")
+        self._mic_thread = None
         self._player = next((p for p in ("afplay", "ffplay") if shutil.which(p)), None)
         log.info("VoiceIO mode=%s tts=%s player=%s", self.mode, bool(self._client), self._player)
 
@@ -158,8 +158,31 @@ class VoiceIO:
 
     def stop(self) -> None:
         self._stop.set()
-        if self._thread and self.mode == "mic":
-            self._thread.join(timeout=CHUNK_SECONDS + 2)
+        self.mic_off()
+
+    @property
+    def listening(self) -> bool:
+        return bool(self._mic_thread and self._mic_thread.is_alive())
+
+    def mic_on(self) -> str:
+        """Start continuous mic capture. Only ever called from an explicit user toggle."""
+        if not self._mic_ok:
+            return "mic unavailable (need ELEVENLABS_API_KEY + ffmpeg on macOS)"
+        if self.listening:
+            return "already listening"
+        self._mic_stop = threading.Event()
+        self.mode = "mic"
+        self._mic_thread = threading.Thread(target=self._mic_loop, daemon=True, name="voice-mic")
+        self._mic_thread.start()
+        return "listening"
+
+    def mic_off(self) -> str:
+        if self._mic_thread:
+            getattr(self, "_mic_stop", self._stop).set()
+            self._mic_thread.join(timeout=CHUNK_SECONDS + 2)
+            self._mic_thread = None
+        self.mode = "text"
+        return "mic off"
 
     def drain(self) -> list[str]:
         out = []
@@ -186,12 +209,14 @@ class VoiceIO:
             self.push(line)
 
     def _mic_loop(self) -> None:
-        while not self._stop.is_set():
+        stop = getattr(self, "_mic_stop", self._stop)
+        while not (self._stop.is_set() or stop.is_set()):
             wav = self._record(CHUNK_SECONDS)
             if wav is None:
-                log.warning("mic capture failed, switching to text input")
+                log.warning("mic capture failed; mic off")
                 self.mode = "text"
-                return self._text_loop()
+                self._mic_thread = None
+                return
             try:
                 text = self.transcribe(wav)
             except Exception as e:  # noqa: BLE001

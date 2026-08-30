@@ -128,6 +128,7 @@ class _KinematicBase:
         self.base_T_table = np.linalg.inv(self.table_T_base)
         self.roll_deg = 0.0
         self.gripper_open = True
+        self.torque = True  # False after torque_off() (E-STOP): every motion is refused until torque_on()
 
     # ---- frames ----
     def fk_table(self, q: np.ndarray) -> np.ndarray:
@@ -171,8 +172,25 @@ class _KinematicBase:
         p = self.fk_table(self._read_joints())[:3, 3]
         return Pose(float(p[0]), float(p[1]), float(p[2]), self.roll_deg)
 
+    # ---- torque / E-STOP ----
+    def torque_off(self) -> ExecResult:
+        """E-STOP: cut motor torque (real: bus.disable_torque()); motions raise SafetyError until torque_on()."""
+        self.torque = False
+        self._set_torque(False)
+        return ExecResult(True, "torque OFF (E-STOP)")
+
+    def torque_on(self) -> ExecResult:
+        self._set_torque(True)
+        self.torque = True
+        return ExecResult(True, "torque on")
+
+    def _set_torque(self, on: bool) -> None:
+        pass
+
     # ---- motion ----
     def _goto_joints(self, q_target: np.ndarray) -> None:
+        if not self.torque:
+            raise SafetyError("torque is off (E-STOP); press torque_on first")
         q = self._read_joints()
         n = max(1, int(math.ceil(np.abs(q_target - q).max() / MOVE_STEP_DEG)))
         for i in range(1, n + 1):
@@ -215,8 +233,11 @@ class _KinematicBase:
         except SafetyError as e:
             log.error("move_to rejected: %s", e)
             return ExecResult(False, str(e))
-        for q in plan:
-            self._goto_joints(q)
+        try:
+            for q in plan:
+                self._goto_joints(q)
+        except SafetyError as e:  # torque off (E-STOP) mid-motion
+            return ExecResult(False, str(e))
         return ExecResult(True, f"at ({x:.0f},{y:.0f},{z:.0f}) tilt {self.tilt_deg(plan[-1]):.0f}deg")
 
     def turn_to(self, deg: float) -> ExecResult:
@@ -227,8 +248,11 @@ class _KinematicBase:
             q = self.ik_table(self._read_joints(), p.x, p.y, p.z, float(deg))
         except SafetyError as e:
             return ExecResult(False, str(e))
+        try:
+            self._goto_joints(q)
+        except SafetyError as e:
+            return ExecResult(False, str(e))
         self.roll_deg = float(deg)
-        self._goto_joints(q)
         return ExecResult(True, f"roll {deg:.0f}")
 
     def _set_gripper(self, value: float) -> None:
@@ -237,12 +261,18 @@ class _KinematicBase:
         self._goto_joints(q)
 
     def open_gripper(self) -> ExecResult:
-        self._set_gripper(GRIPPER_OPEN)
+        try:
+            self._set_gripper(GRIPPER_OPEN)
+        except SafetyError as e:
+            return ExecResult(False, str(e))
         self.gripper_open = True
         return ExecResult(True, "gripper open")
 
     def close_gripper(self) -> ExecResult:
-        self._set_gripper(GRIPPER_CLOSED)
+        try:
+            self._set_gripper(GRIPPER_CLOSED)
+        except SafetyError as e:
+            return ExecResult(False, str(e))
         self.gripper_open = False
         return ExecResult(True, "gripper closed")
 
@@ -252,6 +282,8 @@ class _KinematicBase:
         r = self.move_to(h.x, h.y, h.z)
         if r.ok:
             return ExecResult(True, "home")
+        if not self.torque:
+            return r
         try:  # arm far from home (e.g. right after connect): go directly in joint space
             self._goto_joints(self.ik_table(self._read_joints(), h.x, h.y, h.z, h.roll_deg))
         except SafetyError as e:
@@ -340,8 +372,42 @@ class SO101Robot(_KinematicBase):
     def capture(self, name: str) -> np.ndarray:
         return self.robot.get_observation()[name]
 
+    def _set_torque(self, on: bool) -> None:
+        (self.robot.bus.enable_torque if on else self.robot.bus.disable_torque)()
+
     def disconnect(self) -> None:
         self.robot.disconnect()
+
+
+class Cameras:
+    """Overhead + wrist OpenCV cameras opened directly (not through the follower), so 'real cams + mock robot'
+    works for tuning perception without an arm. read(name) -> RGB HxWx3; frames are cached per name."""
+
+    def __init__(self, cfg: cfgmod.Config | None = None, names=("overhead", "wrist")):
+        from lerobot.cameras.opencv import OpenCVCamera, OpenCVCameraConfig
+
+        self.cfg = cfg or cfgmod.load()
+        self.cams = {}
+        try:
+            for name in names:
+                c = self.cfg.overhead_cam if name == "overhead" else self.cfg.wrist_cam
+                cam = OpenCVCamera(OpenCVCameraConfig(index_or_path=c.index, fps=c.fps, width=c.width, height=c.height))
+                cam.connect(warmup=True)
+                self.cams[name] = cam
+        except Exception:
+            self.disconnect()
+            raise
+
+    def read(self, name: str) -> np.ndarray:
+        return np.ascontiguousarray(self.cams[name].async_read(timeout_ms=1000))
+
+    def disconnect(self) -> None:
+        for cam in self.cams.values():
+            try:
+                cam.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+        self.cams = {}
 
 
 def _selftest() -> None:
@@ -389,6 +455,10 @@ def _selftest() -> None:
         else:
             raise AssertionError(bad)
     assert r.home().ok
+    assert r.torque_off().ok and not r.torque
+    res = r.move_to(275, 0, 60)
+    assert not res.ok and "torque" in res.message, res  # E-STOP refuses motion
+    assert r.torque_on().ok and r.torque
     assert not r.move_to(400, -200, 60).ok  # > max_step_mm from home
     assert r.move_to(275, 0, 60).ok
     res = r.move_to(420, 0, 60)  # inside AABB but kinematically unreachable -> IK sanity rejects

@@ -12,6 +12,7 @@ the overhead image). Groups with nothing registered show "not available in this 
 """
 from __future__ import annotations
 
+import inspect
 import json
 import threading
 import time
@@ -29,7 +30,21 @@ GROUPS = ["run", "robot", "calibration", "voice"]
 PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>sortbot HUD</title>
 <style>
 body{margin:0;background:#111;color:#ddd;font:14px/1.4 -apple-system,Helvetica,Arial,sans-serif}
-.grid{display:grid;grid-template-columns:2fr 1fr;gap:10px;padding:10px}
+header{display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:8px 12px;background:#181818;border-bottom:1px solid #333;position:sticky;top:0;z-index:5}
+h1{font-size:14px;margin:0;color:#8ab;letter-spacing:2px}
+.pillgrp{display:flex;align-items:center;gap:3px}
+.pillgrp .lbl{color:#789;font-size:11px;text-transform:uppercase;margin-right:2px}
+.pill{background:#222;border:1px solid #444;color:#aaa;border-radius:12px;padding:2px 10px;cursor:pointer;font:12px inherit}
+.pill.sel{background:#264;border-color:#4a6;color:#dfd}
+.pill.on{border-color:#3d3;box-shadow:0 0 5px #2a2}
+#phase{font:13px Menlo,monospace;color:#fc8;text-transform:uppercase}
+#stepc{font:13px Menlo,monospace;color:#8ab}
+#estop{margin-left:auto;background:#a11;color:#fff;border:2px solid #f44;border-radius:6px;font-weight:700;font-size:15px;padding:8px 20px;cursor:pointer;letter-spacing:1px}
+#estop:hover{background:#c22}
+#estop.off{background:#f33;animation:blink 1s infinite}
+@keyframes blink{50%{opacity:.45}}
+.grid{display:grid;grid-template-columns:minmax(0,3fr) minmax(0,2fr);gap:10px;padding:10px}
+@media(max-width:900px){.grid{grid-template-columns:1fr}}
 .card{background:#1b1b1b;border:1px solid #333;border-radius:6px;padding:8px}
 .card h3{margin:0 0 6px;font-size:12px;text-transform:uppercase;color:#8ab}
 img{width:100%;display:block;background:#000}
@@ -42,38 +57,77 @@ ul{margin:0;padding-left:18px}
 button{background:#263;color:#dfd;border:1px solid #4a6;border-radius:4px;padding:4px 10px;margin:2px 4px 2px 0;cursor:pointer;font:13px inherit}
 button:hover{background:#385}
 .na{color:#666;font-style:italic}
-.msg{color:#fc8;font:12px/1.3 Menlo,monospace;white-space:pre-wrap;margin-top:4px}
+.msg{color:#fc8;font:12px/1.3 Menlo,monospace;white-space:pre-wrap;margin-top:4px;min-height:14px}
+.err{color:#f66;font:12px/1.3 Menlo,monospace;white-space:pre-wrap}
 .note{color:#888;font-size:12px;margin-top:4px}
-</style></head><body><div class="grid">
+.tabs{display:flex;gap:2px;border-bottom:1px solid #333;margin-bottom:8px}
+.tab{background:none;border:none;color:#89a;padding:4px 12px;cursor:pointer;border-bottom:2px solid transparent;border-radius:0;text-transform:uppercase;font-size:12px}
+.tab.sel{color:#dfd;border-bottom-color:#4a6}
+.tab:hover{background:#222}
+.act{display:flex;flex-wrap:wrap;align-items:center;gap:4px;margin:4px 0}
+.act button{min-width:110px;margin:0}
+input{background:#0d0d0d;color:#dfd;border:1px solid #444;border-radius:3px;padding:4px 6px;font:12px Menlo,monospace;width:72px}
+input.wide{width:260px}
+[hidden]{display:none!important}
+</style></head><body>
+<header>
+ <h1>SORTBOT</h1>
+ <span class="pillgrp"><span class="lbl">robot</span><button class="pill" data-k="robot" data-v="mock">mock</button><button class="pill" data-k="robot" data-v="real">real</button><button class="pill" data-k="robot" data-v="off">off</button></span>
+ <span class="pillgrp"><span class="lbl">cams</span><button class="pill" data-k="cams" data-v="sim">sim</button><button class="pill" data-k="cams" data-v="real">real</button><button class="pill" data-k="cams" data-v="off">off</button></span>
+ <span class="pillgrp"><span class="lbl">vlm</span><button class="pill" data-k="vlm" data-v="mock">mock</button><button class="pill" data-k="vlm" data-v="live">live</button><button class="pill" data-k="vlm" data-v="off">off</button></span>
+ <span id="phase">idle</span><span id="stepc"></span>
+ <button id="estop" title="torque_off: cut motor torque and pause the run">E-STOP</button>
+</header>
+<div class="grid">
 <div class="side">
  <div class="card"><h3>Overhead (VLM input) &mdash; click the calibration target to pick its colour</h3>
   <div class="wrap"><img id="ov" src="/overhead.mjpg"><div id="ring"></div></div></div>
- <div class="card"><h3>Wrist</h3><img src="/wrist.mjpg"></div>
+ <div class="card"><h3>Wrist</h3><img id="wr" src="/wrist.mjpg"></div>
 </div>
 <div class="side">
- <div class="card"><h3>Status</h3><div class="kv" id="kv"></div></div>
- <div class="card"><h3>Calibration</h3><div id="g-calibration"></div><div class="kv" id="calib"></div><div class="msg" id="calibmsg"></div>
-  <div class="note">Hold the target in the gripper, Start, move the arm with the leader, Capture at >= 4 spread-out spots
-  (Touch table once with the fingertip on the table), Finish. Recalibrate whenever the overhead camera or the robot base moves,
-  or the overlay grid stops lining up with the table.</div></div>
- <div class="card"><h3>Run</h3><div id="g-run"></div></div>
- <div class="card"><h3>Robot</h3><div id="g-robot"></div></div>
- <div class="card"><h3>Voice</h3><div id="g-voice"></div><ul id="voice"></ul></div>
+ <div class="card"><h3>Status</h3><div class="kv" id="kv"></div><div class="err" id="errline"></div><div class="msg" id="msg"></div></div>
+ <div class="card"><div class="tabs" id="tabs"></div><div id="acts"></div>
+  <div data-extra="calibration"><div class="kv" id="calib"></div><div class="msg" id="calibmsg"></div>
+   <div class="note">Hold the target in the gripper, Start, move the arm with the leader, Capture at &gt;= 4 spread-out spots
+   (Touch table once with the fingertip on the table), Finish. Recalibrate whenever the overhead camera or the robot base moves,
+   or the overlay grid stops lining up with the table.</div></div>
+  <div data-extra="voice"><h3 style="margin-top:8px">Queue</h3><ul id="voice"></ul></div>
+ </div>
  <div class="card"><h3>Last VLM call</h3><pre id="call"></pre><pre id="say" style="color:#fc8"></pre></div>
  <div class="card"><h3>Rules</h3><ul id="rules"></ul></div>
 </div></div>
 <script>
 const $=id=>document.getElementById(id);
-const esc=s=>String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const li=(id,a)=>{$(id).innerHTML=(a||[]).map(x=>'<li>'+esc(x)+'</li>').join('')||'<li style="color:#666">none</li>'};
-let frameW=640,frameH=480,ring=null;
-async function act(name,body){const r=await fetch('/action/'+name,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
- const j=await r.json();$('calibmsg').textContent=(j.ok?'':'!! ')+(j.message||'');return j;}
-async function loadActions(){const a=await (await fetch('/actions')).json();
- for(const g of ['run','robot','calibration','voice']){const el=$('g-'+g);if(!el)continue;
-  const btns=a.filter(x=>x.group===g&&x.label);
-  el.innerHTML=btns.length?btns.map(x=>`<button data-n="${esc(x.name)}">${esc(x.label)}</button>`).join(''):'<span class="na">not available in this mode</span>';
-  el.querySelectorAll('button').forEach(b=>b.onclick=()=>act(b.dataset.n));}}
+const GROUPS=['run','robot','calibration','voice'];
+const HDR=new Set(['set_mode','torque_off']);
+let actions=[],actsig='',curTab='run',ring=null,frameW=640,frameH=480;
+async function act(name,body){try{
+ const r=await fetch('/action/'+name,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
+ const j=await r.json();const m=(j.ok?'':'!! ')+(j.message||'');
+ $('msg').textContent=m;if(name.startsWith('calib_'))$('calibmsg').textContent=m;
+ loadActions();return j;}catch(e){$('msg').textContent='!! '+e;return{ok:false};}}
+function groupList(){const gs=[...GROUPS];for(const a of actions)if(!gs.includes(a.group))gs.push(a.group);return gs;}
+function renderTabs(){const gs=groupList();if(!gs.includes(curTab))curTab=gs[0];
+ $('tabs').innerHTML=gs.map(g=>`<button class="tab${g===curTab?' sel':''}" data-g="${esc(g)}">${esc(g)}</button>`).join('');
+ $('tabs').querySelectorAll('.tab').forEach(b=>b.onclick=()=>{curTab=b.dataset.g;renderTabs();});
+ renderBody();}
+function rowHtml(a){const ins=(a.params||[]).map(p=>{const d=p.default==null?'':String(p.default);
+ const w=(p.name==='text'||p.name==='task')?' class="wide"':'';
+ return `<input${w} data-p="${esc(p.name)}" placeholder="${esc(p.name)}" value="${esc(d)}">`;}).join('');
+ return `<div class="act"><button data-n="${esc(a.name)}">${esc(a.label)}</button>${ins}</div>`;}
+function renderBody(){const rows=actions.filter(a=>a.group===curTab&&a.label&&!HDR.has(a.name));
+ $('acts').innerHTML=rows.length?rows.map(rowHtml).join(''):'<span class="na">not available in this mode</span>';
+ $('acts').querySelectorAll('button[data-n]').forEach(b=>b.onclick=()=>{const body={};
+  b.parentElement.querySelectorAll('input').forEach(i=>{const v=i.value.trim();if(v==='')return;
+   body[i.dataset.p]=/^-?\\d+(\\.\\d+)?$/.test(v)?parseFloat(v):v;});
+  act(b.dataset.n,body);});
+ document.querySelectorAll('[data-extra]').forEach(d=>d.hidden=d.dataset.extra!==curTab);}
+async function loadActions(){try{const a=await(await fetch('/actions')).json();
+ const sig=JSON.stringify(a);if(sig!==actsig){actsig=sig;actions=a;renderTabs();}}catch(e){}}
+document.querySelectorAll('.pill').forEach(b=>b.onclick=()=>act('set_mode',{[b.dataset.k]:b.dataset.v}));
+$('estop').onclick=()=>act('torque_off');
 $('ov').onclick=async e=>{const im=$('ov'),r=im.getBoundingClientRect();
  const nw=im.naturalWidth||frameW,nh=im.naturalHeight||frameH;
  const u=(e.clientX-r.left)/r.width*nw,v=(e.clientY-r.top)/r.height*nh;
@@ -84,26 +138,39 @@ function drawRing(){const im=$('ov'),el=$('ring');if(!ring){el.style.display='no
  el.style.display='block';el.style.left=(u-rad)*sx+'px';el.style.top=(v-rad)*sy+'px';el.style.width=2*rad*sx+'px';el.style.height=2*rad*sy+'px';}
 async function tick(){try{
  const s=await (await fetch('/state')).json();
- const p=s.ee_pose||{};
+ const r=s.run||{},rb=s.robot,p=(rb&&rb.ee_pose)||s.ee_pose||{};
+ $('phase').textContent=r.phase||'idle';
+ $('stepc').textContent='step '+(r.step??s.step??0)+'/'+(r.max_steps??'-');
+ document.querySelectorAll('.pill').forEach(b=>{const cur=(r.mode||{})[b.dataset.k];
+  b.classList.toggle('sel',cur===b.dataset.v);
+  b.classList.toggle('on',cur===b.dataset.v&&!!((r.connected||{})[b.dataset.k]));});
+ const toff=rb&&rb.torque===false;
+ $('estop').classList.toggle('off',!!toff);
+ $('estop').textContent=toff?'TORQUE OFF':'E-STOP';
+ $('errline').textContent=r.last_error?('last error: '+r.last_error):'';
+ const jd=rb&&rb.joints_deg?rb.joints_deg.map(x=>x.toFixed(0)).join(' '):null;
  $('kv').innerHTML=
-  `<div><span>step</span> ${s.step??'-'} &nbsp; <span>status</span> ${esc(s.status??'-')} &nbsp; <span>latency</span> ${s.latency_ms??'-'} ms</div>`+
-  `<div><span>EE</span> x=${p.x??'-'} y=${p.y??'-'} z=${p.z??'-'} roll=${p.roll_deg??'-'}</div>`+
-  `<div><span>holding</span> ${s.holding??'nothing'} &nbsp; <span>gripper</span> ${s.gripper_open===undefined?'-':(s.gripper_open?'open':'closed')}</div>`+
+  `<div><span>status</span> ${esc(s.status??'-')} &nbsp; <span>latency</span> ${s.latency_ms??'-'} ms &nbsp; <span>result</span> ${esc(r.result||'-')}</div>`+
+  `<div><span>task</span> ${esc(r.task||'(default: sort sensibly)')}</div>`+
+  `<div><span>EE</span> x=${fmt(p.x)} y=${fmt(p.y)} z=${fmt(p.z)} roll=${fmt(p.roll_deg)}`+(jd?` &nbsp; <span>joints</span> ${jd}`:'')+`</div>`+
+  `<div><span>holding</span> ${(rb?rb.holding:s.holding)??'nothing'} &nbsp; <span>gripper</span> ${grip(rb?rb.gripper_open:s.gripper_open)} &nbsp; <span>torque</span> ${rb?(rb.torque?'on':'OFF'):'-'}</div>`+
   `<div><span>updated</span> ${s.age_s??'-'} s ago</div>`;
  if(s.frame_wh){frameW=s.frame_wh[0];frameH=s.frame_wh[1];}
  const c=s.calibration;
- if(c){const fk=c.fk_mm?c.fk_mm.map(x=>x.toFixed(0)).join(', '):'-';const t=c.target||{};
+ if(c&&c.state){const fk=c.fk_mm?c.fk_mm.map(x=>x.toFixed(0)).join(', '):'-';const t=c.target||{};
   $('calib').innerHTML=`<div><span>state</span> ${esc(c.state)} &nbsp; <span>samples</span> ${c.n??0}`+
    (c.residual_mean_mm!=null?` &nbsp; <span>residual</span> mean ${c.residual_mean_mm} max ${c.residual_max_mm} mm`:'')+`</div>`+
    `<div><span>FK</span> ${fk} mm &nbsp; <span>z offset</span> ${c.z_offset_mm==null?'-':c.z_offset_mm.toFixed(1)} mm</div>`+
    `<div><span>target</span> ${esc(t.name||'-')} hsv ${esc(JSON.stringify(t.hsv_lo||[]))}..${esc(JSON.stringify(t.hsv_hi||[]))} &nbsp; <span>detected</span> ${c.det?c.det.map(x=>x.toFixed(0)).join(','):'no'}</div>`;
   if(c.message)$('calibmsg').textContent=c.message;
   if(c.state==='running'){ring=c.det||null;drawRing();}}
- else $('calib').innerHTML='<span class="na">not available in this mode</span>';
+ else $('calib').innerHTML='<span class="na">not available (connect a robot)</span>';
  $('call').textContent=s.last_call?JSON.stringify(s.last_call):'-';
  $('say').textContent=s.say?'"'+s.say+'"':'';
  li('rules',s.rules);li('voice',s.voice_queue);
 }catch(e){}}
+const fmt=v=>v==null?'-':(typeof v==='number'?v.toFixed(0):v);
+const grip=g=>g===undefined||g===null?'-':(g?'open':'closed');
 loadActions();setInterval(tick,500);tick();setInterval(loadActions,5000);
 </script></body></html>"""
 
@@ -166,9 +233,19 @@ class HUD:
             self._seq += 1
             self._cond.notify_all()
 
-    def register(self, name: str, fn: Callable[..., object], label: str | None = None, group: str = "run") -> None:
-        """Expose fn as POST /action/{name}; JSON body -> kwargs. label=None: no button on the page."""
-        self._actions[name] = {"name": name, "label": label, "group": group, "fn": fn}
+    def register(self, name: str, fn: Callable[..., object], label: str | None = None, group: str = "run",
+                 params: list[dict] | None = None) -> None:
+        """Expose fn as POST /action/{name}; JSON body -> kwargs. label=None: no button on the page.
+        params (auto-derived from fn's signature if omitted) tells the page which input fields to render:
+        [{"name": ..., "default": ...}]."""
+        if params is None:
+            try:
+                params = [{"name": q.name, "default": None if q.default is inspect.Parameter.empty else q.default}
+                          for q in inspect.signature(fn).parameters.values()
+                          if q.kind in (q.POSITIONAL_OR_KEYWORD, q.KEYWORD_ONLY)]
+            except (TypeError, ValueError):
+                params = []
+        self._actions[name] = {"name": name, "label": label, "group": group, "params": params, "fn": fn}
 
     def add_state_source(self, key: str, fn: Callable[[], dict]) -> None:
         """fn() is merged into GET /state under `key` at request time."""
@@ -206,7 +283,7 @@ class HUD:
         return JSONResponse(s)
 
     def _get_actions(self):
-        return JSONResponse([{k: a[k] for k in ("name", "label", "group")} for a in self._actions.values()])
+        return JSONResponse([{k: a[k] for k in ("name", "label", "group", "params")} for a in self._actions.values()])
 
     async def _post_action(self, name: str, request: Request):
         a = self._actions.get(name)

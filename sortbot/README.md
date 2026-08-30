@@ -34,7 +34,7 @@ each iteration into a persistent RULES list sent with every prompt.
 | `vlm.py` | vlm | prompt + tool schema, OpenAI call -> `Command` |
 | `voice.py` | voice | ElevenLabs/mic in, keyboard fallback, queue of corrections |
 | `hud.py` | hud | FastAPI status page + generic action registry (`register(name, fn, label, group)` -> `POST /action/{name}`) |
-| `main.py` | main | the loop |
+| `main.py` | main | server-first Session (modes, RUN/ROBOT actions, E-STOP) + the loop |
 
 ## Frames
 
@@ -46,22 +46,57 @@ each iteration into a persistent RULES list sent with every prompt.
 ## Running
 
 ```
+./run.sh -m sortbot.main                                     # SERVER-FIRST (default): HUD on :8765 with nothing connected;
+                                                             #   pick robot/cams/vlm from the header pills, then Start
 ./run.sh -m sortbot.config                                   # print config (selftest)
-./run.sh -m sortbot.main --mock                              # no hardware: MockRobot + synthetic blobs + MockVLM, HUD on :8765,
-                                                             #   type corrections on stdin ("put white things in wires", "stop")
+./run.sh -m sortbot.main --mock                              # shortcut: pre-selects robot=mock cams=sim vlm=mock and auto-starts
 ./run.sh -m sortbot.main --mock --live-vlm                   # same, but real OpenAI planning (needs OPENAI_API_KEY)
-./run.sh -m sortbot.main --mock --no-hud --no-voice --max-steps 12   # headless
+./run.sh -m sortbot.main --mock --no-hud --no-voice --max-steps 12   # headless (exits when the run finishes)
 ./run.sh -m sortbot.tests.test_e2e_mock                      # e2e mock test (HUD on a random port)
+./run.sh -m sortbot.tests.test_hud_actions                   # HTTP tests for every /action endpoint (mock, random port)
 ./run.sh -m sortbot.calibrate                                # hardware: teleoperated target calibration -> calib/calib.json (see below)
 ./run.sh -m sortbot.calibrate --mock                         # same flow with MockRobot + virtual leader (selftest, < 1 mm)
 ./run.sh -m sortbot.calibrate --mode aruco                   # legacy ArUco mat + Kabsch rigid transform
 ./run.sh -m sortbot.calibration --check-target green         # grab one overhead frame, detect the preset -> out/target_check.png
-./run.sh -m sortbot.main --real                              # SO101 + overhead/wrist cams + OpenAI (+ ElevenLabs mic if key set)
+./run.sh -m sortbot.main --real                              # shortcut: robot=real cams=real vlm=live, auto-start (+ mic if key set)
 ./run.sh -m sortbot.<module> --selftest                      # per-module smoke test
 ```
 
-`main` flags: `--max-steps N` (default 40), `--no-hud`, `--hud-port P`, `--no-voice`, `--rules-file PATH`
-(default `sortbot/calib/rules.json`, persistent across runs; delete it to forget rules), `--config PATH`.
+`main` flags: `--max-steps N` (default 40), `--no-hud` (headless, needs `--mock`/`--real`), `--hud-port P`,
+`--no-voice`, `--rules-file PATH` (default `sortbot/calib/rules.json`, persistent across runs; delete it to
+forget rules), `--config PATH`.
+
+## HUD (browser page, everything works without the terminal)
+
+Layout: header (mode pills + phase/step counter + red **E-STOP**), left column overhead (large) + wrist streams,
+right column status card and one tab per action group (run / robot / calibration / voice), rendered dynamically
+from `GET /actions` (button rows with input fields derived from each action's parameters). While no run is
+active a preview thread keeps the camera streams live.
+
+Modes (`set_mode`, header pills; devices are connected lazily and connect errors are reported in the response):
+
+* `robot`: `mock` (kinematic sim) | `real` (SO101 follower) | `off`
+* `cams`: `sim` (synthetic SimScene blobs) | `real` (overhead+wrist OpenCV, opened directly) | `off`
+* `vlm`: `mock` (deterministic) | `live` (OpenAI) | `off`
+
+Any combination works, e.g. **real cams + mock robot** to tune perception with no arm. Mode changes are refused
+while a run is active (Stop first).
+
+RUN group: `start` / `pause` / `resume` / `stop` / `step_once` (from idle: starts paused and runs exactly one
+step) / `set_max_steps(n)` / `set_task(text)` (free-text goal, e.g. "sort it however makes sense" -- prepended
+to the VLM prompt as `GOAL: ...`). Runs are restartable from the page without restarting the process (fresh
+SimScene per start in sim cams). `GET /state` carries `run: {mode, phase, step, max_steps, task, last_error,
+result, connected: {robot, cams, vlm}}`.
+
+ROBOT group (all through the normal safety envelope; refused while the loop is running -- pause first):
+`home`, `open_gripper`, `close_gripper`, `jog(axis: x|y|z|roll, delta)` (mm, or degrees for roll),
+`goto(x, y, z)`, `torque_on`, and `torque_off` = **E-STOP** (always visible in the header): real arm
+`bus.disable_torque()`, mock sets a flag; either way every motion raises/returns a torque error until
+`torque_on`, and the loop is paused. `GET /state` carries `robot: {ee_pose, joints_deg, gripper_open, holding,
+torque}`.
+
+VOICE group: `say_to_robot(text)` pushes a correction into the same queue as the microphone/stdin
+("put white things in wires", "stop", ...).
 
 Loop behaviour: every iteration starts with `home()`, so objects and drop points must be within `max_step_mm`
 of HOME (with the default config: x 160-300 mm, |y| <= 160 mm). Rejected/unsafe commands are returned to the VLM

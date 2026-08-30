@@ -1,11 +1,16 @@
-"""Main loop: home -> capture -> homography -> detect -> overlay -> HUD -> voice -> VLM -> validate -> execute.
+"""Server-first entry point: `python -m sortbot.main` starts the HUD immediately with NOTHING connected;
+robot / cameras / VLM are chosen from the page (RUN group: set_mode) and connected lazily. --mock / --real
+are shortcuts that pre-select a combo and auto-start the sorting loop.
 
---mock: MockRobot wrapped in SimScene (synthetic overhead frames with movable blobs), MockVLM, text voice.
---real: SO101Robot + OpenAI VLM + TableHomography (fitted H from calib.json and/or the ArUco mat, config calibration.mode).
-SafetyError / rejected commands are fed back to the VLM as the tool result, never raised.
-HUD calibration: "Start calibration" requests a teleoperated CalibSession (sortbot.calibrate); the loop pauses at
-its next step boundary, the leader arm drives the follower, Finish/Cancel resumes with the reloaded homography.
-In --mock a VirtualLeader scripts the whole session against SimScene's ground-truth H.
+Modes (any combination; "real cams + mock robot" tunes perception with no arm):
+  robot: mock (MockRobot kinematic sim) | real (SO101 follower) | off
+  cams:  sim (SimScene synthetic blobs) | real (overhead+wrist OpenCV) | off
+  vlm:   mock (deterministic) | live (OpenAI) | off
+
+The Loop is startable/pausable/stoppable from the page repeatedly without restarting the process (a fresh
+SimScene per start in sim cams). SafetyError / rejected commands are fed back to the VLM as the tool result,
+never raised. torque_off is the E-STOP: cuts motor torque (real: bus.disable_torque()) and pauses the loop.
+HUD calibration: "Start calibration" runs immediately when idle, else at the next step boundary (loop pauses).
 """
 from __future__ import annotations
 
@@ -82,6 +87,19 @@ class SimScene:
         return r
 
 
+class CamRig:
+    """Any robot + real cameras: capture() reads OpenCV cams, everything else is the robot."""
+
+    def __init__(self, robot: RobotAPI, cams):
+        self.robot, self.cams = robot, cams
+
+    def __getattr__(self, name):
+        return getattr(self.robot, name)
+
+    def capture(self, name: str) -> np.ndarray:
+        return self.cams.read(name)
+
+
 class Homography:
     """Uniform px->mm H source: fixed (mock) or TableHomography (real: fitted calib.json H and/or ArUco tags)."""
 
@@ -108,6 +126,34 @@ class Homography:
                 self.fixed = H
 
 
+class Control:
+    """Pause/resume/stop/single-step gate shared between the Loop thread and the HUD actions."""
+
+    def __init__(self):
+        self.stop_ev, self.pause_ev = threading.Event(), threading.Event()
+        self._steps, self._slock = 0, threading.Lock()
+        self.phase = "idle"  # idle|running|paused|done|stopped|error
+
+    def grant_steps(self, n: int = 1) -> None:
+        with self._slock:
+            self._steps += n
+
+    def gate(self) -> bool:
+        """Blocks while paused (unless a step token is granted); False = stop requested."""
+        while not self.stop_ev.is_set():
+            if not self.pause_ev.is_set():
+                self.phase = "running"
+                return True
+            with self._slock:
+                if self._steps > 0:
+                    self._steps -= 1
+                    self.phase = "running"
+                    return True
+            self.phase = "paused"
+            time.sleep(0.05)
+        return False
+
+
 def png(rgb: np.ndarray) -> bytes:
     ok, buf = cv2.imencode(".png", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
     assert ok
@@ -115,9 +161,14 @@ def png(rgb: np.ndarray) -> bytes:
 
 
 class Loop:
-    def __init__(self, cfg, robot, vlm, voice, hud, homography, rules: RulesStore, max_steps: int):
+    def __init__(self, cfg, robot, vlm, voice, hud, homography, rules: RulesStore, max_steps: int,
+                 task: str = "", ctl: Control | None = None, lock: threading.RLock | None = None,
+                 step_delay_s: float = 0.0):
         self.cfg, self.robot, self.vlm, self.voice, self.hud = cfg, robot, vlm, voice, hud
         self.homog, self.rules, self.max_steps = homography, rules, max_steps
+        self.task, self.ctl, self.lock = task, ctl, lock or threading.RLock()
+        self.step_delay_s = step_delay_s
+        self.step = 0
         self.history: list[dict] = []
         self.hints: list[str] = []
         self.holding: int | None = None
@@ -125,9 +176,10 @@ class Loop:
         self.filled: set[str] = set()
         self.placed = 0
         self.last_say = ""
-        self.calib = None  # CalibController (see attach_calibration)
+        self.calib = None  # CalibController (see attach_calibration / Session)
         self._calib_requested = threading.Event()
         self.last_overhead: np.ndarray | None = None
+        self.frame_sink = None  # optional callable(overhead) so the Session sees the latest raw frame
 
     # ---- voice ----
     def drain_voice(self) -> bool:
@@ -242,11 +294,7 @@ class Loop:
 
     def _calib_done(self, session) -> None:
         if session.state == "fitted":
-            self.homog.reload(self._calib_out)
-            if self._calib_out is None:  # real: the z offset may have changed too
-                r = getattr(self.robot, "robot", self.robot)
-                r.table_T_base = __import__("sortbot.robot", fromlist=["x"]).load_calib(self.cfg.calib_file)
-                r.base_T_table = np.linalg.inv(r.table_T_base)
+            self.homog.reload(getattr(self, "_calib_out", None))
         log.info("calibration %s: %s", session.state, session.message)
 
     def _maybe_calibrate(self) -> None:
@@ -262,16 +310,23 @@ class Loop:
     def run(self) -> str:
         from sortbot.robot import SafetyError
 
-        for step in range(1, self.max_steps + 1):
+        while self.step < self.max_steps:
+            if self.ctl is not None and not self.ctl.gate():
+                return "stopped"
+            self.step += 1
+            step = self.step
             t0 = time.time()
             self._maybe_calibrate()
-            hr = self.robot.home()
+            with self.lock:
+                hr = self.robot.home()
             if not hr.ok:  # routine homing is not worth a history slot; failures are
                 self.record("home", {}, hr)
             if not self.drain_voice():  # before capture so voice actions cannot stale the frame
                 return "stopped by voice"
             overhead, wrist = self.robot.capture("overhead"), self.robot.capture("wrist")
             self.last_overhead = overhead
+            if self.frame_sink:
+                self.frame_sink(overhead)
             H = self.homog.update(overhead)
             if H is None:
                 log.warning("no homography (no calib.json H and ArUco tags not visible); run calibration")
@@ -279,7 +334,7 @@ class Loop:
                 time.sleep(0.5)
                 continue
             objects = perception.detect_objects(overhead, H, self.cfg, filled_zones=sorted(self.filled), method=self.homog.method)
-            rules = self.rules.list() + self.hints
+            rules = ([f"GOAL: {self.task}"] if self.task else []) + self.rules.list() + self.hints
             if self.holding_obj is not None:
                 o = self.holding_obj
                 rules = rules + [f"holding: the {o.color_hint} object picked from ({o.centroid_mm[0]:.0f},{o.centroid_mm[1]:.0f}); object ids below are renumbered"]
@@ -297,7 +352,8 @@ class Loop:
                 self.record(cmd.tool, cmd.args, ExecResult(False, f"rejected: {err}"))
                 continue
             try:
-                res = self.execute(cmd, world)
+                with self.lock:
+                    res = self.execute(cmd, world)
             except SafetyError as e:
                 res = ExecResult(False, f"safety: {e}")
             args = dict(cmd.args)
@@ -308,6 +364,8 @@ class Loop:
             self.hud_update(overlay, wrist, step, t0, f"{cmd.tool} -> {res.message}")
             if cmd.tool == "done":
                 return f"done: {res.message}"
+            if self.step_delay_s:
+                time.sleep(self.step_delay_s)
         return f"max_steps {self.max_steps} reached"
 
     def hud_update(self, overlay, wrist, step, t0, status) -> None:
@@ -319,70 +377,470 @@ class Loop:
             say=self.last_say, rules=self.rules.list() + self.hints, latency_ms=int((time.time() - t0) * 1000)))
 
 
-def build(args) -> Loop:
+class Session:
+    """Owns the devices (robot / cams / vlm), one Loop thread at a time, and the RUN + ROBOT HUD actions.
+    Everything is reachable over POST /action/*; nothing requires the terminal."""
+
+    ROBOT_MODES, CAM_MODES, VLM_MODES = ("mock", "real", "off"), ("sim", "real", "off"), ("mock", "live", "off")
+    JOG_AXES = ("x", "y", "z", "roll")
+
+    def __init__(self, cfg: cfgmod.Config, hud, voice: VoiceIO, rules: RulesStore,
+                 max_steps: int = 40, step_delay_s: float = 0.25):
+        self.cfg, self.hud, self.voice, self.rules = cfg, hud, voice, rules
+        self.mode: dict[str, str | None] = {"robot": None, "cams": None, "vlm": None}
+        self.robot = None          # MockRobot | SO101Robot
+        self.cams = None           # robot_mod.Cameras (real cams only)
+        self.vlm = None            # MockVLM | VLM
+        self.rig = None            # SimScene | CamRig (what the Loop drives)
+        self.homog_real: Homography | None = None  # persistent TableHomography for real cams
+        self.loop: Loop | None = None
+        self.ctl: Control | None = None
+        self.thread: threading.Thread | None = None
+        self.max_steps, self.task = max_steps, ""
+        self.step_delay_s = step_delay_s
+        self.last_error, self.result = "", ""
+        self.robot_lock = threading.RLock()
+        self._robot_cache: dict = {}
+        self.calib, self._calib_out = None, None
+        self.last_overhead: np.ndarray | None = None
+        self._shutdown = threading.Event()
+        self._register()
+        threading.Thread(target=self._preview_loop, daemon=True, name="preview").start()
+
+    # ------------------------------------------------ registration
+    def _register(self) -> None:
+        if self.hud is None:
+            return
+        h = self.hud
+        h.register("set_mode", self.set_mode, None, "run")  # header pills; no generic button
+        h.register("start", self.start, "Start", "run")
+        h.register("pause", self.pause, "Pause", "run")
+        h.register("resume", self.resume, "Resume", "run")
+        h.register("stop", self.stop, "Stop", "run")
+        h.register("step_once", self.step_once, "Step once", "run")
+        h.register("set_max_steps", self.set_max_steps, "Set max steps", "run")
+        h.register("set_task", self.set_task, "Set task", "run")
+        h.register("home", lambda: self._robot_act(lambda r: r.home()), "Home", "robot", params=[])
+        h.register("open_gripper", lambda: self._robot_act(lambda r: r.open_gripper()), "Open gripper", "robot", params=[])
+        h.register("close_gripper", lambda: self._robot_act(lambda r: r.close_gripper()), "Close gripper", "robot", params=[])
+        h.register("jog", self.jog, "Jog", "robot")
+        h.register("goto", self.goto, "Go to", "robot")
+        h.register("torque_off", self.torque_off, "E-STOP (torque off)", "robot", params=[])
+        h.register("torque_on", self.torque_on, "Torque on", "robot", params=[])
+        h.register("say_to_robot", self.say_to_robot, "Send correction", "voice")
+        h.add_state_source("run", self._run_state)
+        h.add_state_source("robot", self._robot_state)
+        self._register_calib_placeholders()
+
+    def _register_calib_placeholders(self) -> None:
+        if self.hud is None:
+            return
+        no = lambda **kw: {"ok": False, "message": "no robot connected; pick one in the header first", "data": None}  # noqa: E731
+        for name, label in (("calib_start", "Start calibration"), ("calib_touch", "Touch table"),
+                            ("calib_capture", "Capture"), ("calib_undo", "Undo"),
+                            ("calib_finish", "Finish"), ("calib_cancel", "Cancel"), ("calib_sample", None)):
+            self.hud.register(name, no, label, "calibration", params=[])
+        self.hud.add_state_source("calibration", lambda: {"state": "idle", "n": 0, "message": "connect a robot first"})
+
+    # ------------------------------------------------ mode / devices
+    def _running(self) -> bool:
+        return self.thread is not None and self.thread.is_alive()
+
+    def set_mode(self, robot: str | None = None, cams: str | None = None, vlm: str | None = None) -> dict:
+        """Lazily (dis)connect devices; errors are reported in the response, never raised."""
+        if self._running():
+            return {"ok": False, "message": "stop the run before changing mode", "data": None}
+        errs, done = [], []
+        for key, val, allowed, fn in (("robot", robot, self.ROBOT_MODES, self._set_robot),
+                                      ("cams", cams, self.CAM_MODES, self._set_cams),
+                                      ("vlm", vlm, self.VLM_MODES, self._set_vlm)):
+            if val is None:
+                continue
+            val = str(val).lower()
+            if val not in allowed:
+                errs.append(f"{key}={val!r} (allowed: {'|'.join(allowed)})")
+                continue
+            try:
+                fn(val)
+                done.append(f"{key}={val}")
+            except Exception as e:  # noqa: BLE001
+                self.mode[key] = None
+                errs.append(f"{key}={val}: {e}")
+        self._refresh_rig()
+        if errs:
+            self.last_error = "; ".join(errs)
+        msg = "; ".join(done + [f"ERROR {e}" for e in errs]) or "nothing changed"
+        return {"ok": not errs, "message": msg, "data": {"mode": self.mode, "connected": self._connected()}}
+
+    def _set_robot(self, v: str) -> None:
+        if v == self.mode["robot"]:
+            return
+        if self.robot is not None and hasattr(self.robot, "disconnect"):
+            try:
+                self.robot.disconnect()
+            except Exception as e:  # noqa: BLE001
+                log.warning("robot disconnect: %s", e)
+        self.robot, self.calib, self.mode["robot"] = None, None, None
+        self._register_calib_placeholders()
+        if v == "off":
+            return
+        from sortbot.robot import MockRobot, SO101Robot
+        self.robot = MockRobot(self.cfg, realtime=False) if v == "mock" else SO101Robot(self.cfg, with_cameras=False)
+        self.mode["robot"] = v
+        self._attach_calib()
+
+    def _set_cams(self, v: str) -> None:
+        if v == self.mode["cams"]:
+            return
+        if self.cams is not None:
+            self.cams.disconnect()
+            self.cams = None
+        self.mode["cams"] = None
+        if v == "off":
+            return
+        if v == "real":
+            from sortbot.robot import Cameras
+            self.cams = Cameras(self.cfg)
+        self.mode["cams"] = v
+
+    def _set_vlm(self, v: str) -> None:
+        self.vlm, self.mode["vlm"] = None, None
+        if v == "off":
+            return
+        self.vlm = MockVLM() if v == "mock" else VLM()
+        self.mode["vlm"] = v
+
+    def _refresh_rig(self) -> None:
+        """Rig used for idle previews and as the template for the next start."""
+        if self.mode["cams"] == "real" and self.cams is not None and self.robot is not None:
+            self.rig = CamRig(self.robot, self.cams)
+        elif self.mode["cams"] == "sim" and self.robot is not None:
+            if not isinstance(self.rig, SimScene) or self.rig.robot is not self.robot:
+                self.rig = SimScene(self.robot, self.cfg)
+        else:
+            self.rig = None
+
+    def _connected(self) -> dict:
+        return {"robot": self.robot is not None,
+                "cams": self.mode["cams"] == "sim" or self.cams is not None,
+                "vlm": self.vlm is not None}
+
+    # ------------------------------------------------ calibration
+    def _attach_calib(self) -> None:
+        from sortbot import calibrate as cal
+
+        target = cal.ColorTarget.parse(self.cfg.calib_target)
+        if self.mode["robot"] == "mock":
+            self._calib_out = Path(tempfile.mkdtemp()) / "calib_mock.json"
+            w, h = self.cfg.overhead_cam.width, self.cfg.overhead_cam.height
+            H_sim = perception.synth_homography(self.cfg, w, h)
+            pair = []
+
+            def make():
+                if not pair:  # dark-mat background: the scene's own green blob must not distract the detector
+                    pair.extend(cal.mock_rig(self.cfg, self.robot, np.linalg.inv(H_sim), None, target))
+                return pair
+
+            self.calib = cal.CalibController(self.cfg, lambda: make()[0], lambda: make()[1], target, self._calib_out,
+                                             self._calib_done, lambda: self.last_overhead,
+                                             driver=lambda ld, c: ld.drive(c, dwell_s=0.2))
+        else:
+            self._calib_out = None
+            rig = cal.RobotRig(self.robot, lambda: self._grab_frame("overhead"))
+            self.calib = cal.CalibController(self.cfg, lambda: rig, lambda: cal.open_leader(self.cfg), target,
+                                             self.cfg.calib_file, self._calib_done, lambda: self.last_overhead)
+        if self.hud is not None:
+            self.calib.register(self.hud)
+            self.hud.register("calib_start", self._calib_start, "Start calibration", "calibration", params=[])
+
+    def _calib_start(self) -> dict:
+        if self.calib is None:
+            return {"ok": False, "message": "no robot connected", "data": None}
+        if self._running() and self.ctl is not None and not self.ctl.pause_ev.is_set():
+            if self.calib.active or (self.loop and self.loop._calib_requested.is_set()):
+                return {"ok": False, "message": "calibration already running/requested", "data": None}
+            self.loop._calib_requested.set()
+            return {"ok": True, "message": "calibration will start at the next step boundary (loop pauses)", "data": None}
+        return self.calib.start()
+
+    def _calib_done(self, session) -> None:
+        if session.state == "fitted":
+            if self.mode["robot"] == "mock":
+                if self.loop is not None and self.loop.homog.fixed is not None:
+                    self.loop.homog.reload(self._calib_out)
+            else:  # real: the z offset may have changed too
+                import sortbot.robot as robot_mod
+                self.robot.table_T_base = robot_mod.load_calib(self.cfg.calib_file)
+                self.robot.base_T_table = np.linalg.inv(self.robot.table_T_base)
+                if self.homog_real is not None:
+                    self.homog_real.reload()
+        log.info("calibration %s: %s", session.state, session.message)
+
+    def _grab_frame(self, name: str) -> np.ndarray:
+        if self.cams is not None:
+            return self.cams.read(name)
+        if self.rig is not None:
+            return self.rig.capture(name)
+        raise RuntimeError("no cameras connected (set_mode cams)")
+
+    # ------------------------------------------------ RUN actions
+    def start(self, paused: bool = False) -> dict:
+        if self._running():
+            return {"ok": False, "message": "already running; stop first", "data": None}
+        missing = [k for k, ok in self._connected().items() if not ok]
+        if missing:
+            return {"ok": False, "message": f"not connected: {', '.join(missing)} -- pick modes in the header (set_mode)", "data": None}
+        if self.mode["cams"] == "sim":
+            self.rig = SimScene(self.robot, self.cfg)  # fresh scene per start
+            homog = Homography(self.cfg, self.rig.H)
+        else:
+            self.rig = CamRig(self.robot, self.cams)
+            if self.homog_real is None:
+                self.homog_real = Homography(self.cfg)
+            homog = self.homog_real
+        self.ctl = Control()
+        if paused:
+            self.ctl.pause_ev.set()
+        delay = self.step_delay_s if self.mode["robot"] == "mock" else 0.0
+        self.loop = Loop(self.cfg, self.rig, self.vlm, self.voice, self.hud, homog, self.rules,
+                         self.max_steps, task=self.task, ctl=self.ctl, lock=self.robot_lock, step_delay_s=delay)
+        self.loop.calib, self.loop._calib_out = self.calib, self._calib_out
+        self.loop.frame_sink = lambda f: setattr(self, "last_overhead", f)
+        self.result = ""
+        self.thread = threading.Thread(target=self._run_loop, daemon=True, name="sortbot-loop")
+        self.thread.start()
+        return {"ok": True, "message": "run started" + (" (paused)" if paused else ""), "data": None}
+
+    def _run_loop(self) -> None:
+        try:
+            self.result = self.loop.run()
+            self.ctl.phase = "stopped" if self.ctl.stop_ev.is_set() else "done"
+        except Exception as e:  # noqa: BLE001
+            log.exception("loop crashed")
+            self.last_error = str(e)
+            self.result = f"error: {e}"
+            self.ctl.phase = "error"
+        log.info("finished: %s (placed %d)", self.result, self.loop.placed)
+
+    def pause(self) -> dict:
+        if not self._running():
+            return {"ok": False, "message": "not running", "data": None}
+        self.ctl.pause_ev.set()
+        return {"ok": True, "message": "pausing (current step finishes first)", "data": None}
+
+    def resume(self) -> dict:
+        if not self._running():
+            return {"ok": False, "message": "not running (use start)", "data": None}
+        if self.robot is not None and not getattr(self.robot, "torque", True):
+            return {"ok": False, "message": "torque is off (E-STOP); press torque_on first", "data": None}
+        self.ctl.pause_ev.clear()
+        return {"ok": True, "message": "resumed", "data": None}
+
+    def stop(self) -> dict:
+        if not self._running():
+            return {"ok": False, "message": "not running", "data": None}
+        self.ctl.stop_ev.set()
+        return {"ok": True, "message": "stop requested (takes effect at the step boundary)", "data": None}
+
+    def step_once(self) -> dict:
+        if self._running():
+            if not self.ctl.pause_ev.is_set():
+                return {"ok": False, "message": "already running; pause first to single-step", "data": None}
+            self.ctl.grant_steps(1)
+            return {"ok": True, "message": "stepping once", "data": None}
+        r = self.start(paused=True)
+        if not r["ok"]:
+            return r
+        self.ctl.grant_steps(1)
+        return {"ok": True, "message": "started paused; stepping once", "data": None}
+
+    def set_max_steps(self, n: int) -> dict:
+        n = int(n)
+        if n < 1:
+            return {"ok": False, "message": "n must be >= 1", "data": None}
+        self.max_steps = n
+        if self.loop is not None:
+            self.loop.max_steps = n
+        return {"ok": True, "message": f"max_steps = {n}", "data": None}
+
+    def set_task(self, text: str = "") -> dict:
+        self.task = str(text).strip()
+        if self.loop is not None:
+            self.loop.task = self.task
+        return {"ok": True, "message": f"task: {self.task or '(default: sort sensibly)'}", "data": None}
+
+    def say_to_robot(self, text: str) -> dict:
+        self.voice.push(str(text))
+        return {"ok": True, "message": f"queued: {text}", "data": None}
+
+    # ------------------------------------------------ ROBOT actions
+    def _robot_act(self, fn, allow_while_running: bool = False) -> dict:
+        if self.robot is None:
+            return {"ok": False, "message": "no robot connected (set_mode robot=mock|real)", "data": None}
+        if not allow_while_running and self._running() and not self.ctl.pause_ev.is_set():
+            return {"ok": False, "message": "loop is running; pause or stop first", "data": None}
+        if not self.robot_lock.acquire(timeout=2.0):
+            return {"ok": False, "message": "robot busy (finishing a motion); retry", "data": None}
+        try:
+            r = fn(self.robot)
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "message": str(e), "data": None}
+        finally:
+            self.robot_lock.release()
+        return {"ok": r.ok, "message": r.message, "data": None}
+
+    def jog(self, axis: str, delta: float = 10.0) -> dict:
+        """delta: mm for x|y|z, degrees for roll. Goes through the normal safety envelope."""
+        axis = str(axis).lower()
+        if axis not in self.JOG_AXES:
+            return {"ok": False, "message": f"axis must be one of {'|'.join(self.JOG_AXES)}", "data": None}
+        d = float(delta)
+
+        def do(r):
+            p = r.get_ee_pose()
+            if axis == "roll":
+                return r.turn_to(p.roll_deg + d)
+            x, y, z = p.x + d * (axis == "x"), p.y + d * (axis == "y"), p.z + d * (axis == "z")
+            return r.move_to(x, y, z)
+
+        return self._robot_act(do)
+
+    def goto(self, x: float, y: float, z: float) -> dict:
+        return self._robot_act(lambda r: r.move_to(float(x), float(y), float(z)))
+
+    def torque_off(self) -> dict:
+        """E-STOP: flag first (any in-flight motion aborts within one tick), pause the loop, then cut bus torque."""
+        if self.robot is None:
+            return {"ok": False, "message": "no robot connected", "data": None}
+        self.robot.torque = False
+        if self.ctl is not None:
+            self.ctl.pause_ev.set()
+        got = self.robot_lock.acquire(timeout=1.0)
+        try:
+            self.robot._set_torque(False)
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "message": f"torque off (flag set) but bus call failed: {e}", "data": None}
+        finally:
+            if got:
+                self.robot_lock.release()
+        return {"ok": True, "message": "TORQUE OFF (E-STOP); loop paused", "data": None}
+
+    def torque_on(self) -> dict:
+        return self._robot_act(lambda r: r.torque_on())
+
+    # ------------------------------------------------ state
+    def _run_state(self) -> dict:
+        return {"mode": dict(self.mode),
+                "phase": self.ctl.phase if self.ctl is not None else "idle",
+                "step": self.loop.step if self.loop is not None else 0,
+                "max_steps": self.loop.max_steps if self.loop is not None else self.max_steps,
+                "task": self.task, "last_error": self.last_error, "result": self.result,
+                "connected": self._connected()}
+
+    def _robot_state(self) -> dict | None:
+        r = self.robot
+        if r is None:
+            return None
+        if self.robot_lock.acquire(timeout=0.2):
+            try:
+                p = r.get_ee_pose()
+                self._robot_cache = {"ee_pose": {"x": round(p.x, 1), "y": round(p.y, 1), "z": round(p.z, 1),
+                                                "roll_deg": round(p.roll_deg, 1)},
+                                     "joints_deg": [round(float(v), 1) for v in r.get_joints_deg()]}
+            except Exception as e:  # noqa: BLE001
+                self._robot_cache.setdefault("ee_pose", None)
+                self._robot_cache["error"] = str(e)
+            finally:
+                self.robot_lock.release()
+        return {**self._robot_cache, "gripper_open": r.gripper_open, "torque": bool(getattr(r, "torque", True)),
+                "holding": self.loop.holding if self.loop is not None else None}
+
+    # ------------------------------------------------ idle preview + teardown
+    def _preview_loop(self) -> None:
+        """Streams camera frames to the HUD while the loop is not running (so mode/cam checks need no terminal)."""
+        while not self._shutdown.is_set():
+            try:
+                busy = (self.ctl is not None and self.ctl.phase == "running") or (self.calib is not None and self.calib.active)
+                if self.hud is not None and not busy and self.rig is not None:
+                    ov, wr = self.rig.capture("overhead"), self.rig.capture("wrist")
+                    self.last_overhead = ov
+                    self.hud.update(ov, wr, {})
+            except Exception as e:  # noqa: BLE001
+                log.debug("preview: %s", e)
+            time.sleep(0.4)
+
+    def shutdown(self) -> None:
+        self._shutdown.set()
+        if self.ctl is not None:
+            self.ctl.stop_ev.set()
+        if self.thread is not None:
+            self.thread.join(timeout=10)
+        for dev in (self.cams, self.robot):
+            if dev is not None and hasattr(dev, "disconnect"):
+                try:
+                    dev.disconnect()
+                except Exception:  # noqa: BLE001
+                    pass
+
+
+def serve(args) -> Session:
+    """Build the HUD + Session (used by main() and the HTTP tests)."""
     cfg = cfgmod.load(args.config) if args.config else cfgmod.load()
-    if args.mock:
-        from sortbot.robot import MockRobot
-        scene = SimScene(MockRobot(cfg, realtime=False), cfg)
-        robot, vlm, homog = scene, (VLM() if args.live_vlm else MockVLM()), Homography(cfg, scene.H)
-    else:
-        from sortbot.robot import SO101Robot
-        robot, vlm, homog = SO101Robot(cfg), VLM(), Homography(cfg)
-    voice = VoiceIO(cfg.elevenlabs_voice_id, stdin=io.StringIO("") if args.no_voice else None, force_text=args.mock or args.no_voice)
-    voice.start()
     hud = None
     if not args.no_hud:
         from sortbot.hud import HUD
         hud = HUD(port=args.hud_port or cfg.hud_port)
         hud.start()
+    voice = VoiceIO(cfg.elevenlabs_voice_id, stdin=io.StringIO("") if (args.no_voice or args.mock) else None,
+                    force_text=not args.real)
+    voice.start()
     rules = RulesStore(args.rules_file) if args.rules_file else RulesStore()
-    loop = Loop(cfg, robot, vlm, voice, hud, homog, rules, args.max_steps)
-    loop.attach_calibration(*make_calibration(cfg, robot, loop, mock=args.mock))
-    return loop
-
-
-def make_calibration(cfg, robot, loop: Loop, mock: bool):
-    """(CalibController, mock_out). mock: FakeRig renders the target at SimScene's ground-truth projection and a
-    VirtualLeader scripts the captures, writing to a temp file so the real calib.json is never touched."""
-    from sortbot import calibrate as cal
-
-    target = cal.ColorTarget.parse(cfg.calib_target)
-    if mock:
-        out = Path(tempfile.mkdtemp()) / "calib_mock.json"
-        rig, leader = cal.mock_rig(cfg, robot.robot, np.linalg.inv(robot.H), lambda: robot.capture("overhead"), target)
-        ctrl = cal.CalibController(cfg, lambda: rig, lambda: leader, target, out, loop._calib_done,
-                                   lambda: loop.last_overhead, driver=lambda ld, c: ld.drive(c, dwell_s=0.4))
-        return ctrl, out
-    rig = cal.RobotRig(robot)
-    return cal.CalibController(cfg, lambda: rig, lambda: cal.open_leader(cfg), target, cfg.calib_file,
-                               loop._calib_done, lambda: loop.last_overhead), None
+    return Session(cfg, hud, voice, rules, max_steps=args.max_steps)
 
 
 def main(argv=None) -> str:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    g = ap.add_mutually_exclusive_group(required=True)
-    g.add_argument("--mock", action="store_true", help="mock robot/VLM/frames, text voice")
-    g.add_argument("--real", action="store_true", help="SO101 + cameras + OpenAI")
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument("--mock", action="store_true", help="shortcut: robot=mock cams=sim vlm=mock (or live with --live-vlm), auto-start")
+    g.add_argument("--real", action="store_true", help="shortcut: robot=real cams=real vlm=live, auto-start")
     ap.add_argument("--max-steps", type=int, default=40)
-    ap.add_argument("--no-hud", action="store_true")
+    ap.add_argument("--no-hud", action="store_true", help="headless (requires --mock/--real); exits when the run finishes")
     ap.add_argument("--no-voice", action="store_true", help="do not read stdin for corrections")
     ap.add_argument("--hud-port", type=int, default=0)
     ap.add_argument("--live-vlm", action="store_true", help="with --mock: use the real OpenAI VLM")
     ap.add_argument("--rules-file", default=None)
     ap.add_argument("--config", default=None)
     args = ap.parse_args(argv)
+    if args.no_hud and not (args.mock or args.real):
+        ap.error("--no-hud requires --mock or --real (nothing else could start the run)")
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
-    loop = build(args)
+    session = serve(args)
+    result = ""
     try:
-        result = loop.run()
+        if args.mock or args.real:
+            combo = (dict(robot="mock", cams="sim", vlm="live" if args.live_vlm else "mock") if args.mock
+                     else dict(robot="real", cams="real", vlm="live"))
+            r = session.set_mode(**combo)
+            if not r["ok"]:
+                log.error("set_mode: %s", r["message"])
+            else:
+                log.info("start: %s", session.start()["message"])
+        if args.no_hud:
+            if session.thread is not None:
+                session.thread.join()
+            result = session.result
+        else:
+            while True:  # server-first: keep serving; everything else happens from the page
+                time.sleep(1)
+    except KeyboardInterrupt:
+        pass
     finally:
-        loop.voice.stop()
-        if loop.hud:
-            loop.hud.stop()
-        if hasattr(loop.robot, "disconnect"):
-            loop.robot.disconnect()
-    log.info("finished: %s (placed %d)", result, loop.placed)
-    return result
+        session.shutdown()
+        session.voice.stop()
+        if session.hud is not None:
+            session.hud.stop()
+    log.info("finished: %s", result or session.result)
+    return result or session.result
 
 
 if __name__ == "__main__":

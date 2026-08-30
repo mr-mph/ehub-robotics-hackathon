@@ -362,6 +362,13 @@ def test_hud_actions() -> None:
         assert any(e["thumb_b64"] and e["thumb_b64"].startswith("/9j/") for e in lg), "thumb is not a jpeg"
         assert any(e["tool"] == "torque_off" and e["ok"] is False for e in lg), "E-STOP not logged as red"
         assert any(e["tool"] == "place_at" and e["ok"] for e in lg), tools
+        # the claw never closes unchecked: every successful pick logged its both-cameras alignment verdict
+        checks = [e for e in lg if e["tool"] == "verify_grasp"]
+        assert checks and all(e["ok"] for e in checks), checks[:2]
+        done_picks = [e for e in picks if e["ok"]]  # a rejected pick_at never got as far as descending
+        assert len(checks) >= len(done_picks), (len(checks), len(done_picks))
+        assert any(e["thumb_b64"] for e in checks), "no both-cameras verification image in the log"
+        assert all("aligned" in e["result"] for e in checks), checks[:2]
         assert post("log_clear")["ok"]
         assert get("/log") == []
 

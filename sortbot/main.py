@@ -570,18 +570,22 @@ class Loop:
             if err and t != "move_to":  # xy targets must lie where the camera calibration is trustworthy
                 return err
             if t == "move_to":
+                from sortbot.robot import grasp_z_mm
+                zlo = min(lo[2], grasp_z_mm(self.cfg))  # workspace.z_trim_mm can lower the floor below the AABB
                 z = m.get("z")
-                if z is None or not (lo[2] <= z <= hi[2]):
-                    return f"z must be within [{lo[2] / 10:g}, {hi[2] / 10:g}] cm"
+                if z is None or not (zlo <= z <= hi[2]):
+                    return f"z must be within [{zlo / 10:g}, {hi[2] / 10:g}] cm"
         return None
 
     def execute(self, cmd: Command, world: WorldState) -> ExecResult:
         a, t, r = _mm_args(cmd.args), cmd.tool, self.robot  # mm from here down (see the UNIT BOUNDARY)
         if t == "pick_at":
-            res = r.pick(a["x"], a["y"])
+            res = self.pick_verified(a["x"], a["y"])
             if res.ok:
                 self.holding = f"object picked at ({a['x'] / 10:g}, {a['y'] / 10:g}) cm"
-                return ExecResult(True, self.holding.replace("object picked", "picked the object"))
+                # the alignment verdict rides along so the planner (and the log) see WHY this was allowed
+                note = f" -- {res.message}" if res.message and res.message != "pick" else ""
+                return ExecResult(True, self.holding.replace("object picked", "picked the object") + note)
             return res
         if t == "place_at":
             res = r.place_at(a["x"], a["y"])
@@ -599,6 +603,12 @@ class Loop:
             self.holding = None
             return res
         if t == "close":
+            # the claw NEVER closes on an object unseen: even the low-level recovery tool is checked
+            # against BOTH cameras first (see pick_verified / verify_alignment)
+            p = self._pose_cache or self._read_pose()
+            ok, msg, _, _ = self.verify_alignment(p.x, p.y, p.z, what="close")
+            if not ok:
+                return ExecResult(False, msg)
             return r.close_gripper()
         if t == "turn_to":
             return r.turn_to(float(a["deg"]))
@@ -607,6 +617,139 @@ class Loop:
             self.voice.speak(self.last_say)
             return ExecResult(True, "said")
         return ExecResult(True, str(a.get("summary", "")))
+
+    # ---- pre-grasp verification (BOTH cameras, every close) ----
+    def _grasp_frames(self, x_mm: float, y_mm: float) -> tuple[np.ndarray, np.ndarray]:
+        """Fresh overhead + wrist through the CAMERAS (CamRig.capture -> the Cameras object, never the
+        motor bus), with the overhead annotated exactly like the planner sees it plus a marker on the
+        target so the checker knows which object is meant."""
+        ov, wr = self.robot.capture("overhead"), self.robot.capture("wrist")
+        if self._H is not None:
+            try:
+                ov = perception.render_overlay(ov, self._H, self._pose_cache, self.rules.list(),
+                                               calib_region_px=self.homog.region_px,
+                                               calib_samples_px=self.homog.samples_px)
+                u, v = perception.mm_to_px(self._H, [(x_mm, y_mm)])[0]
+                u, v = int(round(float(u))), int(round(float(v)))
+                cv2.drawMarker(ov, (u, v), (255, 80, 255), cv2.MARKER_CROSS, 26, 2)
+                cv2.circle(ov, (u, v), 16, (255, 80, 255), 2)
+            except Exception as e:  # noqa: BLE001 - a missing annotation must not block the check
+                log.debug("verify annotation: %s", e)
+        return ov, wr
+
+    @staticmethod
+    def _verify_thumb(ov: np.ndarray, wr: np.ndarray) -> np.ndarray | None:
+        """Side-by-side overhead|wrist for the decision log, so the human can see WHY a grasp was refused."""
+        try:
+            h = 200
+            a = cv2.resize(ov, (max(1, round(ov.shape[1] * h / ov.shape[0])), h), interpolation=cv2.INTER_AREA)
+            b = cv2.resize(wr, (max(1, round(wr.shape[1] * h / wr.shape[0])), h), interpolation=cv2.INTER_AREA)
+            return np.hstack([a, b])
+        except Exception as e:  # noqa: BLE001
+            log.debug("verify thumb: %s", e)
+            return None
+
+    def verify_alignment(self, x_mm: float, y_mm: float, z_mm: float, what: str = "pick"):
+        """HARD REQUIREMENT: the gripper never closes without checking the overhead AND wrist views first.
+
+        With the jaws open at grasp height over (x, y), take BOTH camera views and make ONE structured VLM
+        call (the fast verify model) -> {aligned, dx_cm, dy_cm, reason, confidence}. Not aligned ->
+        a BOUNDED correction (clamped to grasp.max_correction_cm, through the normal safety envelope) and
+        re-check, up to grasp.max_retries times. Still not aligned -> DO NOT CLOSE.
+
+        Returns (aligned, message, x_mm, y_mm) with the final xy; the message is what the planner sees.
+        Caller must already hold the bus lock (this runs inside Loop.execute's locked section)."""
+        cfg = self.cfg
+        x, y = float(x_mm), float(y_mm)
+        import sortbot.robot as _rb
+        if _rb.large_trim(cfg):
+            log.warning("grasp depth trim is %+.1f mm (grasp height %.1f mm) -- that is a LARGE trim; "
+                        "check the arm clears the table before running",
+                        _rb.z_trim_mm(cfg), _rb.grasp_z_mm(cfg))
+        if not cfg.grasp_verify:
+            self.last_verdict = {"aligned": None, "reason": "grasp.verify is OFF in config.yaml",
+                                 "confidence": None, "tries": 0, "t": round(time.time(), 2),
+                                 "x_cm": round(x / 10, 1), "y_cm": round(y / 10, 1), "what": what}
+            return True, "alignment check DISABLED (grasp.verify=false)", x, y
+        tries = max(1, int(cfg.grasp_max_retries) + 1)
+        lo, hi = cfg.aabb_min_mm, cfg.aabb_max_mm
+        last = "no verdict"
+        for i in range(1, tries + 1):
+            ov, wr = self._grasp_frames(x, y)
+            try:
+                v = self.vlm.verify_grasp(small_jpeg(ov), small_jpeg(wr), x / 10.0, y / 10.0, attempt=i)
+            except Exception as e:  # noqa: BLE001 - a failed check is "not verified", never "go ahead"
+                log.error("grasp check failed: %s", e)
+                v = {"aligned": False, "dx_cm": 0.0, "dy_cm": 0.0, "confidence": 0.0,
+                     "reason": f"alignment check errored ({e})"}
+            conf, reason = float(v.get("confidence", 0.0)), str(v.get("reason", ""))
+            good = bool(v.get("aligned")) and conf >= cfg.grasp_min_confidence
+            verdict = {"aligned": bool(v.get("aligned")), "confidence": round(conf, 2),
+                       "dx_cm": round(float(v.get("dx_cm", 0.0)), 2), "dy_cm": round(float(v.get("dy_cm", 0.0)), 2),
+                       "reason": reason, "try": i, "tries": tries, "accepted": good, "what": what,
+                       "x_cm": round(x / 10, 1), "y_cm": round(y / 10, 1), "t": round(time.time(), 2),
+                       "latency_ms": getattr(self.vlm, "last_verify_latency_ms", None)}
+            self.last_verdict = verdict
+            if self.dlog is not None:
+                self.dlog.add("verify_grasp", {"x_cm": verdict["x_cm"], "y_cm": verdict["y_cm"], "try": i},
+                              ("aligned" if good else "NOT aligned") +
+                              f" (confidence {conf:.2f}, dx {verdict['dx_cm']:+g} dy {verdict['dy_cm']:+g} cm): {reason}",
+                              ok=good, step=self.step, latency_ms=verdict["latency_ms"],
+                              frame=self._verify_thumb(ov, wr))
+            if good:
+                return True, f"alignment confirmed on check {i}/{tries} (confidence {conf:.2f}): {reason}", x, y
+            last = (f"{reason or 'not aligned'} (confidence {conf:.2f}"
+                    + (", low" if bool(v.get("aligned")) and conf < cfg.grasp_min_confidence else "") + ")")
+            if i == tries:
+                break
+            # BOUNDED correction, clamped and pushed through the normal safety envelope
+            mc = float(cfg.grasp_max_correction_cm)
+            dx = max(-mc, min(mc, float(v.get("dx_cm", 0.0)))) * 10.0
+            dy = max(-mc, min(mc, float(v.get("dy_cm", 0.0)))) * 10.0
+            nx = min(max(x + dx, lo[0]), hi[0])
+            ny = min(max(y + dy, lo[1]), hi[1])
+            if abs(nx - x) < 0.5 and abs(ny - y) < 0.5:
+                log.info("grasp check %d/%d: no usable correction, looking again", i, tries)
+                continue
+            mr = self.robot.move_to(nx, ny, z_mm)
+            self._refresh_pose_locked()
+            if not mr.ok:
+                return False, (f"alignment not confirmed after {i} tries: {last}; the correction to "
+                               f"({nx / 10:g}, {ny / 10:g}) cm was rejected ({mr.message})"), x, y
+            log.info("grasp correction %d/%d: %+.1f, %+.1f mm -> (%.0f, %.0f)", i, tries, nx - x, ny - y, nx, ny)
+            x, y = nx, ny
+        return False, f"alignment not confirmed after {tries} tries: {last}", x, y
+
+    def pick_verified(self, x_mm: float, y_mm: float) -> ExecResult:
+        """robot.pick(), with the alignment check wedged between "descended" and "close". Never closes the
+        claw unless BOTH cameras agree the jaws are on the object; otherwise it retreats, jaws still open,
+        and returns a FAILED result the planner can re-plan from. Runs under the bus lock (Loop.execute)."""
+        cfg = self.cfg
+        import sortbot.robot as _rb
+        if _rb.large_trim(cfg):
+            log.warning("grasp depth trim is %+.1f mm (grasp height %.1f mm) -- that is a LARGE trim; "
+                        "check the arm clears the table before running",
+                        _rb.z_trim_mm(cfg), _rb.grasp_z_mm(cfg))
+        if not cfg.grasp_verify:
+            return self.robot.pick(x_mm, y_mm)
+        from sortbot.robot import grasp_z_mm
+        zg = grasp_z_mm(cfg)  # the ONE grasp-height source (workspace.z_trim_mm trims it)
+        # 1. get there with the jaws OPEN -- nothing has been grasped yet
+        for step in (lambda: self.robot.open_gripper(), lambda: self.robot.move_to(x_mm, y_mm, zg)):
+            r = step()
+            self._refresh_pose_locked()
+            if not r.ok:
+                return ExecResult(False, f"pick failed: {r.message}")
+        # 2. BOTH cameras must agree the jaws are on the object (with bounded corrections)
+        ok, msg, x, y = self.verify_alignment(x_mm, y_mm, zg, what="pick")
+        if not ok:
+            self.robot.move_to(x, y, cfg.travel_z_mm)  # retreat with the jaws still OPEN
+            self._refresh_pose_locked()
+            return ExecResult(False, msg)
+        # 3. only now the normal grasp (open -> descend -> CLOSE -> lift) at the verified coordinate
+        res = self.robot.pick(x, y)
+        self._refresh_pose_locked()
+        return ExecResult(True, msg) if res.ok else res
 
     # ---- calibration from the HUD ----
     def attach_calibration(self, ctrl, mock_out: Path | None = None) -> None:

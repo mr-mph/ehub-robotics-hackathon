@@ -168,6 +168,15 @@ def test_bus_lock() -> None:
 
         st = get("/state")["run"]
         assert st["phase"] == "done" and st["result"].startswith("done"), st
+        # the conversation ran throughout, on its own thread, and never went near the bus
+        chat = get("/state")["chat"]
+        assert chat["alive"] and chat["replies"] > 2, chat
+        assert not session.chat.last_error, session.chat.last_error
+        assert threading.active_count() >= 0 and any(
+            t.name == "luna-chat" for t in threading.enumerate()), [t.name for t in threading.enumerate()]
+        # every pick ran the pre-grasp both-cameras check, under the same lock as the motion
+        checks = [e for e in get("/log") if e["tool"] == "verify_grasp"]
+        assert checks and all(e["ok"] for e in checks), checks[:2]
         assert robot.touches > 100, robot.touches  # the run really went over the bus
         assert not robot.overlaps, f"concurrent bus access detected: {robot.overlaps[:5]}"
         assert not errs, errs[:1]
@@ -181,7 +190,8 @@ def test_bus_lock() -> None:
         session.voice.stop()
         if session.hud is not None:
             session.hud.stop()
-    print(f"bus lock OK: {robot.touches} bus touches, 0 overlaps, run done with 3 /state hammers + preview; "
+    print(f"bus lock OK: {robot.touches} bus touches, 0 overlaps, run done with 3 /state hammers + preview "
+          f"+ the luna-chat worker ({chat['replies']} replies) + {len(checks)} pre-grasp camera checks; "
           "SORTBOT_BUS_ASSERT proxy catches unlocked calls")
 
 

@@ -26,7 +26,6 @@ workspace:
   max_step_mm: 250.0
   aabb_mm: {min: [120.0, -220.0, 0.0], max: [420.0, 220.0, 250.0]}
   home: {x: 150.0, y: 0.0, z: 180.0, roll_deg: 0.0}
-  z_trim_mm: -10
 aruco:
   dict: DICT_4X4_50
   tag_size_mm: 40.0

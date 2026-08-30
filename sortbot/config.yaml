@@ -57,12 +57,12 @@ calibration:
   ball_radius_mm: 20.0
   min_sample_spacing_mm: 15.0
 vlm:
-  model: gpt-5.6-luna       # the PLANNER: sees the photos, emits one tool call per step
+  model: gpt-5.6-terra       # the PLANNER: sees the photos, emits one tool call per step
   # The CHAT worker ("Luna") answers the human while the planner keeps working: small + fast + vision.
-  chat_model: gpt-5.4-mini
+  chat_model: gpt-5.6-luna
   chat_effort: low         # none | low | medium | high  (reasoning effort for chat + verify; keep it low)
   # The grasp-alignment check before every close (overhead + wrist -> aligned/dx/dy). Defaults to chat_model.
-  verify_model: gpt-5.4-mini
+  verify_model: gpt-5.6-luna
 grasp:
   # NEVER close the claw without first checking BOTH cameras that the jaws are over the object.
   verify: true              # false is possible but logs a loud warning at startup -- keep it true

@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import logging
 import os
 import time
 
@@ -107,6 +108,8 @@ the jaws up with a long or narrow object before picking it; use move_to / open_g
 to recover from a failure."""
 
 
+log = logging.getLogger("sortbot.vlm")
+
 CHAT_SYSTEM = """You are Luna, the voice of a small tabletop robot arm that tidies objects on a table.
 You are the CONVERSATION channel, not the planner: a separate thread is doing the actual sorting right now
 and keeps working while you talk. Never claim to be moving the arm yourself, and never stall the human.
@@ -118,16 +121,33 @@ You also translate the human into instructions for the planner:
             Write each as one short imperative sentence. Only when they clearly mean it to last.
   hints  -- one-shot nudges for the very next step ("the blue one is behind the cup", "skip that pile").
   urgent -- "stop" if they want everything to stop, "pause" if they want it to hold, else "none".
-Return empty rules and hints when nothing needs to change. NEVER invent an instruction they did not give."""
+Return empty rules and hints when nothing needs to change. NEVER invent an instruction they did not give.
+COMMANDS: when the human DIRECTLY orders a physical action ("turn the wrist", "move left a bit", "pick up
+the red one", "put it down here") set command_tool + command_args and the loop will do it NEXT, before its
+own plan. Positional args, cm/deg: turn_by [deg] | turn_to [deg] | move_to [x_cm,y_cm,z_cm] |
+pick_at [x_cm,y_cm] | place_at [x_cm,y_cm] | open_gripper [] | close_gripper [] | home []. Read positions
+off the overhead grid. Only then may your reply promise action ("On it -- turning the wrist"); with
+command_tool "none" NEVER claim an action is happening now. A vague or unsafe ask stays a hint, not a command."""
 
 CHAT_SCHEMA = {
     "type": "object",
     "properties": {"reply": {"type": "string"},
                    "rules": {"type": "array", "items": {"type": "string"}},
                    "hints": {"type": "array", "items": {"type": "string"}},
-                   "urgent": {"type": "string", "enum": ["none", "stop", "pause"]}},
-    "required": ["reply", "rules", "hints", "urgent"], "additionalProperties": False,
+                   "urgent": {"type": "string", "enum": ["none", "stop", "pause"]},
+                   "command_tool": {"type": "string",
+                                    "enum": ["none", "turn_by", "turn_to", "move_to", "pick_at",
+                                             "place_at", "open_gripper", "close_gripper", "home"]},
+                   "command_args": {"type": "array", "items": {"type": "number"}}},
+    "required": ["reply", "rules", "hints", "urgent", "command_tool", "command_args"],
+    "additionalProperties": False,
 }
+
+#: command_tool -> (Command.tool, [arg names]) -- the chat channel's positional args become tool kwargs
+CHAT_COMMANDS = {"turn_by": ("turn_by", ["deg"]), "turn_to": ("turn_to", ["deg"]),
+                 "move_to": ("move_to", ["x_cm", "y_cm", "z_cm"]), "pick_at": ("pick_at", ["x_cm", "y_cm"]),
+                 "place_at": ("place_at", ["x_cm", "y_cm"]), "open_gripper": ("open", []),
+                 "close_gripper": ("close", []), "home": ("home", [])}
 
 VERIFY_SYSTEM = """You are the grasp-alignment checker for a small tabletop robot arm. The gripper has just
 descended to grasp height over an object and the jaws are still OPEN -- nothing has been grasped yet. You get
@@ -251,7 +271,20 @@ class VLM:
             max_output_tokens=max_output_tokens, **kw)
         txt = (resp.output_text or "").strip()
         if not txt:
-            raise RuntimeError(f"{name}: empty response (model {model!r})")
+            # A big reasoning model can burn the whole output budget on reasoning and emit no text
+            # (seen live: verify on the planner model). Retry once: minimal reasoning, 4x the cap.
+            if kw.get("reasoning"):
+                kw["reasoning"] = {"effort": "minimal"}
+            log.warning("%s: empty response from %r; retrying with minimal reasoning and %d tokens",
+                        name, model, max_output_tokens * 4)
+            resp = self.client.responses.create(
+                model=model, instructions=system, input=[{"role": "user", "content": content}],
+                text={"format": {"type": "json_schema", "name": name, "strict": True, "schema": schema}},
+                max_output_tokens=max_output_tokens * 4, **kw)
+            txt = (resp.output_text or "").strip()
+        if not txt:
+            raise RuntimeError(f"{name}: empty response (model {model!r}) even after a minimal-reasoning "
+                               f"retry - pick a smaller verify/chat model in Tune (e.g. gpt-5.4-mini)")
         return json.loads(txt)
 
     def chat(self, heard: str, context: str, overhead_jpeg: bytes | None = None,
@@ -267,10 +300,20 @@ class VLM:
         t0 = time.time()
         d = self._structured(self.chat_model, CHAT_SYSTEM, content, CHAT_SCHEMA, "luna_reply", 400)
         self.last_chat_latency_ms = int((time.time() - t0) * 1000)
-        return {"reply": str(d.get("reply", "")).strip(),
-                "rules": [str(r).strip() for r in (d.get("rules") or []) if str(r).strip()],
-                "hints": [str(h).strip() for h in (d.get("hints") or []) if str(h).strip()],
-                "urgent": d.get("urgent") if d.get("urgent") in ("stop", "pause") else "none"}
+        out = {"reply": str(d.get("reply", "")).strip(),
+               "rules": [str(r).strip() for r in (d.get("rules") or []) if str(r).strip()],
+               "hints": [str(h).strip() for h in (d.get("hints") or []) if str(h).strip()],
+               "urgent": d.get("urgent") if d.get("urgent") in ("stop", "pause") else "none",
+               "command": None}
+        ct = d.get("command_tool")
+        if ct in CHAT_COMMANDS:
+            tool, names = CHAT_COMMANDS[ct]
+            vals = [float(v) for v in (d.get("command_args") or [])][:len(names)]
+            if len(vals) == len(names):
+                out["command"] = {"tool": tool, "args": dict(zip(names, vals))}
+            else:
+                out["hints"].append(f"(garbled command {ct}: args {vals})")
+        return out
 
     def verify_grasp(self, overhead_jpeg: bytes, wrist_jpeg: bytes, x_cm: float, y_cm: float,
                      attempt: int = 1) -> dict:
@@ -363,7 +406,7 @@ def _selftest() -> None:
     # the planner must be told about the conversation channel and the pre-grasp check
     for frag in ("CONVERSATION", "chat worker", "say() SPARINGLY", "alignment not confirmed"):
         assert frag in SYSTEM_PROMPT, frag
-    assert CHAT_SCHEMA["required"] == ["reply", "rules", "hints", "urgent"]
+    assert CHAT_SCHEMA["required"] == ["reply", "rules", "hints", "urgent", "command_tool", "command_args"]
     assert CHAT_SCHEMA["properties"]["urgent"]["enum"] == ["none", "stop", "pause"]
     assert VERIFY_SCHEMA["required"] == ["aligned", "dx_cm", "dy_cm", "reason", "confidence"]
     assert all(s["additionalProperties"] is False for s in (CHAT_SCHEMA, VERIFY_SCHEMA))

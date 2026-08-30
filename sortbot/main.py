@@ -208,16 +208,17 @@ class DirectiveQueue:
     kind: "rule" (persistent) | "hint" (one-shot) | "cmd" (bare open/close/home) | "stop".
     drain() is non-blocking on purpose -- the action loop must never wait on the conversation."""
 
-    KINDS = ("rule", "hint", "cmd", "stop")
+    KINDS = ("rule", "hint", "cmd", "stop", "action")
 
     def __init__(self):
         self._q: collections.deque = collections.deque()
         self._lock = threading.Lock()
 
-    def put(self, kind: str, text: str = "") -> None:
+    def put(self, kind: str, text: str = "", data: dict | None = None) -> None:
         assert kind in self.KINDS, kind
         with self._lock:
-            self._q.append({"kind": kind, "text": str(text).strip(), "t": round(time.time(), 2)})
+            self._q.append({"kind": kind, "text": str(text).strip(), "data": data,
+                            "t": round(time.time(), 2)})
 
     def drain(self) -> list[dict]:
         with self._lock:
@@ -350,6 +351,12 @@ class ChatWorker:
             self.busy = False
         self.last_latency_ms = int((time.time() - t0) * 1000)
         self.replies += 1
+        if d.get("command"):
+            c = d["command"]
+            self.directives.put("action", text=f"{c['tool']}({c['args']})", data=c)
+            if not d.get("reply"):
+                d["reply"] = f"On it - {c['tool'].replace('_', ' ')}."
+            self._record("chat", {"heard": text}, f"your command queued next: {c['tool']}({c['args']})")
 
         if d.get("urgent") in ("stop", "pause"):  # the model heard a stop the regex did not
             self._urgent(d["urgent"], text, speak=False)
@@ -461,6 +468,7 @@ class Loop:
         self.step = 0
         self.history: list[dict] = []
         self.hints: list[str] = []
+        self.pending_actions: list[dict] = []
         self.holding: str | None = None  # description of the last pick ("object picked at (x, y) cm"), or None
         self.placed = 0
         self.last_say = ""
@@ -489,6 +497,7 @@ class Loop:
             log.debug("pose cache refresh: %s", e)
 
     # ---- conversation -> action (q_directives; see the MULTI-QUEUE block at the top) ----
+    #: user commands from the conversation, executed one per step BEFORE the planner gets a say
     def drain_inputs(self) -> bool:
         """The loop's ONE drain point for everything the human said. Non-blocking: the action loop never
         waits on the conversation. Returns False if a stop was requested."""
@@ -502,6 +511,9 @@ class Loop:
                 self.hints.append(f"(human) {text}")
             elif kind == "cmd":
                 self._run_bare(text)
+            elif kind == "action":
+                if d.get("data"):
+                    self.pending_actions.append(d["data"])
             elif kind == "stop":
                 keep_going = False
         if self.directives is None:  # no chat worker: legacy classifier path, this loop owns q_heard
@@ -841,17 +853,29 @@ class Loop:
                                                 calib_region_px=self.homog.region_px,
                                                 calib_samples_px=self.homog.samples_px)
             self._overlay = overlay
-            self.hud_update(overlay, wrist, step, t0, "planning")
-            try:
-                cmd = self.vlm.plan_step(png(overlay), png(wrist), world, self.history,
-                                         workspace_mm=(self.cfg.aabb_min_mm, self.cfg.aabb_max_mm))
-            except Exception as e:  # noqa: BLE001
-                log.error("VLM failed: %s", e)
-                self.history.append({"tool": "vlm", "args": {}, "result": f"error {e}"})
-                if self.dlog is not None:
-                    self.dlog.add("vlm", {}, f"error {e}", ok=False, step=step, frame=overlay,
-                                  latency_ms=int((time.time() - t0) * 1000))
-                continue
+            if self.pending_actions:  # your command runs FIRST, one per step, on this fresh capture
+                cmd = Command(**{k: v for k, v in [("tool", self.pending_actions[0]["tool"]),
+                                                  ("args", self.pending_actions.pop(0)["args"])]})
+                self.hud_update(overlay, wrist, step, t0, f"your command: {cmd.tool}")
+                self.history.append({"tool": "you", "args": dict(cmd.args),
+                                     "result": f"the human commanded {cmd.tool} directly"})
+            else:
+                self.hud_update(overlay, wrist, step, t0, "planning")
+                try:
+                    cmd = self.vlm.plan_step(png(overlay), png(wrist), world, self.history,
+                                             workspace_mm=(self.cfg.aabb_min_mm, self.cfg.aabb_max_mm))
+                except Exception as e:  # noqa: BLE001
+                    log.error("VLM failed: %s", e)
+                    self.history.append({"tool": "vlm", "args": {}, "result": f"error {e}"})
+                    if self.dlog is not None:
+                        self.dlog.add("vlm", {}, f"error {e}", ok=False, step=step, frame=overlay,
+                                      latency_ms=int((time.time() - t0) * 1000))
+                    continue
+                self.drain_inputs()  # commands spoken while the planner was thinking...
+                if self.pending_actions:  # ...supersede its answer for this step
+                    self.record(cmd.tool, dict(cmd.args),
+                                ExecResult(False, "superseded by your spoken command (not executed)"))
+                    continue
             err = self.validate(cmd, world)
             if err:
                 self.record(cmd.tool, cmd.args, ExecResult(False, f"rejected: {err}"))

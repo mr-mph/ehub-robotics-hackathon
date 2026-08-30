@@ -32,7 +32,11 @@ workspace:
   gripper_clearance_mm: 15.0
   travel_z_mm: 120.0
   grasp_z_mm: 8.0
-  max_step_mm: 250.0
+  # Runaway backstop on a single commanded XY translation. The REAL bound on where the arm may go is
+  # aabb_mm below (whose own diagonal is ~533 mm), plus the IK reachability check, so this only has to be
+  # large enough never to reject a target that is already inside the workspace -- at 250 it did exactly
+  # that, failing far picks and places with "step of N mm exceeds max_step".
+  max_step_mm: 600.0
   aabb_mm: {min: [120.0, -220.0, 0.0], max: [420.0, 220.0, 250.0]}
   home: {x: 150.0, y: 0.0, z: 180.0, roll_deg: 0.0}
 aruco:

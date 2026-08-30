@@ -225,17 +225,17 @@ class _KinematicBase:
             if not lo[i] <= v <= hi[i]:
                 raise SafetyError(f"target {name}={v:.1f} mm outside workspace [{lo[i]}, {hi[i]}]")
         p = self.get_ee_pose()
-        d = math.dist((p.x, p.y, p.z), (x, y, z))
+        # max_step_mm bounds the TRANSLATION across the table, so it is measured in XY only.
+        # move_to never travels the straight line between two poses: it lifts to travel height, crosses in
+        # bounded cartesian sub-steps and then descends straight down. Folding the vertical leg into this
+        # number measured a path the arm does not take, and made the limit depend on the grasp depth --
+        # a deeper workspace.z_trim_mm silently shrank the reachable table until far drop points started
+        # failing as "unreachable". Vertical travel is already bounded, by the workspace AABB and the z
+        # floor; this is the horizontal bound.
+        d = math.hypot(x - p.x, y - p.y)
         if d > self.cfg.max_step_mm:
-            trim = z_trim_mm(self.cfg)
-            # a deep trim makes every grasp/place further from HOME: say so, or this reads as "unreachable"
-            why = ""
-            if trim < 0 and z < float(self.cfg.table_z_mm) + float(self.cfg.gripper_clearance_mm):
-                d0 = math.dist((p.x, p.y, p.z), (x, y, z - trim))
-                if d0 <= self.cfg.max_step_mm:
-                    why = (f" -- the grasp depth trim ({trim:+.0f} mm) adds {d - d0:.0f} mm to this move; "
-                           f"reduce workspace.z_trim_mm or raise workspace.max_step_mm")
-            raise SafetyError(f"step of {d:.0f} mm exceeds max_step {self.cfg.max_step_mm:.0f} mm{why}")
+            raise SafetyError(f"XY step of {d:.0f} mm across the table exceeds max_step "
+                              f"{self.cfg.max_step_mm:.0f} mm")
 
     # ---- state ----
     def get_joints_deg(self) -> np.ndarray:
@@ -545,14 +545,16 @@ def _selftest() -> None:
     # --- workspace.z_trim_mm: a negative trim really does lower BOTH the commanded grasp z and the floor,
     # and the absolute floor (table - 40 mm) still refuses anything below it whatever the trim says ---
     import dataclasses
-    zg0 = grasp_z_mm(cfg)
-    low = dataclasses.replace(cfg, z_trim_mm=-6.0)
+    # the live workspace.z_trim_mm is the OPERATOR's calibration of their table, so pin a baseline here
+    base = dataclasses.replace(cfg, z_trim_mm=0.0)
+    zg0 = grasp_z_mm(base)
+    low = dataclasses.replace(base, z_trim_mm=-6.0)
     assert abs(grasp_z_mm(low) - (zg0 - 6.0)) < 1e-9, (grasp_z_mm(low), zg0)
-    assert abs(table_plane_mm(low) - (cfg.table_z_mm - 6.0)) < 1e-9
-    assert z_trim_mm(dataclasses.replace(cfg, z_trim_mm=-999.0)) == -Z_TRIM_LIMIT_MM  # clamped at 150 mm
-    assert Z_TRIM_LIMIT_MM >= 150.0 and not large_trim(cfg) and large_trim(dataclasses.replace(cfg, z_trim_mm=-55.0))
+    assert abs(table_plane_mm(low) - (base.table_z_mm - 6.0)) < 1e-9
+    assert z_trim_mm(dataclasses.replace(base, z_trim_mm=-999.0)) == -Z_TRIM_LIMIT_MM  # clamped at 150 mm
+    assert Z_TRIM_LIMIT_MM >= 150.0 and not large_trim(base) and large_trim(dataclasses.replace(base, z_trim_mm=-55.0))
     # the floor is a configurable backstop, not a policy limit: a deep table is reachable by lowering it
-    deep = dataclasses.replace(cfg, z_trim_mm=-90.0, z_floor_mm=-150.0)
+    deep = dataclasses.replace(base, z_trim_mm=-90.0, z_floor_mm=-150.0)
     assert grasp_z_mm(deep) < -70.0 and hard_floor_mm(deep) == -150.0
     try:
         MockRobot(deep).check_target(250.0, 0.0, -160.0)
@@ -570,7 +572,9 @@ def _selftest() -> None:
         raise AssertionError("absolute floor not enforced")
     except (SafetyError, _robot.SafetyError) as e:
         assert "absolute floor" in str(e), e
-    for bad in ((275, 0, 5), (50, 0, 60), (275, 300, 60), (500, 0, 60), (275, 0, 300)):
+    # "too low" is relative to the configured grasp height, not a hardcoded number: the operator's
+    # workspace.z_trim_mm moves that floor (see grasp_z_mm)
+    for bad in ((275, 0, grasp_z_mm(cfg) - 5.0), (50, 0, 60), (275, 300, 60), (500, 0, 60), (275, 0, 300)):
         assert not r.move_to(*bad).ok, bad
         try:
             r.check_target(*bad)
@@ -583,7 +587,26 @@ def _selftest() -> None:
     res = r.move_to(275, 0, 60)
     assert not res.ok and "torque" in res.message, res  # E-STOP refuses motion
     assert r.torque_on().ok and r.torque
-    assert not r.move_to(400, -200, 60).ok  # > max_step_mm from home
+    # max_step_mm is a runaway backstop, not the workspace bound: it must be wide enough that ANY target
+    # already inside the AABB is reachable in one commanded move, or legal picks fail as "exceeds max_step"
+    lo_a, hi_a = cfg.aabb_min_mm, cfg.aabb_max_mm
+    diag = math.hypot(hi_a[0] - lo_a[0], hi_a[1] - lo_a[1])
+    assert cfg.max_step_mm >= diag, (f"max_step_mm {cfg.max_step_mm} is smaller than the workspace's own "
+                                     f"XY diagonal {diag:.0f} mm: reachable targets will be refused")
+    tiny = dataclasses.replace(cfg, max_step_mm=100.0)  # ... but it does still bound a huge jump
+    rt = MockRobot(tiny)
+    rt.home()
+    bad_step = rt.move_to(300.0, 150.0, 60.0)
+    assert not bad_step.ok and "XY step" in bad_step.message, bad_step
+    # it must not depend on how deep the grasp goes, or a bigger negative trim would silently shrink the
+    # reachable table (this used to reject far drop points)
+    r.home()
+    far = (300.0, 150.0)
+    assert r.move_to(*far, grasp_z_mm(base)).ok, "a far target at grasp height must be reachable"
+    deep2 = dataclasses.replace(base, z_trim_mm=-40.0)
+    rd = MockRobot(deep2)
+    rd.home()
+    assert rd.move_to(*far, grasp_z_mm(deep2)).ok, "a deep trim must not shrink the reachable table"
     assert r.move_to(275, 0, 60).ok
     try:  # far beyond the arm's reach -> the FK(IK) sanity check must reject (ik_table has no AABB gate)
         r.ik_table(r._read_joints(), 600.0, 0.0, 60.0, 0.0)

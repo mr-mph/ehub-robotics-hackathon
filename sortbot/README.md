@@ -227,8 +227,12 @@ Grasp config (`config.yaml`): `grasp: {verify: true, max_correction_cm: 2.0, max
 min_confidence: 0.5}`. `verify: false` is possible but logs a loud multi-line warning at startup and shows
 the check as OFF in the HUD -- the default is and should stay `true`.
 
-Loop behaviour: every iteration starts with `home()`, so objects and drop points must be within `max_step_mm`
-of HOME (with the default config: x 160-300 mm, |y| <= 160 mm). Rejected/unsafe commands are returned to the VLM
+Loop behaviour: every iteration starts with `home()`. Where the arm may go is bounded by
+`workspace.aabb_mm` (x 120-420 mm, |y| <= 220 mm) and the IK reachability check; `workspace.max_step_mm`
+(600 mm) is only a runaway backstop on one commanded XY translation, deliberately wider than the
+workspace's own diagonal (~533 mm) so it never refuses a target that is already inside the envelope. It
+measures the **XY translation** only -- `move_to` lifts, crosses and descends, so folding the vertical leg
+in measured a path the arm does not take and made the limit shrink as the grasp depth trim deepened. Rejected/unsafe commands are returned to the VLM
 as `FAILED: ...` history entries, never raised. Voice input: "rule"-shaped sentences are persisted to RULES,
 `stop` ends the run, `open`/`close`/`home` execute directly, anything else is passed to the VLM as a `(human) ...` hint.
 What counts as "already sorted" is the VLM's call: the prompt tells it to leave things that are already where

@@ -336,7 +336,8 @@ class Loop:
         if self.hud is None:
             return
         ctrl.register(self.hud)
-        self.hud.register("calib_start", self._request_calib, "Start calibration", "calibration")
+        self.hud.register("calib_start", self._request_calib, "Start calibration", "calibration",
+                          help="Begin the teleoperated camera calibration at the next step boundary (the loop pauses).")
 
     def _request_calib(self) -> dict:
         if self.calib.active or self._calib_requested.is_set():
@@ -468,6 +469,7 @@ class Session:
         self.mask_view = False
         self.dlog = DecisionLog()
         self._overlay_hold: tuple[float, np.ndarray] | None = None  # (until_ts, overlay) shown while idle after redetect
+        self._calib_flag: tuple[float, bool] | None = None  # (calib.json mtime, has fitted H) cache
         self.last_overhead: np.ndarray | None = None
         self._shutdown = threading.Event()
         self._register()
@@ -478,21 +480,36 @@ class Session:
         if self.hud is None:
             return
         h = self.hud
-        h.register("set_mode", self.set_mode, None, "run")  # header pills; no generic button
-        h.register("start", self.start, "Start", "run")
-        h.register("pause", self.pause, "Pause", "run")
-        h.register("resume", self.resume, "Resume", "run")
-        h.register("stop", self.stop, "Stop", "run")
-        h.register("step_once", self.step_once, "Step once", "run")
-        h.register("set_max_steps", self.set_max_steps, "Set max steps", "run")
-        h.register("set_task", self.set_task, "Set task", "run")
-        h.register("home", lambda: self._robot_act(lambda r: r.home()), "Home", "robot", params=[])
-        h.register("open_gripper", lambda: self._robot_act(lambda r: r.open_gripper()), "Open gripper", "robot", params=[])
-        h.register("close_gripper", lambda: self._robot_act(lambda r: r.close_gripper()), "Close gripper", "robot", params=[])
-        h.register("jog", self.jog, "Jog", "robot")
-        h.register("goto", self.goto, "Go to", "robot")
-        h.register("torque_off", self.torque_off, "E-STOP (torque off)", "robot", params=[])
-        h.register("torque_on", self.torque_on, "Torque on", "robot", params=[])
+        h.register("set_mode", self.set_mode, None, "run",  # driven by the Setup mode cards / pills
+                   help="Connect or disconnect devices: robot=mock|real|off, cams=sim|real|off, vlm=mock|live|off. Any combination; connected lazily.")
+        h.register("start", self.start, "Start", "run",
+                   help="Start a sorting run with the connected devices (needs robot + cams + VLM).")
+        h.register("pause", self.pause, "Pause", "run",
+                   help="Pause the run; the current step finishes first.")
+        h.register("resume", self.resume, "Resume", "run",
+                   help="Continue a paused run (refused while torque is off after an E-STOP).")
+        h.register("stop", self.stop, "Stop", "run",
+                   help="End the run at the next step boundary; devices stay connected for the next Start.")
+        h.register("step_once", self.step_once, "Step once", "run",
+                   help="Run exactly one step; from idle the run is started paused first.")
+        h.register("set_max_steps", self.set_max_steps, "Set max steps", "run",
+                   help="Cap the number of steps for this and future runs (n >= 1).")
+        h.register("set_task", self.set_task, "Set task", "run",
+                   help="Free-text goal sent to the VLM as GOAL: ... (empty = sort sensibly into the zones).")
+        h.register("home", lambda: self._robot_act(lambda r: r.home()), "Home", "robot", params=[],
+                   help="Move the arm to its HOME pose above the table.")
+        h.register("open_gripper", lambda: self._robot_act(lambda r: r.open_gripper()), "Open gripper", "robot", params=[],
+                   help="Open the gripper (drops whatever it is holding).")
+        h.register("close_gripper", lambda: self._robot_act(lambda r: r.close_gripper()), "Close gripper", "robot", params=[],
+                   help="Close the gripper.")
+        h.register("jog", self.jog, "Jog", "robot",
+                   help="Nudge the arm along one axis (axis: x|y|z|roll; delta in mm, degrees for roll), through the safety envelope.")
+        h.register("goto", self.goto, "Go to", "robot",
+                   help="Move the gripper to table-frame (x, y, z) mm, through the safety envelope.")
+        h.register("torque_off", self.torque_off, "E-STOP (torque off)", "robot", params=[],
+                   help="E-STOP: cut motor torque immediately and pause the run; all motion is refused until torque_on.")
+        h.register("torque_on", self.torque_on, "Torque on", "robot", params=[],
+                   help="Re-enable motor torque after an E-STOP.")
         h.register("say_to_bot", self.say_to_bot, "Send to bot", "voice",
                    help="Send a typed correction through the voice classifier (rule / hint / immediate command), exactly like speech.")
         h.register("say_to_robot", self.say_to_bot, None, "voice",
@@ -545,7 +562,8 @@ class Session:
         for name, label in (("calib_start", "Start calibration"), ("calib_touch", "Touch table"),
                             ("calib_capture", "Capture"), ("calib_undo", "Undo"),
                             ("calib_finish", "Finish"), ("calib_cancel", "Cancel"), ("calib_sample", None)):
-            self.hud.register(name, no, label, "calibration", params=[])
+            self.hud.register(name, no, label, "calibration", params=[],
+                              help="Calibration needs a robot: pick a mode in Setup first.")
         self.hud.add_state_source("calibration", lambda: {"state": "idle", "n": 0, "message": "connect a robot first"})
 
     # ------------------------------------------------ mode / devices
@@ -660,7 +678,9 @@ class Session:
                                              self.cfg.calib_file, self._calib_done, lambda: self.last_overhead)
         if self.hud is not None:
             self.calib.register(self.hud)
-            self.hud.register("calib_start", self._calib_start, "Start calibration", "calibration", params=[])
+            self.hud.register("calib_start", self._calib_start, "Start calibration", "calibration", params=[],
+                              help="Begin the teleoperated camera calibration (put the target ball in the gripper first); "
+                                   "mid-run it starts at the next step boundary.")
 
     def _calib_start(self) -> dict:
         if self.calib is None:
@@ -1006,8 +1026,26 @@ class Session:
         n = self.dlog.clear()
         return {"ok": True, "message": f"cleared {n} log entries", "data": None}
 
+    def _calibrated(self) -> bool:
+        """Is a px->mm homography available for the current cams? (sim: always; real: fitted H in calib.json).
+        Drives the page's 'Not calibrated' banner + first-run checklist; cached on the calib file's mtime."""
+        if self.mode["cams"] == "sim":
+            return True
+        p = self.cfg.calib_file
+        try:
+            mt = p.stat().st_mtime
+        except OSError:
+            return False
+        if self._calib_flag is None or self._calib_flag[0] != mt:
+            try:
+                from sortbot.calibration import load_calib_dict
+                self._calib_flag = (mt, load_calib_dict(p)["H_px_to_mm"] is not None)
+            except Exception:  # noqa: BLE001
+                self._calib_flag = (mt, False)
+        return self._calib_flag[1]
+
     def _perception_state(self) -> dict:
-        return {"params": self.det_params.to_dict(), "mask": self.mask_view,
+        return {"params": self.det_params.to_dict(), "mask": self.mask_view, "calibrated": self._calibrated(),
                 "zones": [{"name": z.name, "drop": [z.drop_point_mm[0], z.drop_point_mm[1]],
                            "rect": [list(z.polygon_mm[0]), list(z.polygon_mm[2])]} for z in self.cfg.zones]}
 

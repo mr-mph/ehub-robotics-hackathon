@@ -354,13 +354,20 @@ class CalibController:
     def register(self, hud) -> None:
         self.hud = hud
         g = "calibration"
-        hud.register("calib_start", self.start, "Start calibration", g)
-        hud.register("calib_touch", lambda: self.trigger("touch_table"), "Touch table", g)
-        hud.register("calib_capture", lambda: self.trigger("capture"), "Capture", g)
-        hud.register("calib_undo", lambda: self.trigger("undo"), "Undo", g)
-        hud.register("calib_finish", lambda: self.trigger("finish"), "Finish", g)
-        hud.register("calib_cancel", lambda: self.trigger("cancel"), "Cancel", g)
-        hud.register("calib_sample", lambda u, v: self.sample(float(u), float(v)), None, g)  # click-to-pick (no button)
+        hud.register("calib_start", self.start, "Start calibration", g,
+                     help="Begin the teleoperated calibration: the leader arm drives the follower while you capture samples (target ball in the gripper first).")
+        hud.register("calib_touch", lambda: self.trigger("touch_table"), "Touch table", g,
+                     help="With the fingertip resting on the tabletop, record the table height (once per calibration).")
+        hud.register("calib_capture", lambda: self.trigger("capture"), "Capture", g,
+                     help="Capture a sample: pairs the target's pixel position with the arm's FK position (spacebar). Need 4+, spread out.")
+        hud.register("calib_undo", lambda: self.trigger("undo"), "Undo", g,
+                     help="Drop the last captured sample.")
+        hud.register("calib_finish", lambda: self.trigger("finish"), "Finish", g,
+                     help="Fit the homography from the samples (4+, well spread over the mat) and save calib.json.")
+        hud.register("calib_cancel", lambda: self.trigger("cancel"), "Cancel", g,
+                     help="Abandon the calibration session; nothing is written.")
+        hud.register("calib_sample", lambda u, v: self.sample(float(u), float(v)), None, g,  # click-to-pick (no button)
+                     help="Click the overhead image: picks the target colour at that pixel and shows the detection circle.")
         hud.add_state_source("calibration", self.status)
 
 

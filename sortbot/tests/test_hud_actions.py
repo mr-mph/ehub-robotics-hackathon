@@ -339,13 +339,41 @@ def test_hud_actions() -> None:
         assert any(e["tool"] == "place_in_zone" and e["ok"] for e in lg), tools
         assert post("log_clear")["ok"]
         assert get("/log") == []
+
+        # --- UX redesign: help on EVERY action, mic toggle endpoints, page/action cross-check ---
+        acts = {a["name"]: a for a in get("/actions")}
+        missing_help = [n for n, a in acts.items() if not a.get("help")]
+        assert not missing_help, f"actions without help text: {missing_help}"
+        st = get("/state")
+        assert st["voice"]["listening"] is False, "mic must be OFF by default"
+        assert st["perception"]["calibrated"] is True, st["perception"]  # sim cams: always calibrated
+        session.voice._mic_ok = False  # never start a real ffmpeg mic capture from tests
+        r = post("mic_on")
+        assert r["ok"] and "unavailable" in r["message"], r
+        assert get("/state")["voice"]["listening"] is False
+        assert post("mic_off")["ok"]
+        assert get("/state")["voice"]["listening"] is False
+        assert any(e["tool"] == "mic_on" for e in get("/log")), "mic toggle not in the decision log"
+        # the page: every act('...') target in its JS must be a registered action; safety/UX chrome present
+        import re as _re
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5) as rr:
+            page = rr.read().decode()
+        refs = set(_re.findall(r"act\('([a-z_0-9]+)'", page))
+        assert len(refs) > 15, f"page references too few actions: {sorted(refs)}"
+        unknown = refs - set(acts)
+        assert not unknown, f"page JS calls actions not in /actions: {sorted(unknown)}"
+        for frag in ("MIC LIVE", "mic_on", "mic_off", 'id="checklist"', 'id="demo"', "E-STOP",
+                     'data-tab="setup"', 'data-tab="operate"', 'data-tab="tune"', 'data-tab="debug"',
+                     "Not a straight line"):
+            assert frag in page, f"page missing {frag!r}"
     finally:
         session.shutdown()
         session.voice.stop()
         if session.hud is not None:
             session.hud.stop()
     print("hud actions OK: RUN/ROBOT/PERCEPTION/VOICE/RULES/MODELS/LOG groups, E-STOP, restart, calibration, "
-          "push-to-talk transcribe, model hot-swap, live detector tuning + zone drops + /log all over HTTP")
+          "push-to-talk transcribe, model hot-swap, live detector tuning + zone drops + /log, "
+          "help on every action, mic toggle, page/action cross-check all over HTTP")
 
 
 if __name__ == "__main__":

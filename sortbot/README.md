@@ -69,10 +69,34 @@ forget rules), `--config PATH`.
 
 ## HUD (browser page, everything works without the terminal)
 
-Layout: header (mode pills + phase/step counter + red **E-STOP**), left column overhead (large) + wrist streams,
-right column status card and one tab per action group (run / robot / perception / calibration / voice / rules / models / log), rendered dynamically
-from `GET /actions` (button rows with input fields derived from each action's parameters). While no run is
-active a preview thread keeps the camera streams live.
+Layout (redesigned around what an operator is trying to do): sticky header with connection dots
+(robot / cams / vlm), a plain-words status banner ("Not connected -- choose a mode in Setup",
+"Sorting -- step 7/30 ..."; clicking it jumps to the relevant tab), a pulsing red **MIC LIVE** chip whenever the
+microphone is listening, and the red **E-STOP** (always visible, key `e`). Below: the overhead stream as the hero
+(~65% width) with the wrist cam picture-in-picture on its corner, and four intent tabs on the right:
+
+* **SETUP** -- mode selection as big labeled cards (Simulation / Real robot / Cameras only; per-device
+  robot/cams/vlm pills under "Advanced"), then the calibration flow with a numbered, state-driven how-to
+  (current step highlighted, live residuals, collinear-samples warning, when-to-recalibrate note).
+* **OPERATE** -- task text, big Start/Pause/Resume/Stop (+ Step once / max steps), corrections (text box,
+  push-to-talk, and the **Listening** toggle mapped to `mic_on`/`mic_off` -- the mic NEVER runs unless that
+  toggle is on, and it is off on every start), and the rules editor.
+* **TUNE** -- model dropdowns, detector sliders, zone drop points.
+* **DEBUG** -- manual arm control (home / gripper / jog pad / go-to / torque), the decision log, and a raw
+  list of every registered action.
+
+A dismissible 3-step first-run checklist (1 Choose mode -> 2 Calibrate -> 3 Start sorting, current step
+highlighted, steps link to their tabs) sits under the header and disappears once a run starts. Disabled controls
+say why in one line ("needs a robot connected -- pick a mode in Setup") instead of being greyed out silently.
+The "?" button in the tab bar reveals every control's one-line `help` text (all registered actions carry
+`help=`, also served as title tooltips). Buttons show a pending spinner then a tick / inline error (no
+alert()s); the bot's say() lines and safety rejections pop up as toasts. **Demo** (header button) is a
+fullscreen judging view -- stream + status + last decision + rules ticker, no controls (Esc exits). Keys:
+`e` = E-STOP, `p` = pause/resume, `space` = capture while calibrating. Groups still come dynamically from
+`GET /actions`: known groups map onto the four tabs, and any new group/action renders as generic button rows
+(unknown groups land in Debug). `GET /state` `perception.calibrated` reports whether a px->mm homography exists
+for the current cams (sim: always; real: fitted H in calib.json) -- it drives the "Not calibrated" banner and
+checklist step 2. While no run is active a preview thread keeps the camera streams live.
 
 Modes (`set_mode`, header pills; devices are connected lazily and connect errors are reported in the response):
 

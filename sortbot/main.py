@@ -89,6 +89,11 @@ class Homography:
         return "ball" if self.tracker is None else self.tracker.method
 
     @property
+    def samples_px(self) -> np.ndarray | None:
+        """The calibration's own anchor pixels (drawn on the overlay so a mismatch is diagnosable)."""
+        return None if self.tracker is None else getattr(self.tracker, "samples_px", None)
+
+    @property
     def region_px(self) -> np.ndarray | None:
         """Convex hull (overhead px) of the calibration samples: where px<->mm is trustworthy.
         None for a fixed/injected H (tests) or an old calib.json without stored points."""
@@ -420,7 +425,8 @@ class Loop:
             rules = ([f"GOAL: {self.task}"] if self.task else []) + self.rules.list() + self.hints
             world = WorldState(self.cfg.zones, self._read_pose(), self.robot.gripper_open, self.holding, rules)
             overlay = perception.render_overlay(overhead, H, self.cfg.zones, world.ee_pose, rules,
-                                                calib_region_px=self.homog.region_px)
+                                                calib_region_px=self.homog.region_px,
+                                                calib_samples_px=self.homog.samples_px)
             self._overlay = overlay
             self.hud_update(overlay, wrist, step, t0, "planning")
             try:
@@ -994,7 +1000,8 @@ class Session:
         if H is None:
             return
         overlay = perception.render_overlay(frame, H, self.cfg.zones, None, self.rules.list(),
-                                            calib_region_px=self.homog.region_px if self.homog else None)
+                                            calib_region_px=self.homog.region_px if self.homog else None,
+                                            calib_samples_px=self.homog.samples_px if self.homog else None)
         self._overlay_hold = (time.time() + 5.0, overlay)
         if self.hud is not None and not self._running():
             self.hud.update(overlay, None, {})
@@ -1203,7 +1210,8 @@ class Session:
                             try:
                                 show = perception.render_overlay(
                                     ov, H, self.cfg.zones, pose, self.rules.list(),
-                                    calib_region_px=self.homog.region_px if self.homog is not None else None)
+                                    calib_region_px=self.homog.region_px if self.homog is not None else None,
+                                    calib_samples_px=self.homog.samples_px if self.homog is not None else None)
                             except Exception as e:  # noqa: BLE001
                                 log.debug("preview overlay: %s", e)
                     self.hud.update(show, wr, {})

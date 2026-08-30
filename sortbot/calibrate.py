@@ -34,6 +34,12 @@ from sortbot.calibration import (ColorTarget, _ip, calib_summary_file, collinear
 
 MOTORS = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
 TELEOP_HZ, DETECT_EVERY = 30.0, 3  # detection runs every DETECT_EVERY teleop ticks
+# Sample-quality thresholds. The homography is a SINGLE-PLANE model fitted from (ball pixel, FK xy)
+# pairs, so a sample is only meaningful when the arm is still (frame and FK must describe the SAME
+# pose), at the same height, and at the same gripper orientation (the ball sits at a fixed offset from
+# the gripper frame -- tilt the wrist and that offset swings by centimetres).
+STILL_DRIFT_MM, STILL_GAP_S = 2.0, 0.06
+Z_SPREAD_WARN_MM, TILT_SPREAD_WARN_DEG, RESID_WARN_MM = 25.0, 12.0, 8.0
 
 
 # ---------------------------------------------------------------- rigs (follower + camera)
@@ -58,6 +64,11 @@ class RobotRig:
     def fk_base_mm(self, q: np.ndarray) -> np.ndarray:
         return self.robot.kin.forward_kinematics(np.asarray(q, float))[:3, 3] * 1000.0
 
+    def tilt_deg(self, q: np.ndarray) -> float | None:
+        """Gripper tilt off vertical, or None if the robot cannot report it (sample-consistency check)."""
+        f = getattr(self.robot, "tilt_deg", None)
+        return None if f is None else float(f(np.asarray(q, float)))
+
     def frame(self) -> np.ndarray:
         return self.frame_fn()
 
@@ -81,9 +92,10 @@ class CalibSession:
         self.rig, self.leader, self.target, self.out = rig, leader, target, Path(out)
         self.min_spacing, self.on_frame = min_spacing_mm, on_frame
         self.z_off = z_offset_mm  # None until touch_table() (or a previous calib.json value is passed in)
-        self.samples: list[dict] = []  # {px:(u,v), base_mm:(x,y,z)}
+        self.samples: list[dict] = []  # {px:(u,v), base_mm:(x,y,z), tilt_deg}
         self.H = self.res = None
-        self.det = self.fk = None
+        self.inliers = None  # bool mask: which samples the RANSAC fit actually used
+        self.det = self.fk = self.tilt = None
         self.frame_rgb: np.ndarray | None = None
         self.frame_wh: tuple[int, int] | None = None  # for sample-coverage feedback
         self.state, self.message = "idle", ""
@@ -123,13 +135,14 @@ class CalibSession:
         if getattr(self.rig, "frame_via_bus", True):
             with self._bus:  # frame comes through the follower -> it IS a bus read
                 self.frame_rgb = self.rig.frame()
-                self.fk = self.rig.fk_base_mm(self.rig.read_joints())
+                q = self.rig.read_joints()
         else:
             # camera-only frame: never hold the shared bus lock across a (potentially ~1 s) camera
             # read -- that starved the E-STOP's 1 s lock acquire into its unlocked fallback
             self.frame_rgb = self.rig.frame()
             with self._bus:
-                self.fk = self.rig.fk_base_mm(self.rig.read_joints())
+                q = self.rig.read_joints()
+        self.fk, self.tilt = self.rig.fk_base_mm(q), self.rig.tilt_deg(q)
         self.frame_wh = (self.frame_rgb.shape[1], self.frame_rgb.shape[0])
         self.det = detect_target(self.frame_rgb, self.target)
         if self.on_frame:
@@ -146,22 +159,56 @@ class CalibSession:
             self._thread.join(timeout=2)
 
     # ---- triggers ----
+    def _drift_mm(self) -> float:
+        """FK xy movement across two bus reads ~STILL_GAP_S apart. A sample pairs a camera frame with an
+        FK reading taken milliseconds later: if the arm is still drifting, the two describe different
+        poses and the sample is silently wrong by however far it moved -- the single biggest source of
+        the 15-20 mm outliers seen in real calibrations."""
+        with self._bus:
+            a = self.rig.fk_base_mm(self.rig.read_joints())
+        time.sleep(STILL_GAP_S)
+        with self._bus:
+            b = self.rig.fk_base_mm(self.rig.read_joints())
+        return float(np.linalg.norm(b[:2] - a[:2]))
+
     def capture(self) -> dict:
         with self._lock:
             if self.state != "running":
                 return _r(False, f"not running ({self.state})")
+            drift = self._drift_mm()
+            if drift > STILL_DRIFT_MM:
+                return _r(False, f"the arm is still moving ({drift:.1f} mm between two reads) -- let go, "
+                                 f"let it settle, then capture")
             _, det, fk = self._observe()
             if det is None:
                 return _r(False, "target not detected; adjust colour (click it in the HUD) or lighting")
             for s in self.samples:
                 if np.linalg.norm(np.array(s["base_mm"][:2]) - fk[:2]) < self.min_spacing:
                     return _r(False, f"too close to an existing sample (< {self.min_spacing:.0f} mm); move further")
-            self.samples.append({"px": (det[0], det[1]), "base_mm": tuple(float(v) for v in fk)})
+            self.samples.append({"px": (det[0], det[1]), "base_mm": tuple(float(v) for v in fk),
+                                 "tilt_deg": self.tilt})
             self._refit()
             n = len(self.samples)
             self.message = f"sample {n}: px=({det[0]:.0f},{det[1]:.0f}) base=({fk[0]:.0f},{fk[1]:.0f},{fk[2]:.0f}) mm" + (
-                f"  residual mean {self.res.mean():.2f} max {self.res.max():.2f} mm" if self.res is not None else f"  ({max(0, 4 - n)} more for a fit)")
+                f"  residual mean {self._res_in().mean():.2f} max {self._res_in().max():.2f} mm (fitted samples)"
+                if self.res is not None else f"  ({max(0, 4 - n)} more for a fit)")
             return _r(True, self.message, {"n": n})
+
+    def drop_worst(self) -> dict:
+        """Remove the sample the fit disagrees with most -- one bad capture (a nudged arm, a mis-detected
+        ball) drags the whole calibration, and re-running the entire session to shed it is needless."""
+        with self._lock:
+            if self.res is None or not len(self.samples):
+                return _r(False, "no fit yet (need 4+ samples)")
+            i = int(np.argmax(self.res))
+            worst = float(self.res[i])
+            if len(self.samples) <= 4:
+                return _r(False, f"only {len(self.samples)} samples; capture another before dropping one")
+            self.samples.pop(i)
+            self._refit()
+            self.message = f"dropped sample {i + 1} (was off by {worst:.1f} mm) -> {len(self.samples)} samples" + (
+                f", residual max now {self._res_in().max():.2f} mm" if self.res is not None else "")
+            return _r(True, self.message, {"n": len(self.samples), "dropped": i + 1})
 
     def undo(self) -> dict:
         with self._lock:
@@ -177,7 +224,11 @@ class CalibSession:
             with self._bus:
                 fk = self.rig.fk_base_mm(self.rig.read_joints())
             self.z_off = -float(fk[2])
-            self.message = f"table plane: base_link origin is {self.z_off:.1f} mm above the table"
+            # This measures the table HEIGHT (z) only -- how deep the gripper may go to grasp. The captured
+            # samples give the x/y mapping and say nothing about z... unless they were taken with the target
+            # on the table, in which case Finish derives the same number from them and this step is optional.
+            self.message = (f"table height set from the fingertip: base_link origin is {self.z_off:.1f} mm "
+                            f"above the table (optional -- Finish infers this from the samples otherwise)")
             return _r(True, self.message, {"z_offset_mm": self.z_off})
 
     def finish(self, force: bool = False) -> dict:
@@ -185,33 +236,67 @@ class CalibSession:
         self._join_teleop()  # outside the lock: the teleop thread needs it to see the stop flag
         return r
 
+    def _problems(self) -> list[str]:
+        """Everything that makes this sample set a bad basis for a single-plane homography, in plain words.
+        These are the failure modes that produce a fit which LOOKS fine (tiny residuals) but is metres off
+        in the real world -- so Finish reports them instead of silently saving."""
+        out = []
+        nin = len(self.samples) if self.inliers is None else int(self.inliers.sum())
+        if nin < 8:
+            # 8 DOF = 4 pairs. Below ~8 usable points the homography threads through them almost exactly
+            # no matter how bad they are, so it looks perfect here and bends anywhere else.
+            out.append(f"only {nin} usable samples for an 8-degree-of-freedom fit -- it is forced through "
+                       f"them (so the tiny residuals mean nothing) and is free to bend everywhere else; "
+                       f"capture 8+, spread wide")
+        px_now = [s["px"] for s in self.samples]
+        cov, ratio = coverage_pct(px_now, self.frame_wh), collinearity_ratio(px_now)
+        if ratio < 0.15:
+            out.append("the samples are nearly on one line")
+        elif cov < 10.0:
+            out.append(f"the samples cover only {cov:.0f}% of the camera view")
+        zs = np.array([s["base_mm"][2] for s in self.samples], float)
+        if len(zs) >= 2 and float(np.ptp(zs)) > Z_SPREAD_WARN_MM:
+            out.append(f"the target height varies by {np.ptp(zs):.0f} mm (this fit is a single flat plane -- "
+                       f"keep the target at one height, resting on the table)")
+        tl = [s.get("tilt_deg") for s in self.samples if s.get("tilt_deg") is not None]
+        if len(tl) >= 2 and (max(tl) - min(tl)) > TILT_SPREAD_WARN_DEG:
+            out.append(f"the gripper tilt varies by {max(tl) - min(tl):.0f} deg (the target then sits at a "
+                       f"different offset in each sample -- keep the gripper pointing straight down)")
+        if self.inliers is not None and not self.inliers.all():
+            bad = [i + 1 for i, ok in enumerate(self.inliers) if not ok]
+            out.append(f"sample(s) {bad} disagree with the others and were EXCLUDED from the fit "
+                       f"(worst {self.res.max():.0f} mm) -- drop and recapture them")
+        elif self.res is not None and len(self.res) and self.res.max() > RESID_WARN_MM:
+            out.append(f"sample {int(np.argmax(self.res)) + 1} is off by {self.res.max():.0f} mm")
+        return out
+
     def _finish_locked(self, force: bool = False) -> dict:
         with self._lock:
             if self.state != "running":
                 return _r(False, f"not running ({self.state})")
             if len(self.samples) < 4:
                 return _r(False, f"need >= 4 samples, have {len(self.samples)}")
-            px_now = [s["px"] for s in self.samples]
-            cov = coverage_pct(px_now, self.frame_wh)
-            ratio = collinearity_ratio(px_now)
-            if not force and (cov < 10.0 or ratio < 0.15):
-                # a clustered/near-collinear fit LOOKS fine in residual but extrapolates garbage off-hull
+            self._refit()
+            cov = coverage_pct([s["px"] for s in self.samples], self.frame_wh)
+            probs = self._problems()
+            if probs and not force:
                 sig = (len(self.samples), None if self.z_off is None else round(float(self.z_off), 3))
                 if getattr(self, "_finish_blocked_sig", None) == sig:
                     force = True  # a second Finish with nothing changed is the operator's override
                 else:
                     self._finish_blocked_sig = sig
-                    why = ("samples are nearly on one line" if ratio < 0.15
-                           else f"samples cover only {cov:.0f}% of the camera view")
-                    self.message = (f"not saved: {why} — the fit would be way off everywhere else. "
-                                    f"Capture more spread-out samples (aim for the corners), or press "
-                                    f"Finish again to save anyway.")
-                    return _r(False, self.message, {"force_needed": True, "coverage_pct": round(cov, 1),
-                                                    "collinearity": round(ratio, 3)})
+                    self.message = ("not saved -- " + "; ".join(probs)
+                                    + ". Fix those (Drop worst / capture more), or press Finish again to save anyway.")
+                    return _r(False, self.message, {"force_needed": True, "problems": probs,
+                                                    "coverage_pct": round(cov, 1)})
+            zs = np.array([s["base_mm"][2] for s in self.samples], float)
             if self.z_off is None:
-                print("[calibrate] no touch-table step: assuming base_link origin is on the table plane (z offset 0)")
-                self.z_off = 0.0
-            self._refit()
+                # No touch-table step. The samples themselves ARE at the table when the target rests on
+                # it (the normal way to calibrate), so take the table height from them instead of the old
+                # "assume base_link sits exactly on the table" guess, which was silently wrong by cm.
+                self.z_off = -float(zs.mean())
+                print(f"[calibrate] no touch-table step: taking the table height from the samples "
+                      f"({self.z_off:.1f} mm) -- correct if the target rested on the table for every one")
             if self.H is None:
                 return _r(False, self.message or "fit failed; capture more spread-out samples")
             px, mm = self._arrays()
@@ -219,11 +304,15 @@ class CalibSession:
             save_ball_calib(self.out, self.H, px, mm[:, :2], self.res, plane_z, self.target, self.z_off,
                             method="teleop", frame_wh=self.frame_wh)
             self.state = "fitted"
-            self.message = (f"fitted {len(px)} pts: residual mean {self.res.mean():.2f} max {self.res.max():.2f} mm, "
-                            f"coverage {cov:.0f}%, plane z {plane_z:.0f} mm -> {self.out} (previous kept as .bak)")
+            rin, nin = self._res_in(), int(self.inliers.sum()) if self.inliers is not None else len(px)
+            self.message = (f"fitted {nin}/{len(px)} samples: residual mean {rin.mean():.2f} max {rin.max():.2f} mm, "
+                            f"coverage {cov:.0f}%, plane {plane_z:+.0f} mm from the table -> {self.out} "
+                            f"(previous kept as .bak)")
+            if probs:
+                self.message += "  [saved with warnings: " + "; ".join(probs) + "]"
             self._stop_teleop()
             return _r(True, self.message, {"residuals_mm": self.res.tolist(), "plane_z_mm": plane_z,
-                                           "coverage_pct": round(cov, 1)})
+                                           "coverage_pct": round(cov, 1), "problems": probs})
 
     def cancel(self) -> dict:
         with self._lock:
@@ -254,15 +343,23 @@ class CalibSession:
             return _r(det is not None, self.message, {"target": cand.to_dict(), "det": det})
 
     # ---- fit / status ----
+    def _res_in(self) -> np.ndarray:
+        """Residuals of the FITTED (inlier) samples: reporting a mean mixed with RANSAC-rejected points
+        makes a good fit look terrible and hides which samples were actually ignored."""
+        if self.res is None:
+            return np.zeros(0)
+        m = self.inliers if self.inliers is not None else np.ones(len(self.res), bool)
+        return self.res[m] if m.any() else self.res
+
     def _arrays(self):
         return np.array([s["px"] for s in self.samples], float), np.array([s["base_mm"] for s in self.samples], float)
 
     def _refit(self) -> None:
-        self.H = self.res = None
+        self.H = self.res = self.inliers = None
         if len(self.samples) >= 4:
             px, mm = self._arrays()
             try:
-                self.H, self.res = fit_px_to_mm(px, mm[:, :2])
+                self.H, self.res, self.inliers = fit_px_to_mm(px, mm[:, :2])
             except Exception as e:  # noqa: BLE001
                 self.message = f"fit failed: {e}"
 
@@ -275,15 +372,21 @@ class CalibSession:
         cov = coverage_pct(px, self.frame_wh)
         res = None if self.res is None else [round(float(r), 2) for r in self.res]
         worst_i = None if not res else int(np.argmax(self.res))
-        med = None if not res else float(np.median(self.res))
-        outliers = [] if not res else [i for i, r in enumerate(self.res)
-                                       if med is not None and med > 1e-6 and r > 3.0 * med]
+        # samples RANSAC threw out: the honest answer to "why is it inaccurate"
+        outliers = [] if self.inliers is None else [i for i, ok in enumerate(self.inliers) if not ok]
+        rin = self._res_in()
+        zs = np.array([q["base_mm"][2] for q in self.samples], float)
+        tl = [q.get("tilt_deg") for q in self.samples if q.get("tilt_deg") is not None]
         return {"state": self.state, "message": self.message, "n": len(self.samples),
                 "fk_mm": None if self.fk is None else [round(float(v), 1) for v in self.fk],
                 "det": None if self.det is None else [round(float(v), 1) for v in self.det],
-                "residual_mean_mm": None if self.res is None else round(float(self.res.mean()), 2),
-                "residual_max_mm": None if self.res is None else round(float(self.res.max()), 2),
+                "residual_mean_mm": None if not rin.size else round(float(rin.mean()), 2),
+                "residual_max_mm": None if not rin.size else round(float(rin.max()), 2),
                 "residuals_mm": res, "worst_i": worst_i, "outlier_i": outliers,
+                "n_fitted": None if self.inliers is None else int(self.inliers.sum()),
+                "z_spread_mm": None if len(zs) < 2 else round(float(np.ptp(zs)), 1),
+                "tilt_spread_deg": None if len(tl) < 2 else round(float(max(tl) - min(tl)), 1),
+                "problems": self._problems() if len(self.samples) >= 4 else [],
                 "coverage_pct": round(cov, 1), "coverage_verdict": coverage_verdict(cov),
                 "z_offset_mm": self.z_off, "target": self.target.to_dict(),
                 "samples": [[round(v, 1) for v in (*s["px"], *s["base_mm"])] for s in self.samples]}
@@ -306,17 +409,21 @@ class CalibSession:
         hull = sample_hull_px(px)
         if hull is not None:
             cv2.polylines(img, [hull.round().astype(np.int32).reshape(-1, 1, 2)], True, (255, 200, 0), 1, cv2.LINE_AA)
-        worst_i = None if self.res is None or not len(self.res) else int(np.argmax(self.res))
         for i, s in enumerate(self.samples):
-            col = (255, 60, 60) if i == worst_i and self.res is not None and self.res[worst_i] > 3.0 else (255, 200, 0)
+            rejected = self.inliers is not None and i < len(self.inliers) and not self.inliers[i]
+            col = (255, 60, 60) if rejected else (255, 200, 0)
             cv2.circle(img, _ip(s["px"]), 5, col, -1)
-            cv2.putText(img, str(i + 1), (_ip(s["px"])[0] + 6, _ip(s["px"])[1] - 4),
+            if rejected:  # ring it: this sample was EXCLUDED from the fit
+                cv2.circle(img, _ip(s["px"]), 10, col, 2)
+            lbl = str(i + 1) + (f" {self.res[i]:.0f}mm" if self.res is not None and i < len(self.res) and rejected else "")
+            cv2.putText(img, lbl, (_ip(s["px"])[0] + 8, _ip(s["px"])[1] - 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1, cv2.LINE_AA)
         if self.det:
             cv2.circle(img, _ip(self.det), int(self.det[2]), (0, 255, 0), 2)
         cov = coverage_pct(px, self.frame_wh)
+        rin = self._res_in()
         txt = f"{self.state} n={len(self.samples)} coverage {cov:.0f}%" + (
-            f" res {self.res.mean():.1f}/{self.res.max():.1f}mm" if self.res is not None else "")
+            f" res {rin.mean():.1f}/{rin.max():.1f}mm" if rin.size else "")
         cv2.putText(img, txt, (8, img.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1, cv2.LINE_AA)
         return img
 
@@ -445,8 +552,14 @@ class CalibController:
         g = "calibration"
         hud.register("calib_start", self.start, "Start calibration", g,
                      help="Begin the teleoperated calibration: the leader arm drives the follower while you capture samples (target ball in the gripper first).")
-        hud.register("calib_touch", lambda: self.trigger("touch_table"), "Touch table", g,
-                     help="With the fingertip resting on the tabletop, record the table height (once per calibration).")
+        hud.register("calib_touch", lambda: self.trigger("touch_table"), "Set table height (optional)", g,
+                     help="Measures only the TABLE HEIGHT (how deep the gripper may go), with the fingertip resting "
+                          "on the tabletop. The captured samples give the x/y mapping and say nothing about height "
+                          "-- but if you capture them with the target resting on the table, Finish derives the same "
+                          "number from them and you can skip this.")
+        hud.register("calib_drop_worst", lambda: self.trigger("drop_worst"), "Drop worst sample", g,
+                     help="Remove the sample the fit disagrees with most (one nudged or mis-detected capture drags "
+                          "the whole calibration). Re-fits immediately.")
         hud.register("calib_capture", lambda: self.trigger("capture"), "Capture", g,
                      help="Capture a sample: pairs the target's pixel position with the arm's FK position (spacebar). Need 4+, spread out.")
         hud.register("calib_undo", lambda: self.trigger("undo"), "Undo", g,

@@ -238,6 +238,12 @@ def test_hud_actions() -> None:
         c = get("/state")["calibration"]
         assert c["n"] >= 4 and c["residual_mean_mm"] is not None and c["residual_mean_mm"] < 3.0, c
         assert c["coverage_pct"] > 10 and c["coverage_verdict"], c  # live sample-coverage feedback
+        # sample-quality reporting: how many samples the fit actually USED, and the consistency spreads
+        assert c["n_fitted"] is not None and c["n_fitted"] >= 4, c
+        assert c["z_spread_mm"] is not None and c["tilt_spread_deg"] is not None, c
+        assert isinstance(c["problems"], list), c
+        assert c["residual_mean_mm"] < 3.0, c  # reported over the FITTED samples, not mixed with rejects
+        assert "calib_drop_worst" in {a["name"] for a in get("/actions")}
         assert isinstance(c.get("residuals_mm"), list) and c.get("worst_i") is not None, c
         assert c.get("loaded") and "points" in c["loaded"], c  # persistence made obvious once not running
         assert session._calib_out is not None and session._calib_out.exists()

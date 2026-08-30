@@ -367,10 +367,10 @@ const DEVICES=[
 const GUIDE=[
  'Put the green ball (or any bright object) in the gripper, then <b>click it in the overhead image</b>. A green circle confirms the target is locked.',
  'Press <b>Start calibration</b> &mdash; the leader arm now drives the follower. Move it gently by hand.',
- 'Move the ball somewhere over the mat, hold it still, press <b>Capture</b> (spacebar).',
- 'Repeat at <b>6+ spots spread across the whole camera view</b> &mdash; not a line, aim for the corners (numbered dots + coverage % show on the image; the fitted cm grid appears live after 4 samples &mdash; check it lines up with the table). Residual under 5 mm is good: <span id="g-res">no fit yet</span>.',
- 'Rest the fingertip on the table and press <b>Touch table</b> (records the table height).',
- 'Press <b>Finish</b> to save. <b>Cancel</b> writes nothing.'];
+ 'Rest the target <b>on the table</b>, <b>let go and let it settle</b>, then press <b>Capture</b> (spacebar). A capture taken while the arm is still drifting is rejected &mdash; that is the #1 source of bad samples.',
+ 'Repeat at <b>8 or more spots spread across the whole camera view</b> &mdash; not a line, aim for the corners. A homography has 8 degrees of freedom, so with only 4&ndash;5 points it threads through them exactly and tiny residuals mean <i>nothing</i>; 8+ is what makes the number real. Keep the gripper pointing straight down and the target at the same height throughout. Live: <span id="g-res">no fit yet</span>. Red ringed dots were excluded from the fit &mdash; <b>Drop worst sample</b> removes one.',
+ '<i>Optional:</i> <b>Set table height</b> &mdash; only needed if you did <i>not</i> capture with the target on the table. It measures the table height (grasp depth) and nothing else; the captures give the x/y mapping, and if they were taken on the table Finish reads the height off them.',
+ 'Press <b>Finish</b> to save (it refuses a fit it can tell is bad, and tells you why). <b>Cancel</b> writes nothing.'];
 let ACT={},actsig='',S={},curTab='setup';
 let ring=null,frameW=640,frameH=480,haveWH=false,dropZone=null,zoneSig='',rulesSig='',logSig='',tickerSig='';
 // Frame size for px scaling: prefer the live size from /state (haveWH) — an <img> on an mjpeg stream can keep
@@ -416,7 +416,7 @@ function buildConn(){$('connrows').innerHTML=DEVICES.map(([k,a,t,d])=>
   act(b.dataset.ca,{connect:!on},b);});}
 function buildCalib(){
  $('calguide').innerHTML=GUIDE.map(g=>'<li>'+g+'</li>').join('');
- const order=['calib_start','calib_capture','calib_touch','calib_undo','calib_finish','calib_cancel'];
+ const order=['calib_start','calib_capture','calib_undo','calib_drop_worst','calib_touch','calib_finish','calib_cancel'];
  const rows=order.filter(n=>ACT[n]&&ACT[n].label).map(n=>ACT[n]);
  $('calbtns').innerHTML=rows.map(a=>
   '<button class="btn'+(a.name==='calib_start'?' primary':'')+(a.name==='calib_capture'?' big':'')+'" data-n="'+esc(a.name)+
@@ -644,11 +644,11 @@ function renderGuide(cal){
  let cur=-1;const done=[];
  if(cal&&cal.state==='running'){const n=cal.n||0,locked=targetLocked||!!cal.det||n>0;
   done.push(0);if(locked)done.push(1);
+  if(cal.z_offset_mm!=null)done.push(4);
   if(!locked)cur=0;
   else if(n===0)cur=2;
-  else if(n<6){done.push(2);cur=3;}
-  else if(cal.z_offset_mm==null){done.push(2,3);cur=4;}
-  else{done.push(2,3,4);cur=5;}}
+  else if(n<8){done.push(2);cur=3;}
+  else{done.push(2,3);cur=5;}}
  else if(cal&&cal.state==='fitted'){for(let i=0;i<6;i++)done.push(i);}
  else cur=targetLocked?1:0;
  for(let i=0;i<lis.length;i++){lis[i].classList.toggle('cur',i===cur);
@@ -747,9 +747,13 @@ async function tick(){let s;
  if(cal&&cal.state){
   const res=cal.residual_mean_mm!=null?('residual mean '+cal.residual_mean_mm+' / max '+cal.residual_max_mm+' mm'):'no fit yet (4+ samples)';
   const tgt=cal.target||{};
-  $('calstat').textContent='state '+cal.state+'   samples '+(cal.n??0)+'   '+res+
-   '\ntarget '+(tgt.name||'-')+'   z offset '+(cal.z_offset_mm==null?'not measured':cal.z_offset_mm.toFixed(1)+' mm')+
-   (cal.coverage_pct!=null&&cal.state==='running'?('\ncoverage '+cal.coverage_pct+'% - '+(cal.coverage_verdict||'')):'')+
+  const fit=cal.n_fitted!=null?(cal.n_fitted+'/'+(cal.n??0)+' used in the fit'):((cal.n??0)+' samples');
+  const spread=[cal.z_spread_mm!=null?('height spread '+cal.z_spread_mm+' mm'):'',
+                cal.tilt_spread_deg!=null?('tilt spread '+cal.tilt_spread_deg+' deg'):''].filter(Boolean).join('   ');
+  $('calstat').textContent='state '+cal.state+'   '+fit+'   '+res+
+   '\ntarget '+(tgt.name||'-')+'   table height '+(cal.z_offset_mm==null?'from the samples (optional step skipped)':cal.z_offset_mm.toFixed(1)+' mm')+
+   (cal.coverage_pct!=null&&cal.state==='running'?('\ncoverage '+cal.coverage_pct+'% - '+(cal.coverage_verdict||'')+(spread?('   '+spread):'')):'')+
+   ((cal.problems&&cal.problems.length)?('\n! '+cal.problems.join('\n! ')):'')+
    '\n'+(cal.message||'')+(cal.loaded?('\n'+cal.loaded):'');
   renderGuide(cal);
   if(cal.state==='running'){ring=cal.det||null;drawRing();}}

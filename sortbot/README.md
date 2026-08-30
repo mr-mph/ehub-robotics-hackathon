@@ -188,23 +188,36 @@ the HUD of a running `main` with the robot connected. A background thread teleop
    `config.yaml calibration.target`. Among same-coloured blobs the roundest large one wins.
 2. **Touch table** (once): rest the fingertip on the table and press *Touch table* / `t`. FK z there is the table
    plane -> `base_z_offset_mm` (the only non-identity part of `table_T_base`). Skipped = 0 (or the previous value).
-3. **Capture** (`space`) at >= 4 well-spread positions (>= 15 mm apart, `min_sample_spacing_mm`); ~8 spread
-   across the WHOLE camera view is good — aim for the corners. Each sample pairs the target's pixel centroid
-   with the FK base xyz; after 4 samples the homography is refitted on every capture, the residuals + a
-   **coverage %** (convex hull of the samples / frame area, with a plain-language verdict) are shown live,
-   every sample is drawn as a numbered dot with the hull outline (worst residual in red — *Undo* it), and the
-   **fitted cm grid renders live on the image** so you can see whether the projection lines up with the table.
-4. **Finish** (`enter`): RANSAC fit `H_px_to_mm`, per-point residual table, written to `calib/calib.json`
+3. **Capture** (`space`) at **8 or more** well-spread positions (>= 15 mm apart, `min_sample_spacing_mm`),
+   with the target **resting on the table**, the **gripper pointing straight down**, and the arm **let go of
+   and settled** — a capture taken while the arm is still drifting is rejected (the frame and the FK reading
+   would describe different poses; this was the source of the 15-20 mm outliers seen in practice).
+   Why 8: a homography has **8 degrees of freedom**, so 4-5 point pairs are threaded through *exactly*
+   whatever the data says — a sub-millimetre residual there is arithmetic, not accuracy, and the fit is free
+   to bend anywhere else. Each sample pairs the target's pixel centroid with the FK base xyz; after 4 the
+   homography refits on every capture and the live view shows numbered sample dots, the sample hull, a
+   **coverage %**, the height/tilt spread, and the **fitted cm grid** so you can see the projection against
+   the real table. Samples RANSAC excluded from the fit are ringed in red with their error — ***Drop worst
+   sample*** removes the worst one and refits; *Undo* (`u`) drops the last.
+4. **Set table height** (`t`) — **optional**. It measures only the table height (how deep the gripper may go
+   to grasp), by resting the fingertip on the tabletop. The captures give the x/y mapping and say nothing
+   about height — *but if you captured them with the target on the table, Finish reads the height straight
+   off them*, so you can skip this step entirely. (That is why it looks redundant: in the normal workflow it
+   is.)
+5. **Finish** (`enter`): RANSAC fit `H_px_to_mm`, per-point residual table, written to `calib/calib.json`
    together with `plane_z_mm`, `target`, `method: "teleop"`, `points`, `residuals_mm`, `frame_wh` and
-   `saved_at`; the previous file is kept as `calib.json.bak`. Clustered (< 10% coverage) or near-collinear
-   sample sets are refused with an explanation — press Finish again (or pass `force`) to save anyway; those
-   fits look fine in residual but extrapolate garbage off-hull. *Cancel* (`q`) writes nothing. The leader is
-   released and the loop resumes with the reloaded homography.
+   `saved_at`; the previous file is kept as `calib.json.bak`. Finish **refuses a fit it can tell is bad** and
+   says which of these is wrong — too few usable points for 8 DOF, < 10% coverage, near-collinear samples,
+   varying target height, varying gripper tilt, or samples excluded by RANSAC — press Finish again (or pass
+   `force`) to save anyway. *Cancel* (`q`) writes nothing. The leader is released and the loop resumes with
+   the reloaded homography.
 
 The calibration **persists**: it is written only on Finish, auto-loads on startup (a summary line —
 points / residuals / coverage / age — is logged and shown in the Setup tab), and nothing else ever
-overwrites it. At runtime the sampled area is drawn as a subtle outline on the overlay and coordinates
-outside it (+20% margin) are refused ("outside the calibrated area — recalibrate with wider coverage"),
+overwrites it. At runtime the calibration's own anchor points are drawn on the overlay (small diamonds, `c1`, `c2`, ...)
+next to the sampled-area outline -- the grid is pinned at those anchors and interpolated everywhere else, so
+a visible mismatch tells you immediately whether the fit is bad or you are simply far from any anchor.
+Coordinates outside the sampled area (+20% margin) are refused ("outside the calibrated area — recalibrate with wider coverage"),
 because the homography is only trustworthy where it was sampled.
 
 After that the **table frame is the base frame** in xy (x fwd, y left, mm). `H` is exact for object centroids at

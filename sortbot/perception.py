@@ -59,10 +59,13 @@ def render_overlay(
     rules: list[str] = (),
     grid_mm: float = 50.0,
     calib_region_px: np.ndarray | None = None,
+    calib_samples_px=None,
 ) -> np.ndarray:
     """frame is RGB; returns an RGB copy annotated with a cm-labelled grid, zone outlines + names + drop
-    markers, the EE marker and the rules legend. calib_region_px: optional Nx2 polygon (overhead px) of
-    the area covered by the calibration samples — drawn as a subtle outline so it is visible where the
+    markers, the EE marker and the rules legend. calib_samples_px: optional Nx2 of the calibration's own
+    sample pixels, drawn as small anchors -- the grid is pinned there and interpolated everywhere else, so
+    they show at a glance whether a mismatch means 'bad fit' or 'far from any anchor'.
+    calib_region_px: optional Nx2 polygon (overhead px) of the area covered by the calibration samples — drawn as a subtle outline so it is visible where the
     px->cm mapping is trustworthy."""
     img = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
     h, w = img.shape[:2]
@@ -95,6 +98,10 @@ def render_overlay(
     if 0 <= og[0] < w and 0 <= og[1] < h:
         cv2.drawMarker(img, tuple(map(int, og)), _BGR["axis"], cv2.MARKER_TILTED_CROSS, 16, 2)
         _put(img, "base (0,0)", (int(og[0]) + 8, int(og[1]) - 6), _BGR["axis"])
+    if calib_samples_px is not None and len(calib_samples_px):
+        for i, (su, sv) in enumerate(np.asarray(calib_samples_px, float).reshape(-1, 2), 1):
+            cv2.drawMarker(img, (int(round(su)), int(round(sv))), _BGR["hull"], cv2.MARKER_DIAMOND, 9, 1)
+            _put(img, f"c{i}", (int(round(su)) + 6, int(round(sv)) + 12), _BGR["hull"], 0.34)
     if calib_region_px is not None and len(calib_region_px) >= 3:
         pts = np.asarray(calib_region_px, np.float64).round().astype(np.int32).reshape(-1, 1, 2)
         cv2.polylines(img, [pts], True, _BGR["hull"], 1, cv2.LINE_AA)

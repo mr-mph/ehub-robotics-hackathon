@@ -85,7 +85,12 @@ def calib_summary(d: dict) -> str | None:
     res = np.asarray(d.get("residuals_mm") or [], float)
     parts = [f"calibration loaded: {len(pts)} points"]
     if res.size:
+        used = int((res <= 5.0).sum())
         parts.append(f"residual mean {res.mean():.1f} / max {res.max():.1f} mm")
+        if used < 8:
+            # 8 DOF = 4 pairs: at 4-7 usable points the fit passes through them almost exactly whatever
+            # the data says, so a tiny residual is arithmetic, not accuracy. Say so instead of implying 
+            parts.append(f"only ~{used} usable for an 8-DOF fit (residuals prove little -- capture 8+)")
     if d.get("frame_wh"):
         parts.append(f"coverage {coverage_pct(pts, d['frame_wh']):.0f}%")
     if d.get("saved_at"):
@@ -121,6 +126,7 @@ class TableHomography:
         self.H_inv: np.ndarray | None = None
         self.H_fixed: np.ndarray | None = None
         self.region_px: np.ndarray | None = None  # sample hull: where the fitted H is trustworthy
+        self.samples_px: np.ndarray | None = None  # the fit's own anchor points (drawn on the overlay)
         self.summary: str | None = None  # human line about the loaded calibration (or None)
         self.last_centers_px: dict[int, tuple[float, float]] = {}
         self.method = "aruco"  # which source produced self.H
@@ -133,7 +139,9 @@ class TableHomography:
         obvious the saved calibration persisted and was picked up."""
         d = load_calib_dict(path or self.cfg.calib_file)
         self.H_fixed = d.get("H_px_to_mm")
-        self.region_px = sample_hull_px((d.get("points") or {}).get("px") or [])
+        pts_px = (d.get("points") or {}).get("px") or []
+        self.region_px = sample_hull_px(pts_px)
+        self.samples_px = np.asarray(pts_px, float).reshape(-1, 2) if pts_px else None
         self.summary = calib_summary(d)
         if self.summary:
             print(f"[calibration] {self.summary}")
@@ -315,18 +323,22 @@ def detect_ball(frame_rgb: np.ndarray, hsv_lo=BALL_HSV_LO, hsv_hi=BALL_HSV_HI, m
     return detect_target(frame_rgb, ColorTarget(hsv_lo, hsv_hi), min_r_px)
 
 
-def fit_px_to_mm(px, mm, ransac_thresh_mm: float = 5.0) -> tuple[np.ndarray, np.ndarray]:
-    """Homography overhead px -> table mm from paired points (Nx2 each), RANSAC. Returns (H, residuals_mm)."""
+def fit_px_to_mm(px, mm, ransac_thresh_mm: float = 5.0) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Homography overhead px -> table mm from paired points (Nx2 each), RANSAC.
+    Returns (H, residuals_mm, inlier_mask). The mask matters: RANSAC silently drops samples that do not
+    fit, so a fit can look perfect on 5 points while 2 rejected ones sit 17 mm out -- the caller must be
+    able to SAY which samples were ignored instead of reporting a mean residual mixed from both groups."""
     px, mm = np.asarray(px, np.float64).reshape(-1, 2), np.asarray(mm, np.float64).reshape(-1, 2)
     if len(px) < 4:
         raise ValueError(f"need >= 4 points for a homography, got {len(px)}")
     if len(px) < 6:
         print(f"[calibration] warning: only {len(px)} points; fit is unverified (no redundancy)")
-    H, _ = cv2.findHomography(np.float32(px), np.float32(mm), cv2.RANSAC, ransac_thresh_mm)
+    H, mask = cv2.findHomography(np.float32(px), np.float32(mm), cv2.RANSAC, ransac_thresh_mm)
     if H is None:
         raise RuntimeError("findHomography failed (degenerate points?)")
     proj = cv2.perspectiveTransform(px.reshape(-1, 1, 2), H).reshape(-1, 2)
-    return H, np.linalg.norm(proj - mm, axis=1)
+    inliers = np.ones(len(px), bool) if mask is None else mask.ravel().astype(bool)
+    return H, np.linalg.norm(proj - mm, axis=1), inliers
 
 
 def ball_table_xy(homog: TableHomography, u: float, v: float, ball_radius_mm: float,
@@ -484,9 +496,14 @@ def _selftest() -> None:
     Ht = np.array([[-0.5, 0.01, 400.0], [0.02, -0.52, 190.0], [1e-5, 2e-5, 1.0]])
     pxs = np.random.default_rng(1).uniform([50, 50], [600, 400], (9, 2))
     mms = cv2.perspectiveTransform(pxs.reshape(-1, 1, 2), Ht).reshape(-1, 2)
-    Hf, res = fit_px_to_mm(pxs, mms + np.random.default_rng(2).normal(0, 0.2, mms.shape))
+    Hf, res, inl = fit_px_to_mm(pxs, mms + np.random.default_rng(2).normal(0, 0.2, mms.shape))
+    assert inl.all(), inl  # clean synthetic data: nothing may be silently dropped
     chk = np.array([[100.0, 100.0], [500.0, 350.0]]).reshape(-1, 1, 2)
     assert res.max() < 1.0 and np.allclose(cv2.perspectiveTransform(chk, Hf), cv2.perspectiveTransform(chk, Ht), atol=1.0), (res, Hf)
+    bad = mms.copy()
+    bad[2] += 40.0  # one wrecked sample must be REPORTED as an outlier, not quietly averaged in
+    _, res_b, inl_b = fit_px_to_mm(pxs, bad)
+    assert not inl_b[2] and inl_b.sum() >= 6 and res_b[2] > 20.0, (inl_b, res_b)
     try:
         fit_px_to_mm(pxs[:3], mms[:3])
         raise AssertionError("accepted 3 points")

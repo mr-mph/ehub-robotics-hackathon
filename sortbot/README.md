@@ -31,8 +31,9 @@ the robot or the bus. Full contract: the MULTI-QUEUE block at the top of `main.p
 
 There is NO object detector: the VLM does the seeing itself. Loop: `home()` -> capture overhead + wrist ->
 composite the cached cm-grid overlay -> VLM reads the photos and emits ONE coordinate-based tool call
-(`pick_at(x_cm,y_cm)`, `place_at(x_cm,y_cm)`, `say(text)`, `done`; low-level
-`move_to/open_gripper/close_gripper/turn_to` for recovery) -> validate against the workspace envelope
+(`pick_at(x_cm,y_cm)`, `place_at(x_cm,y_cm)`, `say(text)`, `done`; wrist angle
+`turn_to(deg)` absolute / `turn_by(deg)` relative; low-level
+`move_to/open_gripper/close_gripper` for recovery) -> validate against the workspace envelope
 (rejections go back to the VLM as FAILED tool results) -> execute -> repeat. Voice corrections drain at the
 top of each iteration into a persistent RULES list sent with every prompt.
 
@@ -74,7 +75,9 @@ at the top of `main.py`; `SORTBOT_BUS_ASSERT=1` arms a proxy that fails loudly o
 
 * **Table frame**: mm, origin = robot base projected onto tabletop, x forward, y left, z up, table z=0.
 * **Base frame** (FK/IK): meters, `base_link` of the URDF. `table_T_base` (rigid, from calibration) converts.
-* End effector always points straight down; only `wrist_roll` changes via `turn_to(deg)`.
+* End effector always points straight down; only `wrist_roll` changes -- `turn_to(deg)` sets it absolutely,
+  `turn_by(deg)` nudges it relatively (both clamp to -90..90). Use them to square the jaws up with a long
+  or narrow object before picking it.
 * Joint order: shoulder_pan, shoulder_lift, elbow_flex, wrist_flex, wrist_roll, gripper.
 
 ## Running
@@ -146,7 +149,9 @@ to the VLM prompt as `GOAL: ...`). Runs are restartable from the page without re
 
 ROBOT group (all through the normal safety envelope; refused while the loop is running -- pause first):
 `home`, `open_gripper`, `close_gripper`, `jog(axis: x|y|z|roll, delta)` (mm, or degrees for roll),
-`goto(x, y, z)`, `set_z_trim(mm)` (grasp depth, see below), `torque_on`, and `torque_off` = **E-STOP** (always visible in the header):
+`goto(x, y, z)`, `set_wrist(deg)` (absolute wrist angle, -90..90; 0 = jaws square to the table x axis) and
+`adjust_wrist(delta)` (turn BY delta degrees from where it is now) -- both also on the Debug tab with
+±5/±15° nudges and a live readout, `set_z_trim(mm)` (grasp depth, see below), `torque_on`, and `torque_off` = **E-STOP** (always visible in the header):
 `bus.disable_torque()` plus a flag; every motion raises/returns a torque error until
 `torque_on`, and the loop is paused. `GET /state` carries `robot: {ee_pose, joints_deg, gripper_open, holding,
 torque, z_trim_mm, grasp_z_cm}`.

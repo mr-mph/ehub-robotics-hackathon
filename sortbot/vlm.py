@@ -39,7 +39,14 @@ TOOLS: list[dict] = [
     ("close_gripper", "Low-level recovery: close the gripper.", {}),
     ("move_to", "Low-level recovery: move the end effector to table-frame x, y, z (cm).",
      {"x_cm": {"type": "number"}, "y_cm": {"type": "number"}, "z_cm": {"type": "number"}}),
-    ("turn_to", "Low-level recovery: rotate the wrist roll to <deg>.", {"deg": {"type": "number"}}),
+    ("turn_to", "Set the wrist angle: rotate the wrist roll to an ABSOLUTE angle in degrees "
+                "(-90..90, 0 = jaws square to the table's x axis). Use it to line the jaws up with a "
+                "long or narrow object before picking it.",
+     {"deg": {"type": "number"}}),
+    ("turn_by", "Adjust the wrist angle: rotate the wrist roll BY <deg> degrees relative to where it is "
+                "now (positive = counter-clockwise seen from above). Small nudges to square up on an "
+                "object; the resulting angle must stay within -90..90.",
+     {"deg": {"type": "number"}}),
     ("say", "Speak a short message to the human. Use sparingly (questions, ambiguity, finish).",
      {"text": {"type": "string"}}),
     ("done", "Finish: nothing sensible left to sort. Give a one-line summary.", {"summary": {"type": "string"}}),
@@ -95,8 +102,9 @@ jaws are centred on the object, nudges itself if not, and ABORTS with "alignment
 tries: ..." rather than closing on nothing. Treat that failure as "I could not see it well enough there":
 re-read the photos and try a corrected coordinate, or pick something else.
 RULES from the human override everything else and must always be respected.
-Prefer pick_at / place_at; use move_to / open_gripper / close_gripper / turn_to only to
-recover from a failure."""
+Prefer pick_at / place_at. turn_to (absolute wrist angle) and turn_by (relative nudge) are there to square
+the jaws up with a long or narrow object before picking it; use move_to / open_gripper / close_gripper only
+to recover from a failure."""
 
 
 CHAT_SYSTEM = """You are Luna, the voice of a small tabletop robot arm that tidies objects on a table.
@@ -331,7 +339,7 @@ def _selftest() -> None:
             break
     assert seq == ["pick_at", "place_at", "pick_at", "place_at", "done"], seq
     assert {t["name"] for t in TOOLS} == {"pick_at", "place_at", "open_gripper", "close_gripper",
-                                          "move_to", "turn_to", "say", "done"}, [t["name"] for t in TOOLS]
+                                          "move_to", "turn_to", "turn_by", "say", "done"}, [t["name"] for t in TOOLS]
     for gone in ("pick", "place_in_zone"):
         assert not any(t["name"] == gone for t in TOOLS), f"{gone} must be gone"
     st = _state_text(world, hist)

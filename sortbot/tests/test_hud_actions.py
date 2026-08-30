@@ -78,6 +78,7 @@ def test_hud_actions() -> None:
                             ("stop", "run"), ("step_once", "run"), ("set_max_steps", "run"), ("set_task", "run"),
                             ("home", "robot"), ("open_gripper", "robot"), ("close_gripper", "robot"),
                             ("jog", "robot"), ("goto", "robot"), ("torque_off", "robot"), ("torque_on", "robot"),
+                            ("set_wrist", "robot"), ("adjust_wrist", "robot"),
                             ("say_to_robot", "voice"), ("calib_start", "calibration")):
             assert name in acts and acts[name]["group"] == group, (name, acts.get(name))
         assert [p["name"] for p in acts["jog"]["params"]] == ["axis", "delta"]
@@ -117,6 +118,17 @@ def test_hud_actions() -> None:
         assert post("jog", {"axis": "roll", "delta": 15})["ok"]
         assert abs(get("/state")["robot"]["ee_pose"]["roll_deg"] - 15) < 1
         assert post("jog", {"axis": "roll", "delta": -15})["ok"]
+        # --- wrist angle: absolute set + relative adjust ---
+        assert post("set_wrist", {"deg": 40})["ok"]
+        assert abs(get("/state")["robot"]["ee_pose"]["roll_deg"] - 40) < 1.0, get("/state")["robot"]
+        r = post("adjust_wrist", {"delta": -25})
+        assert r["ok"] and r["data"]["roll_deg"] == 15.0, r
+        assert abs(get("/state")["robot"]["ee_pose"]["roll_deg"] - 15) < 1.0, get("/state")["robot"]
+        assert post("adjust_wrist")["ok"]  # default nudge
+        assert not post("set_wrist", {"deg": 200})["ok"], "the wrist range must be enforced"
+        assert not post("set_wrist", {"deg": "sideways"})["ok"]
+        assert not post("adjust_wrist", {"delta": 400})["ok"]
+        assert post("set_wrist", {"deg": 0})["ok"]
         assert not post("jog", {"axis": "warp", "delta": 5})["ok"]
         assert post("close_gripper")["ok"] and get("/state")["robot"]["gripper_open"] is False
         assert post("open_gripper")["ok"] and get("/state")["robot"]["gripper_open"] is True
@@ -403,7 +415,8 @@ def test_hud_actions() -> None:
                      "Not a straight line",
                      # the conversation panel, the grasp verdict and the grasp-depth trim control
                      'id="chatlog"', "Talk to Luna", 'id="graspnote"', 'id="sec-ztrim"', 'id="znudge"',
-                     'id="zgrasp"', "openai_chat", "openai_verify"):
+                     'id="zgrasp"', "openai_chat", "openai_verify",
+                     'id="wnudge"', 'id="b-wset"', 'id="wcur"'):
             assert frag in page, f"page missing {frag!r}"
 
         # --- CONVERSATION: transcript + chat/verify model slots + the grasp verdict in /state ---

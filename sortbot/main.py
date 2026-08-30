@@ -85,7 +85,7 @@ from sortbot.voice import RulesStore, VoiceIO, bare_command, classify, urgent_ki
 log = logging.getLogger("sortbot.main")
 
 HIGH_LEVEL = {"pick_at", "place_at", "done", "say"}
-LOW_LEVEL = {"move_to", "open", "close", "turn_to"}
+LOW_LEVEL = {"move_to", "open", "close", "turn_to", "turn_by"}
 
 # ============================== UNIT BOUNDARY (cm <-> mm) ==============================
 # The VLM surface (tool args, overlay grid labels, prompt state, history, rejection messages) is
@@ -610,8 +610,10 @@ class Loop:
             if not ok:
                 return ExecResult(False, msg)
             return r.close_gripper()
-        if t == "turn_to":
+        if t == "turn_to":  # absolute wrist angle
             return r.turn_to(float(a["deg"]))
+        if t == "turn_by":  # relative: r.roll_deg is the tracked wrist angle, no bus read needed
+            return r.turn_to(float(getattr(r, "roll_deg", 0.0)) + float(a["deg"]))
         if t == "say":
             self.last_say = str(a.get("text", ""))
             self.voice.speak(self.last_say)
@@ -1038,6 +1040,12 @@ class Session:
                    help="Nudge the arm along one axis (axis: x|y|z|roll; delta in mm, degrees for roll), through the safety envelope.")
         h.register("goto", self.goto, "Go to", "robot",
                    help="Move the gripper to table-frame (x, y, z) mm, through the safety envelope.")
+        h.register("set_wrist", self.set_wrist, "Set wrist angle", "robot",
+                   help="Set the wrist angle to an ABSOLUTE value in degrees (-90..90; 0 = jaws square to "
+                        "the table x axis). Use it to line the jaws up with a long object before picking it.")
+        h.register("adjust_wrist", self.adjust_wrist, "Adjust wrist angle", "robot",
+                   help="Turn the wrist BY this many degrees from where it is now (positive = "
+                        "counter-clockwise seen from above); the result must stay within -90..90.")
         h.register("torque_off", self.torque_off, "E-STOP (torque off)", "robot", params=[],
                    help="E-STOP: cut motor torque immediately and pause the run; all motion is refused until torque_on.")
         h.register("set_z_trim", self.set_z_trim, "Set grasp depth trim", "robot",
@@ -1604,6 +1612,31 @@ class Session:
                                        f"{zg / 10:.2f} cm ({zg:.1f} mm); {persisted}.{warn}",
                 "data": {"z_trim_mm": v, "grasp_z_mm": round(zg, 1), "grasp_z_cm": round(zg / 10.0, 2),
                          "large_trim": bool(warn), "hard_floor_mm": round(robot_mod.hard_floor_mm(self.cfg), 1)}}
+
+    def set_wrist(self, deg: float) -> dict:
+        """Absolute wrist angle, through the normal safety envelope (robot.turn_to clamps to -90..90)."""
+        try:
+            d = float(deg)
+        except (TypeError, ValueError):
+            return {"ok": False, "message": f"deg must be a number, got {deg!r}", "data": None}
+        r = self._robot_act(lambda rb: rb.turn_to(d))
+        if r["ok"]:
+            r["data"] = {"roll_deg": round(d, 1)}
+        return r
+
+    def adjust_wrist(self, delta: float = 15.0) -> dict:
+        """Relative wrist nudge. The current angle is the tracked roll -- no extra bus read."""
+        try:
+            d = float(delta)
+        except (TypeError, ValueError):
+            return {"ok": False, "message": f"delta must be a number, got {delta!r}", "data": None}
+        if self.robot is None:
+            return {"ok": False, "message": "no robot connected (connect_robot)", "data": None}
+        target = round(float(getattr(self.robot, "roll_deg", 0.0)) + d, 1)
+        r = self._robot_act(lambda rb: rb.turn_to(target))
+        if r["ok"]:
+            r["data"] = {"roll_deg": target}
+        return r
 
     def torque_off(self) -> dict:
         """E-STOP: flag first (any in-flight motion aborts within one tick), pause the loop, then cut bus torque."""

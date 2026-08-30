@@ -356,6 +356,14 @@ body.showhelp .help{display:block}
    <div class="help" data-h="jog"></div>
    <div class="inline"><input id="gx" placeholder="x"><input id="gy" placeholder="y"><input id="gz" placeholder="z"><button id="b-goto" class="btn" data-h-title="goto">Go to</button></div>
    <div class="help" data-h="goto"></div>
+   <div class="inline"><span class="lbl2">wrist</span><input id="wdeg" placeholder="0" size="5"><span class="note" style="margin:0">deg</span>
+    <button id="b-wset" class="btn" data-h-title="set_wrist">Set wrist angle</button>
+    <span class="note" style="margin:0">now <span id="wcur" class="mono">-</span></span></div>
+   <div class="btnrow" id="wnudge">
+    <button class="btn" data-dw="-15">&minus;15&deg;</button><button class="btn" data-dw="-5">&minus;5&deg;</button>
+    <button class="btn" data-dw="5">+5&deg;</button><button class="btn" data-dw="15">+15&deg;</button></div>
+   <div class="help" data-h="set_wrist"></div>
+   <div class="help" data-h="adjust_wrist"></div>
    <div class="why" id="why-robot"></div>
    <div class="rowmsg" id="msg-robot"></div>
   </div>
@@ -392,6 +400,7 @@ const TABS=['setup','operate','tune','debug'];
 const TABOF={run:'operate',robot:'debug',perception:'tune',calibration:'setup',voice:'operate',rules:'operate',models:'tune',log:'debug'};
 const CLAIMED=new Set(['connect_robot','connect_cameras','connect_vlm','start','pause','resume','stop','step_once','set_max_steps','set_task',
  'home','open_gripper','close_gripper','jog','goto','torque_off','torque_on','set_z_trim',
+ 'set_wrist','adjust_wrist',
  'say_to_bot','say_to_robot','transcribe','speak','mic_on','mic_off','clear_chat',
  'add_rule','delete_rule','move_rule','clear_hints','get_models','set_model',
  'px_to_mm','log_clear',
@@ -538,6 +547,10 @@ $('newrule').onkeydown=e=>{if(e.key==='Enter')$('rulebtn').click();};
 $('rulebtn').onclick=async()=>{const t=$('newrule').value.trim();
  if(!t){showMsg($('rulebtn'),{ok:false,message:'type a rule first'});return;}
  rulesSig='';const j=await act('add_rule',{text:t},$('rulebtn'));if(j.ok)$('newrule').value='';};
+$('b-wset').onclick=()=>{const v=parseFloat($('wdeg').value);
+ if(isNaN(v)){showMsg($('b-wset'),{ok:false,message:'enter a wrist angle in degrees, e.g. 45'});return;}
+ act('set_wrist',{deg:v},$('b-wset'));};
+document.querySelectorAll('#wnudge button').forEach(b=>b.onclick=()=>act('adjust_wrist',{delta:parseFloat(b.dataset.dw)},b));
 $('b-ztrim').onclick=()=>{const v=parseFloat($('ztrim').value);
  if(isNaN(v)){showMsg($('b-ztrim'),{ok:false,message:'enter a trim in mm, e.g. -3'});return;}
  act('set_z_trim',{mm:v},$('b-ztrim'));};
@@ -776,7 +789,8 @@ function updateEnables(){
  const noRobot=!c.robot;
  const rWhy=noRobot?'needs a robot connected - connect it in Setup':
   (running&&!paused?'the sorting loop is running - pause it first':(toff?'torque is off (E-STOP) - press Torque on':null));
- ['b-home','b-open','b-close','b-goto'].forEach(id=>dis($(id),rWhy));
+ ['b-home','b-open','b-close','b-goto','b-wset'].forEach(id=>dis($(id),rWhy));
+ document.querySelectorAll('#wnudge button').forEach(b=>dis(b,rWhy));
  const jw=noRobot?rWhy:(running&&!paused?rWhy:(toff?rWhy:null));
  document.querySelectorAll('#jogpad button').forEach(b=>dis(b,jw));
  dis($('b-ton'),noRobot?'needs a robot connected - connect it in Setup':null);
@@ -823,6 +837,7 @@ async function tick(){let s;
  const p=(rb&&rb.ee_pose)||s.ee_pose||{};
  const jd=rb&&rb.joints_deg?rb.joints_deg.map(x=>x.toFixed(0)).join(' '):'-';
  const grip=rb?(rb.gripper_open?'open':'closed'):'-';
+ $('wcur').textContent=(p&&p.roll_deg!=null)?(p.roll_deg.toFixed(0)+' deg'):'-';
  const vs=s.vlm;
  const vtxt=vs?(vs.model+' '+(vs.last_latency_ms==null?'':vs.last_latency_ms+'ms')+
   (vs.last_cost_usd!=null?' ~$'+vs.last_cost_usd.toFixed(4):'')):'-';

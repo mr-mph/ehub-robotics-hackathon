@@ -68,6 +68,14 @@ def test_e2e(with_hud: bool = True) -> None:
     assert "cm" in loop.validate(m.Command("pick_at", {"x_cm": 5.0, "y_cm": 0.0}), world)
     assert loop.validate(m.Command("place_at", {"x_cm": 27.5, "y_cm": 0.0}), world)  # not holding anything
     assert loop.validate(m.Command("bogus", {}), world)
+    # wrist angle: absolute (turn_to) and relative (turn_by) are both known low-level tools
+    assert loop.validate(m.Command("turn_to", {"deg": 30}), world) is None
+    assert loop.validate(m.Command("turn_by", {"deg": -10}), world) is None
+    assert loop.execute(m.Command("turn_to", {"deg": 30}), world).ok
+    assert abs(scene.get_ee_pose().roll_deg - 30) < 1e-6
+    assert loop.execute(m.Command("turn_by", {"deg": -12}), world).ok
+    assert abs(scene.get_ee_pose().roll_deg - 18) < 1e-6, scene.get_ee_pose()
+    assert not loop.execute(m.Command("turn_by", {"deg": 400}), world).ok  # stays inside -90..90
     print(f"e2e OK: {result}, placed {loop.placed}/{n_objects}, hud={'on' if hud else 'off'}")
 
 

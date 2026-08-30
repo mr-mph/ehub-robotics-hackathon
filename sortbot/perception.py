@@ -60,9 +60,12 @@ class Overlay:
     config, not of the picture: the grid, its cm tick labels, the axis arrows, the calibration anchors and
     the legend. Re-drawing them per frame made the overlay shimmer and shift while nothing had actually
     changed. The layer is cached against a key built from exactly those inputs, so it is recomputed only
-    when the homography, the frame size, the grid spacing, the calibration anchors or the rules text
-    change -- i.e. only when the configuration does, never mid-run for no reason.
+    when the homography, the frame size, the grid spacing or the calibration anchors change -- i.e. only
+    when the configuration does, never mid-run for no reason.
 
+    Only SPATIAL things are drawn: the grid and its cm tick labels, the axis arrows, the base marker, the
+    calibration anchors and the sampled-area outline. Text that merely *describes* the scene (the legend,
+    and the RULES in force) is fed to the model as TEXT instead -- see sortbot.vlm._state_text.
     """
 
     def __init__(self, grid_mm: float = 50.0):
@@ -74,13 +77,13 @@ class Overlay:
     def _bytes(a) -> bytes | None:
         return None if a is None or not len(a) else np.asarray(a, float).round(2).tobytes()
 
-    def _key_for(self, hw, H, rules, region, samples) -> tuple:
-        return (hw, np.asarray(H, float).round(9).tobytes(), tuple(rules), self.grid_mm,
+    def _key_for(self, hw, H, region, samples) -> tuple:
+        return (hw, np.asarray(H, float).round(9).tobytes(), self.grid_mm,
                 self._bytes(region), self._bytes(samples))
 
-    def _static(self, hw, H, rules, region, samples):
+    def _static(self, hw, H, region, samples):
         """(layer_bgr, mask) of the static annotations -- built only when the key changes."""
-        key = self._key_for(hw, H, rules, region, samples)
+        key = self._key_for(hw, H, region, samples)
         if key == self._key:
             return self._layer, self._mask
         h, w = hw
@@ -132,20 +135,24 @@ class Overlay:
             pts = np.asarray(region, np.float64).round().astype(np.int32).reshape(-1, 1, 2)
             cv2.polylines(img, [pts], True, _BGR["hull"], 1, cv2.LINE_AA)
             _put(img, "calibrated area", (int(pts[:, 0, 0].min()) + 4, int(pts[:, 0, 1].min()) + 14), _BGR["hull"], 0.38)
-        legend = [f"grid {g / 10.0:g} cm | coordinates in cm: x fwd, y left, origin at robot base",
-                  "magenta cross = gripper" + ("  |  dim grid = outside the calibrated area"
-                                               if region is not None and len(region) >= 3 else "")] + [f"rule: {r}" for r in rules]
-        for i, t in enumerate(legend):
-            _put(img, t, (6, 16 + 15 * i), _BGR["text"])
+        # Nothing else is drawn. Everything that is not a SPATIAL annotation -- what the grid spacing is,
+        # what the colours mean, the sorting instructions in force -- is prose, and prose belongs in the
+        # TEXT half of the prompt (sortbot.vlm._state_text + SYSTEM_PROMPT), not painted over the
+        # photograph. It used to burn a block of writing into the top-left corner of every single frame,
+        # which hid whatever was underneath from both the model and the operator, and left the model
+        # reading its instructions off a picture of them.
         self._layer, self._mask, self._key = img, img.any(axis=2), key
         return self._layer, self._mask
 
     def render(self, frame: np.ndarray, homography: np.ndarray, ee_pose: Pose | None = None,
                rules: list[str] = (), calib_region_px=None, calib_samples_px=None) -> np.ndarray:
-        """frame is RGB; returns an RGB copy with the cached static layer composited plus the live EE marker."""
+        """frame is RGB; returns an RGB copy with the cached static layer composited plus the live EE marker.
+
+        `rules` is accepted and IGNORED (callers still pass it): rules reach the model as text, never as
+        pixels. It is not part of the cache key either, so editing a rule no longer rebuilds the layer."""
         img = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         with self._lock:
-            layer, mask = self._static(img.shape[:2], homography, tuple(rules), calib_region_px, calib_samples_px)
+            layer, mask = self._static(img.shape[:2], homography, calib_region_px, calib_samples_px)
             layer, mask = layer.copy(), mask.copy()
         img[mask] = layer[mask]
         if ee_pose is not None:  # the ONLY per-frame element
@@ -210,9 +217,19 @@ def _selftest(out_png: Path) -> None:
                       calib_region_px=hull, calib_samples_px=hull)
     assert ov._key is key0 or ov._key == key0, "static layer rebuilt for identical inputs"
     assert np.array_equal(out, again), "overlay changed between identical renders"
+    # RULES ARE TEXT, NOT PIXELS: no legend/rule block is painted on the frame, so changing (or dropping)
+    # the rules cannot change a single pixel and cannot rebuild the cached layer
+    no_rules = ov.render(img, H, Pose(*cfg.home.__dict__.values()), [],
+                         calib_region_px=hull, calib_samples_px=hull)
+    assert np.array_equal(out, no_rules), "rules text is still being drawn on the overlay"
+    other = ov.render(img, H, Pose(*cfg.home.__dict__.values()), ["a completely different rule"],
+                      calib_region_px=hull, calib_samples_px=hull)
+    assert np.array_equal(out, other) and ov._key == key0, "the rules still affect the overlay layer"
     # ... and it DOES rebuild when the configuration changes
-    ov.render(img, H, None, ["a different rule"], calib_region_px=hull, calib_samples_px=hull)
-    assert ov._key != key0, "static layer not rebuilt after the rules changed"
+    ov.grid_mm = 100.0
+    ov.render(img, H, None, [], calib_region_px=hull, calib_samples_px=hull)
+    assert ov._key != key0, "static layer not rebuilt after the grid spacing changed"
+    ov.grid_mm = 50.0
 
     # only the EE marker may differ between two frames that share a configuration
     a = ov.render(img, H, Pose(200.0, 50.0, 100.0, 0.0), [])

@@ -72,6 +72,9 @@ def estimate_cost_usd(model: str, input_tokens: int, output_tokens: int) -> floa
 SYSTEM_PROMPT = """You are the planner for a small tabletop robot arm that tidies things on a table.
 Each step you see an overhead photo overlaid with a labelled coordinate grid, a wrist-camera photo, and a text state block. YOU do the seeing: look at the photos, decide what is on the
 table and where, and call exactly one tool.
+Nothing is written on the photos except the grid, its cm tick labels and the spatial markers: the RULES,
+the state and what the overlay's colours mean are all given to you as TEXT below the images. Do not look
+for instructions in the picture.
 COORDINATES: everything you see and emit is CENTIMETERS in the table frame — x forward from the robot
 base, y left, z up, table at z=0, origin at the base. Read positions straight off the grid: the overlay
 lines are labelled in cm at both ends (x.. and y..) and the grid spacing is stated in the legend. Aim
@@ -144,11 +147,16 @@ VERIFY_SCHEMA = {
 _REASONING_FAMILIES = ("gpt-5", "o1", "o3", "o4")
 
 
-def _state_text(world: WorldState, history: list, workspace_mm=None) -> str:
+def _state_text(world: WorldState, history: list, workspace_mm=None, grid_cm: float = 5.0) -> str:
     # mm -> cm for everything the VLM reads (the unit boundary; see the module docstring)
     p = world.ee_pose
     lo, hi = workspace_mm or ((120.0, -220.0, 0.0), (420.0, 220.0, 250.0))
-    lines = [f"EE pose (table cm): x={p.x / 10:.1f} y={p.y / 10:.1f} z={p.z / 10:.1f} roll={p.roll_deg:.0f}deg",
+    # What the overlay MEANS is prose, so it is said here instead of being painted over the photo:
+    # nothing is written on the image except the grid, its cm tick labels and the spatial markers.
+    lines = [f"OVERLAY KEY: grid lines every {grid_cm:g} cm, each labelled in cm at both ends (x.. forward, "
+             f"y.. left); magenta cross = the gripper; thin outline = the calibrated camera area and a "
+             f"dimmed grid outside it means positions read there are unreliable.",
+             f"EE pose (table cm): x={p.x / 10:.1f} y={p.y / 10:.1f} z={p.z / 10:.1f} roll={p.roll_deg:.0f}deg",
              f"table z=0  gripper_open={world.gripper_open}  holding={world.holding or 'nothing'}",
              f"REACHABLE AREA (cm): x {lo[0] / 10:g}..{hi[0] / 10:g}, y {lo[1] / 10:g}..{hi[1] / 10:g}"]
     lines.append("RULES:")
@@ -328,6 +336,13 @@ def _selftest() -> None:
         assert not any(t["name"] == gone for t in TOOLS), f"{gone} must be gone"
     st = _state_text(world, hist)
     assert "RULES" in st and "put red things" in st
+    # the overlay legend is TEXT now, not pixels (sortbot.perception draws no legend/rules block)
+    assert "OVERLAY KEY" in st and "grid lines every 5 cm" in st, st
+    assert "written on the photos" in SYSTEM_PROMPT
+    import sortbot.perception as _pc
+    import inspect as _i
+    src = _i.getsource(_pc.Overlay._static)
+    assert "rule: " not in src and '_BGR["text"]' not in src, "the overlay still paints the rules on the frame"
     assert "cm" in st and "zone" not in st.lower(), st  # coordinates only; zones are gone
     low = SYSTEM_PROMPT.lower()
     for banned in ("numbered", "object id", "object list", "detected object", "detector", "zone"):

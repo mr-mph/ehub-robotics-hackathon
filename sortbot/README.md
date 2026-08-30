@@ -271,11 +271,16 @@ the raw URDF frame (and recalibrate).
 
 The calibration **persists**: it is written only on Finish, auto-loads on startup (a summary line —
 points / residuals / coverage / age — is logged and shown in the Setup tab), and nothing else ever
-overwrites it. The overlay itself is a **cached static layer**: the grid, its cm tick labels, the axis arrows, the
-calibration anchors and the legend are functions of the calibration and the config, not of the picture, so
-they are rendered once and composited unchanged onto every frame -- the overlay only changes when the
-homography, frame size, grid spacing, anchors or rules change (i.e. when the configuration does), never
-frame to frame. The end-effector cross is the one live element. At runtime the calibration's own anchor points are drawn on the overlay (small diamonds, `c1`, `c2`, ...)
+overwrites it. The overlay itself is a **cached static layer**: the grid, its cm tick labels, the axis arrows and the
+calibration anchors are functions of the calibration and the config, not of the picture, so they are
+rendered once and composited unchanged onto every frame -- the overlay only changes when the homography,
+frame size, grid spacing or anchors change (i.e. when the configuration does), never frame to frame.
+**Only spatial things are drawn.** There is no legend and no rules block on the image: what the grid
+spacing is, what the colours mean and the RULES in force are given to the VLM as **text** (an
+`OVERLAY KEY:` line plus the `RULES:` block in `vlm._state_text`), not painted over the photograph -- a
+text block in the corner hid whatever was under it from the model and from you, and made the model read
+its instructions off a picture of them. `render_overlay(..., rules=...)` still accepts the argument and
+ignores it. The end-effector cross is the one live element. At runtime the calibration's own anchor points are drawn on the overlay (small diamonds, `c1`, `c2`, ...)
 next to the sampled-area outline -- the grid is pinned at those anchors and interpolated everywhere else, so
 a visible mismatch tells you immediately whether the fit is bad or you are simply far from any anchor.
 Coordinates outside the sampled area (+20% margin) are refused ("outside the calibrated area — recalibrate with wider coverage"),

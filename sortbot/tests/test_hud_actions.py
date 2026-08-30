@@ -197,6 +197,8 @@ def test_hud_actions() -> None:
         # --- E-STOP mid-run pauses the loop ---
         assert post("start")["ok"]
         _wait(lambda: get("/state")["run"]["phase"] == "running", what="running for estop")
+        # the preview thread keeps the streams live DURING a run (regression: frozen image mid-sort)
+        _wait(lambda: (get("/state").get("frame_age_s") or 99) < 2.0, what="fresh frame during the run")
         assert post("torque_off")["ok"]
         _wait(lambda: get("/state")["run"]["phase"] == "paused", what="paused by E-STOP")
         assert get("/state")["robot"]["torque"] is False

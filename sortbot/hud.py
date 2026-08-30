@@ -87,6 +87,9 @@ h1{font-size:15px;margin:0;letter-spacing:3px;color:var(--acc);font-weight:700}
 .viewwrap{position:relative;background:#000;border:1px solid var(--line);border-radius:var(--r);overflow:hidden;cursor:crosshair}
 #ov{width:100%;display:block;min-height:200px;background:#000}
 #ring{position:absolute;border:2px solid #22ff88;border-radius:50%;pointer-events:none;display:none;box-sizing:border-box}
+#imgage{position:absolute;left:8px;top:8px;font:11px var(--mono);background:rgba(0,0,0,.55);color:#9fe8c9;padding:3px 8px;border-radius:4px;pointer-events:none;z-index:5}
+#imgage.warn{color:#ffd9a0}
+#imgage.stale{color:#ffb3b5;background:rgba(90,20,22,.7)}
 .pip{position:absolute;right:10px;bottom:10px;width:26%;min-width:120px;border:1px solid var(--line2);border-radius:var(--rs);overflow:hidden;background:#000;box-shadow:var(--sh);cursor:default}
 .pip img{width:100%;display:block;min-height:40px}
 .pip span{position:absolute;left:6px;bottom:4px;font-size:10px;color:#cfd8e3;text-shadow:0 1px 2px #000;text-transform:uppercase;letter-spacing:1px}
@@ -192,6 +195,7 @@ body.showhelp .help{display:block}
 <section class="stage">
  <div class="viewwrap" id="ovwrap">
   <img id="ov" src="/overhead.mjpg" alt="overhead camera">
+  <div id="imgage" title="Age of the overhead image on the server - if this climbs, the stream is stalled">no image yet</div>
   <div id="ring"></div>
   <div class="pip"><img id="wr" src="/wrist.mjpg" alt="wrist camera"><span>wrist</span></div>
  </div>
@@ -657,6 +661,10 @@ async function tick(){let s;
  S=s;
  const r=s.run,rb=s.robot,cal=s.calibration;
  if(s.frame_wh){frameW=s.frame_wh[0];frameH=s.frame_wh[1];haveWH=true;}
+ // image-age chip: how old the overhead frame is on the server (fresh < 2s, stale in red)
+ const fa=s.frame_age_s;
+ $('imgage').textContent=fa==null?'no image yet':('image '+fa.toFixed(1)+'s old');
+ $('imgage').className=fa==null?'stale':(fa<2?'':(fa<6?'warn':'stale'));
  // header: connection dots
  const conn=(r&&r.connected)||{};
  [['robot','cd-robot'],['cams','cd-cams'],['vlm','cd-vlm']].forEach(([k,id])=>{const el=$(id);
@@ -789,6 +797,7 @@ class HUD:
         self._state: dict = {}
         self._frame_wh: tuple[int, int] | None = None
         self._t_update = 0.0
+        self._t_frame = 0.0  # when the overhead frame was last refreshed (drives the image-age chip)
         self._actions: dict[str, dict] = {}
         self._sources: dict[str, Callable[[], dict]] = {}
         self.app = FastAPI()
@@ -808,6 +817,7 @@ class HUD:
             if ov is not None:
                 self._frames["overhead"] = ov
                 self._frame_wh = (overlay_frame.shape[1], overlay_frame.shape[0])
+                self._t_frame = time.time()
             if wr is not None:
                 self._frames["wrist"] = wr
             if state:
@@ -862,6 +872,7 @@ class HUD:
         with self._lock:
             s = dict(self._state)
             s["age_s"] = round(time.time() - self._t_update, 1) if self._t_update else None
+            s["frame_age_s"] = round(time.time() - self._t_frame, 1) if self._t_frame else None
             s["seq"], s["frame_wh"] = self._seq, self._frame_wh
         for k, fn in self._sources.items():
             try:
@@ -946,6 +957,7 @@ def _selftest() -> None:
         with urllib.request.urlopen(base + "/state", timeout=3) as r:
             s = json.load(r)
             assert s["step"] == 1 and s["ee_pose"]["x"] == 150 and s["frame_wh"] == [640, 360]
+            assert s["frame_age_s"] is not None and s["frame_age_s"] < 60, s["frame_age_s"]
             assert s["calibration"] == {"state": "idle", "n": 0}
         with urllib.request.urlopen(base + "/actions", timeout=3) as r:
             acts = json.load(r)

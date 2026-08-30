@@ -1165,15 +1165,35 @@ class Session:
 
     # ------------------------------------------------ idle preview + teardown
     def _preview_loop(self) -> None:
-        """Streams camera frames to the HUD while the loop is not running (so mode/cam checks need no terminal)."""
+        """Streams camera frames to the HUD continuously -- while idle AND mid-run -- so the page never
+        shows a stale image (the Loop only pushes a few frames per step, and a VLM call can take tens of
+        seconds). Only an active calibration session owns the stream (it pushes annotated frames itself).
+        This thread NEVER touches the robot: cameras only (they are opened directly by the Session, not
+        through the follower -- the serial bus belongs to the lock holders, see the module invariant)."""
         while not self._shutdown.is_set():
             try:
-                busy = (self.ctl is not None and self.ctl.phase == "running") or (self.calib is not None and self.calib.active)
-                if self.hud is not None and not busy and self.cams is not None:
+                calib_busy = self.calib is not None and self.calib.active
+                if self.hud is not None and not calib_busy and self.cams is not None:
                     ov, wr = self.cams.read("overhead"), self.cams.read("wrist")
                     self.last_overhead = ov
                     hold = self._overlay_hold
-                    show = hold[1] if hold is not None and time.time() < hold[0] else ov
+                    if hold is not None and time.time() < hold[0]:
+                        show = hold[1]
+                    else:
+                        show = ov
+                        # draw the grid overlay on the live frame; mid-run reuse the Loop's homography
+                        # and cached pose (plain attribute reads -- no tracker mutation, no bus)
+                        if self._running() and self.loop is not None:
+                            H, pose = self.loop._H, self.loop._pose_cache
+                        else:
+                            H, pose = self._current_H(), None
+                        if H is not None:
+                            try:
+                                show = perception.render_overlay(
+                                    ov, H, self.cfg.zones, pose, self.rules.list(),
+                                    calib_region_px=self.homog.region_px if self.homog is not None else None)
+                            except Exception as e:  # noqa: BLE001
+                                log.debug("preview overlay: %s", e)
                     self.hud.update(show, wr, {})
             except Exception as e:  # noqa: BLE001
                 log.debug("preview: %s", e)

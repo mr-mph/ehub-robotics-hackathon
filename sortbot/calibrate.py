@@ -401,7 +401,7 @@ class CalibSession:
         if self.H is not None:
             from sortbot import perception  # grid under the sample markers: how the current fit looks
             try:
-                img = perception.render_overlay(img, self.H, [], None, [])
+                img = perception.render_overlay(img, self.H)
             except Exception as e:  # noqa: BLE001 - a degenerate interim fit must not kill the teleop view
                 cv2.putText(img, f"grid preview unavailable: {e}", (8, 40),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 80, 80), 1, cv2.LINE_AA)

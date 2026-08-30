@@ -424,7 +424,7 @@ class Loop:
             self._H = H
             rules = ([f"GOAL: {self.task}"] if self.task else []) + self.rules.list() + self.hints
             world = WorldState(self.cfg.zones, self._read_pose(), self.robot.gripper_open, self.holding, rules)
-            overlay = perception.render_overlay(overhead, H, self.cfg.zones, world.ee_pose, rules,
+            overlay = perception.render_overlay(overhead, H, world.ee_pose, rules,
                                                 calib_region_px=self.homog.region_px,
                                                 calib_samples_px=self.homog.samples_px)
             self._overlay = overlay
@@ -999,7 +999,7 @@ class Session:
         H = self._current_H()
         if H is None:
             return
-        overlay = perception.render_overlay(frame, H, self.cfg.zones, None, self.rules.list(),
+        overlay = perception.render_overlay(frame, H, None, self.rules.list(),
                                             calib_region_px=self.homog.region_px if self.homog else None,
                                             calib_samples_px=self.homog.samples_px if self.homog else None)
         self._overlay_hold = (time.time() + 5.0, overlay)
@@ -1209,7 +1209,7 @@ class Session:
                         if H is not None:
                             try:
                                 show = perception.render_overlay(
-                                    ov, H, self.cfg.zones, pose, self.rules.list(),
+                                    ov, H, pose, self.rules.list(),
                                     calib_region_px=self.homog.region_px if self.homog is not None else None,
                                     calib_samples_px=self.homog.samples_px if self.homog is not None else None)
                             except Exception as e:  # noqa: BLE001

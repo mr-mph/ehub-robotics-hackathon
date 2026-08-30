@@ -19,7 +19,7 @@ The app is task-agnostic — your spoken task and RULES say what goes where; wit
 ```
 
 There is NO object detector: the VLM does the seeing itself. Loop: `home()` -> capture overhead + wrist ->
-render the cm-labelled grid overlay -> VLM reads the photos and emits ONE coordinate-based tool call
+composite the cached cm-grid overlay -> VLM reads the photos and emits ONE coordinate-based tool call
 (`pick_at(x_cm,y_cm)`, `place_in_zone(zone)`, `place_at(x_cm,y_cm)`, `say(text)`, `done`; low-level
 `move_to/open_gripper/close_gripper/turn_to` for recovery) -> validate against the workspace envelope
 (rejections go back to the VLM as FAILED tool results) -> execute -> repeat. Voice corrections drain at the
@@ -42,7 +42,7 @@ at the top of `main.py`; `SORTBOT_BUS_ASSERT=1` arms a proxy that fails loudly o
 | `robot.py` | robot | `RobotAPI` real SO101; safety envelope, lift-translate-descend, IK sanity |
 | `calibration.py` | calib | colour-target detector, homography px->mm (fitted or ArUco), `table_T_base`, calib.json I/O |
 | `calibrate.py`, `calibrate_aruco.py` | calib | teleop calibration session/controller (HUD actions), legacy ArUco+Kabsch flow |
-| `perception.py` | perception | overlay render (cm-labelled grid, zones, EE marker) + px<->mm helpers |
+| `perception.py` | perception | overlay render (cached cm-grid layer + EE marker) + px<->mm helpers |
 | `vlm.py` | vlm | prompt + coordinate tool schema (cm), OpenAI call -> `Command` |
 | `voice.py` | voice | ElevenLabs/mic in, keyboard fallback, queue of corrections, `transcribe_bytes` for HUD push-to-talk |
 | `models.py` | models | selectable OpenAI/ElevenLabs model listings (cached 5 min) + `yaml_set` config.yaml persistence |
@@ -214,7 +214,13 @@ the HUD of a running `main` with the robot connected. A background thread teleop
 
 The calibration **persists**: it is written only on Finish, auto-loads on startup (a summary line —
 points / residuals / coverage / age — is logged and shown in the Setup tab), and nothing else ever
-overwrites it. At runtime the calibration's own anchor points are drawn on the overlay (small diamonds, `c1`, `c2`, ...)
+overwrites it. The overlay itself is a **cached static layer**: the grid, its cm tick labels, the axis arrows, the
+calibration anchors and the legend are functions of the calibration and the config, not of the picture, so
+they are rendered once and composited unchanged onto every frame -- the overlay only changes when the
+homography, frame size, grid spacing, anchors or rules change (i.e. when the configuration does), never
+frame to frame. The end-effector cross is the one live element. **Zone rectangles are not drawn**: the
+LEFT/MIDDLE/RIGHT boxes are bookkeeping for `place_in_zone`, not physical bins, and painting them over the
+picture was misleading. At runtime the calibration's own anchor points are drawn on the overlay (small diamonds, `c1`, `c2`, ...)
 next to the sampled-area outline -- the grid is pinned at those anchors and interpolated everywhere else, so
 a visible mismatch tells you immediately whether the fit is bad or you are simply far from any anchor.
 Coordinates outside the sampled area (+20% margin) are refused ("outside the calibrated area — recalibrate with wider coverage"),

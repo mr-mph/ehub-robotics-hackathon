@@ -50,6 +50,9 @@ class Config:
     calib_target: str = "green"  # green | orange | hsv:lo_h,lo_s,lo_v,hi_h,hi_s,hi_v
     calib_ball_radius_mm: float = 20.0
     calib_min_spacing_mm: float = 15.0
+    tts_model: str = "eleven_turbo_v2_5"   # voice.tts_model
+    stt_model: str = "scribe_v2"           # voice.stt_model
+    source_path: Path = DEFAULT_YAML       # yaml file this config was loaded from (set_model persists here)
     raw: dict = field(default_factory=dict, repr=False)
 
     def zone(self, name: str) -> Zone | None:
@@ -94,6 +97,9 @@ def load(path: str | Path = DEFAULT_YAML) -> Config:
         calib_target=str(cal.get("target", "green")),
         calib_ball_radius_mm=float(cal.get("ball_radius_mm", 20.0)),
         calib_min_spacing_mm=float(cal.get("min_sample_spacing_mm", 15.0)),
+        tts_model=str(raw["voice"].get("tts_model", Config.tts_model)),
+        stt_model=str(raw["voice"].get("stt_model", Config.stt_model)),
+        source_path=Path(path),
         raw=raw,
     )
 

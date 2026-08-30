@@ -25,7 +25,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 _BOUNDARY = b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n"
-GROUPS = ["run", "robot", "calibration", "voice"]
+GROUPS = ["run", "robot", "calibration", "voice", "rules", "models"]
 
 PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>sortbot HUD</title>
 <style>
@@ -68,6 +68,16 @@ button:hover{background:#385}
 .act button{min-width:110px;margin:0}
 input{background:#0d0d0d;color:#dfd;border:1px solid #444;border-radius:3px;padding:4px 6px;font:12px Menlo,monospace;width:72px}
 input.wide{width:260px}
+#ptt{background:#333;border:1px solid #666;color:#ddd;min-width:170px;padding:8px 12px}
+#ptt.rec{background:#a11;border-color:#f44;animation:blink 1s infinite}
+#transcript{color:#cfc;font:12px/1.3 Menlo,monospace;white-space:pre-wrap;margin-top:4px;min-height:14px}
+.rl li{margin:2px 0}
+.rl a{color:#8ab;cursor:pointer;margin-left:6px;text-decoration:none;border:1px solid #444;border-radius:3px;padding:0 5px;font-size:11px}
+.rl a:hover{background:#333;color:#dfd}
+select{background:#0d0d0d;color:#dfd;border:1px solid #444;border-radius:3px;padding:4px 6px;font:12px Menlo,monospace;max-width:280px}
+.mrow{display:flex;align-items:center;gap:8px;margin:4px 0;flex-wrap:wrap}
+.mrow .lbl2{color:#789;font-size:11px;text-transform:uppercase;width:80px}
+#vlmstat{color:#fc8;font:12px Menlo,monospace}
 [hidden]{display:none!important}
 </style></head><body>
 <header>
@@ -91,7 +101,14 @@ input.wide{width:260px}
    <div class="note">Hold the target in the gripper, Start, move the arm with the leader, Capture at &gt;= 4 spread-out spots
    (Touch table once with the fingertip on the table), Finish. Recalibrate whenever the overhead camera or the robot base moves,
    or the overlay grid stops lining up with the table.</div></div>
-  <div data-extra="voice"><h3 style="margin-top:8px">Queue</h3><ul id="voice"></ul></div>
+  <div data-extra="voice">
+   <div class="act"><button id="ptt" title="Hold to record; on release the clip is transcribed (ElevenLabs) and fed to the bot like a spoken correction.">&#127908; Hold to talk</button></div>
+   <div class="note" id="micnote"></div><div id="transcript"></div>
+   <h3 style="margin-top:8px">Queue</h3><ul id="voice"></ul></div>
+  <div data-extra="rules"><h3 style="margin-top:8px">Rules (persisted; sent with every VLM prompt)</h3><ul id="rlist" class="rl"></ul>
+   <h3 style="margin-top:8px">Hints (one-shot, this run)</h3><ul id="hlist"></ul></div>
+  <div data-extra="models"><div id="mrows"><span class="na">loading...</span></div>
+   <div class="note">last VLM call: <span id="vlmstat">-</span></div><div class="note" id="mnotes"></div></div>
  </div>
  <div class="card"><h3>Last VLM call</h3><pre id="call"></pre><pre id="say" style="color:#fc8"></pre></div>
  <div class="card"><h3>Rules</h3><ul id="rules"></ul></div>
@@ -100,7 +117,7 @@ input.wide{width:260px}
 const $=id=>document.getElementById(id);
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const li=(id,a)=>{$(id).innerHTML=(a||[]).map(x=>'<li>'+esc(x)+'</li>').join('')||'<li style="color:#666">none</li>'};
-const GROUPS=['run','robot','calibration','voice'];
+const GROUPS=['run','robot','calibration','voice','rules','models'];
 const HDR=new Set(['set_mode','torque_off']);
 let actions=[],actsig='',curTab='run',ring=null,frameW=640,frameH=480;
 async function act(name,body){try{
@@ -116,14 +133,15 @@ function renderTabs(){const gs=groupList();if(!gs.includes(curTab))curTab=gs[0];
 function rowHtml(a){const ins=(a.params||[]).map(p=>{const d=p.default==null?'':String(p.default);
  const w=(p.name==='text'||p.name==='task')?' class="wide"':'';
  return `<input${w} data-p="${esc(p.name)}" placeholder="${esc(p.name)}" value="${esc(d)}">`;}).join('');
- return `<div class="act"><button data-n="${esc(a.name)}">${esc(a.label)}</button>${ins}</div>`;}
+ return `<div class="act"><button data-n="${esc(a.name)}" title="${esc(a.help||'')}">${esc(a.label)}</button>${ins}</div>`;}
 function renderBody(){const rows=actions.filter(a=>a.group===curTab&&a.label&&!HDR.has(a.name));
  $('acts').innerHTML=rows.length?rows.map(rowHtml).join(''):'<span class="na">not available in this mode</span>';
  $('acts').querySelectorAll('button[data-n]').forEach(b=>b.onclick=()=>{const body={};
   b.parentElement.querySelectorAll('input').forEach(i=>{const v=i.value.trim();if(v==='')return;
    body[i.dataset.p]=/^-?\\d+(\\.\\d+)?$/.test(v)?parseFloat(v):v;});
   act(b.dataset.n,body);});
- document.querySelectorAll('[data-extra]').forEach(d=>d.hidden=d.dataset.extra!==curTab);}
+ document.querySelectorAll('[data-extra]').forEach(d=>d.hidden=d.dataset.extra!==curTab);
+ if(curTab==='models'&&!window._models)loadModels();}
 async function loadActions(){try{const a=await(await fetch('/actions')).json();
  const sig=JSON.stringify(a);if(sig!==actsig){actsig=sig;actions=a;renderTabs();}}catch(e){}}
 document.querySelectorAll('.pill').forEach(b=>b.onclick=()=>act('set_mode',{[b.dataset.k]:b.dataset.v}));
@@ -167,10 +185,58 @@ async function tick(){try{
  else $('calib').innerHTML='<span class="na">not available (connect a robot)</span>';
  $('call').textContent=s.last_call?JSON.stringify(s.last_call):'-';
  $('say').textContent=s.say?'"'+s.say+'"':'';
- li('rules',s.rules);li('voice',s.voice_queue);
+ const rl=s.rules;
+ li('rules',Array.isArray(rl)?rl:(rl?(rl.list||[]).concat((rl.hints||[]).map(h=>'(hint) '+h)):[]));
+ renderRules(rl);
+ li('voice',(s.voice&&s.voice.queue)||s.voice_queue);
+ if(s.voice&&s.voice.last_transcript&&!$('transcript').textContent.startsWith('!!')&&$('transcript').textContent!=='transcribing...')
+  $('transcript').textContent='heard: "'+s.voice.last_transcript+'"';
+ const vs=s.vlm;
+ const vtxt=vs?(vs.model+'  '+(vs.last_latency_ms==null?'- ms':vs.last_latency_ms+' ms')
+  +(vs.last_cost_usd!=null?'  ~$'+vs.last_cost_usd.toFixed(4)+'/call':'')
+  +(vs.last_usage?'  ('+vs.last_usage.input_tokens+' in / '+vs.last_usage.output_tokens+' out)':'')):'-';
+ document.querySelectorAll('#vlmstat,.vlmbeside').forEach(el=>el.textContent=vtxt);
 }catch(e){}}
 const fmt=v=>v==null?'-':(typeof v==='number'?v.toFixed(0):v);
 const grip=g=>g===undefined||g===null?'-':(g?'open':'closed');
+let rec=null,chunks=[];
+function b64(buf){const u=new Uint8Array(buf);let t='';for(let i=0;i<u.length;i+=0x8000)t+=String.fromCharCode.apply(null,u.subarray(i,i+0x8000));return btoa(t);}
+async function pttDown(){if(rec)return;
+ if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia||typeof MediaRecorder==='undefined'){
+  $('micnote').textContent='microphone unavailable in this browser context (getUserMedia/MediaRecorder missing; use Send to bot instead)';return;}
+ try{const st=await navigator.mediaDevices.getUserMedia({audio:true});
+  rec=new MediaRecorder(st,MediaRecorder.isTypeSupported&&MediaRecorder.isTypeSupported('audio/webm')?{mimeType:'audio/webm'}:undefined);
+  chunks=[];rec.ondataavailable=e=>{if(e.data.size)chunks.push(e.data)};
+  rec.onstop=async()=>{st.getTracks().forEach(t=>t.stop());const b=new Blob(chunks,{type:rec.mimeType||'audio/webm'});rec=null;pttIdle();
+   if(b.size<200){$('micnote').textContent='clip too short, try again';return;}
+   $('transcript').textContent='transcribing...';
+   const j=await act('transcribe',{audio_b64:b64(await b.arrayBuffer()),mime:b.type||'audio/webm'});
+   $('transcript').textContent=j.ok&&j.data&&j.data.text?('heard: "'+j.data.text+'"'):('!! '+(j.message||'transcription failed'));};
+  rec.start();$('ptt').classList.add('rec');$('ptt').textContent='recording... release to send';$('micnote').textContent='';}
+ catch(e){$('micnote').textContent='mic unavailable: '+e+' (use Send to bot instead)';rec=null;pttIdle();}}
+function pttIdle(){$('ptt').classList.remove('rec');$('ptt').innerHTML='&#127908; Hold to talk';}
+function pttUp(){if(rec&&rec.state!=='inactive')rec.stop();else pttIdle();}
+$('ptt').onmousedown=pttDown;$('ptt').onmouseup=pttUp;$('ptt').onmouseleave=pttUp;
+$('ptt').ontouchstart=e=>{e.preventDefault();pttDown();};$('ptt').ontouchend=e=>{e.preventDefault();pttUp();};
+let rulesSig='';
+function renderRules(rl){if(!rl||Array.isArray(rl)||!$('rlist'))return;const sig=JSON.stringify(rl);if(sig===rulesSig)return;rulesSig=sig;
+ $('rlist').innerHTML=(rl.list||[]).map((r,i)=>`<li>${esc(r)}<a data-mv="${i}|up" title="move up (higher priority)">&#8593;</a><a data-mv="${i}|down" title="move down">&#8595;</a><a data-del="${i}" title="delete this rule">&#10005;</a></li>`).join('')||'<li style="color:#666">none</li>';
+ $('rlist').querySelectorAll('a[data-mv]').forEach(a=>a.onclick=()=>{const[i,d]=a.dataset.mv.split('|');rulesSig='';act('move_rule',{i:+i,dir:d});});
+ $('rlist').querySelectorAll('a[data-del]').forEach(a=>a.onclick=()=>{rulesSig='';act('delete_rule',{i:+a.dataset.del});});
+ $('hlist').innerHTML=(rl.hints||[]).map(h=>'<li>'+esc(h)+'</li>').join('')||'<li style="color:#666">none</li>';}
+const PROVIDERS=[['openai','openai model'],['elevenlabs_tts','tts model'],['elevenlabs_stt','stt model'],['elevenlabs_voice','voice']];
+async function loadModels(){const j=await act('get_models');if(j.ok&&j.data){window._models=j.data;renderModels();}
+ else $('mrows').innerHTML='<span class="na">'+esc(j.message||'get_models failed')+'</span>';}
+function renderModels(){const d=window._models;if(!d)return;const cur=d.current||{};
+ const opts={openai:d.openai||[],elevenlabs_tts:(d.elevenlabs||{}).tts||[],elevenlabs_stt:(d.elevenlabs||{}).stt||[],
+  elevenlabs_voice:((d.elevenlabs||{}).voices||[]).map(v=>[v.id,v.name+' ('+v.id.slice(0,8)+')'])};
+ $('mrows').innerHTML=PROVIDERS.map(([p,lbl])=>{let os=opts[p].map(o=>{const[v,n]=Array.isArray(o)?o:[o,o];
+   return `<option value="${esc(v)}"${v===cur[p]?' selected':''}>${esc(n)}</option>`;}).join('');
+  if(cur[p]&&!opts[p].some(o=>(Array.isArray(o)?o[0]:o)===cur[p]))os=`<option value="${esc(cur[p])}" selected>${esc(cur[p])}</option>`+os;
+  return `<div class="mrow"><span class="lbl2">${esc(lbl)}</span><select data-prov="${esc(p)}" title="Hot-swaps the live client and persists to config.yaml.">${os}</select>`+
+   (p==='openai'?' <span class="vlmbeside" style="color:#fc8;font:12px Menlo,monospace"></span>':'')+`</div>`;}).join('');
+ $('mnotes').textContent=(d.notes||[]).join('; ');
+ $('mrows').querySelectorAll('select').forEach(sl=>sl.onchange=async()=>{await act('set_model',{provider:sl.dataset.prov,value:sl.value});window._models=null;loadModels();});}
 loadActions();setInterval(tick,500);tick();setInterval(loadActions,5000);
 </script></body></html>"""
 
@@ -234,10 +300,11 @@ class HUD:
             self._cond.notify_all()
 
     def register(self, name: str, fn: Callable[..., object], label: str | None = None, group: str = "run",
-                 params: list[dict] | None = None) -> None:
+                 params: list[dict] | None = None, help: str | None = None) -> None:
         """Expose fn as POST /action/{name}; JSON body -> kwargs. label=None: no button on the page.
         params (auto-derived from fn's signature if omitted) tells the page which input fields to render:
-        [{"name": ..., "default": ...}]."""
+        [{"name": ..., "default": ...}]. help: one sentence (what this does / when to use it), served in
+        GET /actions for tooltips."""
         if params is None:
             try:
                 params = [{"name": q.name, "default": None if q.default is inspect.Parameter.empty else q.default}
@@ -245,7 +312,7 @@ class HUD:
                           if q.kind in (q.POSITIONAL_OR_KEYWORD, q.KEYWORD_ONLY)]
             except (TypeError, ValueError):
                 params = []
-        self._actions[name] = {"name": name, "label": label, "group": group, "params": params, "fn": fn}
+        self._actions[name] = {"name": name, "label": label, "group": group, "params": params, "help": help, "fn": fn}
 
     def add_state_source(self, key: str, fn: Callable[[], dict]) -> None:
         """fn() is merged into GET /state under `key` at request time."""
@@ -283,7 +350,7 @@ class HUD:
         return JSONResponse(s)
 
     def _get_actions(self):
-        return JSONResponse([{k: a[k] for k in ("name", "label", "group", "params")} for a in self._actions.values()])
+        return JSONResponse([{k: a[k] for k in ("name", "label", "group", "params", "help")} for a in self._actions.values()])
 
     async def _post_action(self, name: str, request: Request):
         a = self._actions.get(name)
@@ -338,7 +405,8 @@ def _selftest() -> None:
         return {"ok": det is not None, "message": "sampled", "data": {"target": t.to_dict(), "det": det}}
 
     hud.register("calib_sample", sample, None, "calibration")
-    hud.register("calib_start", lambda: calib.update(state="running") or "started", "Start calibration", "calibration")
+    hud.register("calib_start", lambda: calib.update(state="running") or "started", "Start calibration", "calibration",
+                 help="Begin a teleop calibration session.")
     hud.add_state_source("calibration", lambda: calib)
     hud.start()
     try:
@@ -361,6 +429,8 @@ def _selftest() -> None:
         with urllib.request.urlopen(base + "/actions", timeout=3) as r:
             acts = json.load(r)
             assert {a["name"] for a in acts} == {"calib_sample", "calib_start"} and all(a["group"] == "calibration" for a in acts)
+            byname = {a["name"]: a for a in acts}
+            assert byname["calib_start"]["help"] == "Begin a teleop calibration session." and byname["calib_sample"]["help"] is None
         j = post("/action/calib_sample", {"u": 420, "v": 300})
         assert j["ok"] and abs(j["data"]["det"][0] - 420) < 1 and abs(j["data"]["det"][1] - 300) < 1, j
         assert 40 <= j["data"]["target"]["hsv_lo"][0] <= 70, j

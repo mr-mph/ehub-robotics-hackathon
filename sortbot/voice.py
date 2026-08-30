@@ -26,6 +26,8 @@ log = logging.getLogger("sortbot.voice")
 REPO_ROOT = Path(__file__).resolve().parent.parent
 RULES_FILE = REPO_ROOT / "sortbot" / "calib" / "rules.json"
 DEFAULT_VOICE_ID = "21m00Tcm4TlvDq8ikWAM"
+DEFAULT_TTS_MODEL = "eleven_turbo_v2_5"
+DEFAULT_STT_MODEL = "scribe_v2"
 CHUNK_SECONDS = 4.0
 
 
@@ -86,6 +88,25 @@ class RulesStore:
                 self._rules.append(rule)
                 self._save()
 
+    def delete(self, i: int) -> str | None:
+        """Remove rule at index i; returns the removed rule or None if out of range."""
+        with self._lock:
+            if not 0 <= i < len(self._rules):
+                return None
+            r = self._rules.pop(i)
+            self._save()
+            return r
+
+    def move(self, i: int, delta: int) -> bool:
+        """Move rule at index i by delta (-1 = up / earlier, +1 = down / later)."""
+        with self._lock:
+            j = i + delta
+            if not (0 <= i < len(self._rules) and 0 <= j < len(self._rules) and i != j):
+                return False
+            self._rules.insert(j, self._rules.pop(i))
+            self._save()
+            return True
+
     def clear(self) -> None:
         with self._lock:
             self._rules = []
@@ -104,9 +125,12 @@ class RulesStore:
 class VoiceIO:
     """start() launches a listener thread; drain() returns commands heard since last call."""
 
-    def __init__(self, voice_id: str = DEFAULT_VOICE_ID, stdin=None, force_text: bool = False):
+    def __init__(self, voice_id: str = DEFAULT_VOICE_ID, stdin=None, force_text: bool = False,
+                 tts_model: str = DEFAULT_TTS_MODEL, stt_model: str = DEFAULT_STT_MODEL):
         load_dotenv(REPO_ROOT / ".env")
         self.voice_id = voice_id
+        self.tts_model, self.stt_model = tts_model, stt_model
+        self.last_transcript = ""
         self._q: queue.Queue[str] = queue.Queue()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -150,6 +174,10 @@ class VoiceIO:
         if text.strip():
             self._q.put(text.strip())
 
+    def peek(self) -> list[str]:
+        """Snapshot of pending (undrained) commands, oldest first."""
+        return list(self._q.queue)
+
     # -- listeners
     def _text_loop(self) -> None:
         for line in self._stdin:
@@ -187,12 +215,21 @@ class VoiceIO:
         return path if r.returncode == 0 and Path(path).exists() else None
 
     def transcribe(self, wav_path: str) -> str:
-        if not self._client:
-            return ""
         with open(wav_path, "rb") as f:
-            res = self._client.speech_to_text.convert(model_id="scribe_v1", file=f, tag_audio_events=False)
+            return self.transcribe_bytes(f.read(), "audio/wav")
+
+    def transcribe_bytes(self, data: bytes, mime: str = "audio/webm") -> str:
+        """STT on an in-memory clip (HUD push-to-talk posts webm/opus; the API takes the bytes as-is)."""
+        if not self._client:
+            raise RuntimeError("ElevenLabs unavailable (no ELEVENLABS_API_KEY)")
+        ext = (mime.split("/")[-1].split(";")[0] or "webm") if "/" in mime else "webm"
+        res = self._client.speech_to_text.convert(
+            model_id=self.stt_model, file=(f"clip.{ext}", data, mime), tag_audio_events=False)
         text = (getattr(res, "text", "") or "").strip()
-        return "" if re.fullmatch(r"[\s\W]*", text) else text
+        text = "" if re.fullmatch(r"[\s\W]*", text) else text
+        if text:
+            self.last_transcript = text
+        return text
 
     # -- speaking
     def speak(self, text: str) -> None:
@@ -201,7 +238,7 @@ class VoiceIO:
             return
         try:
             audio = b"".join(self._client.text_to_speech.convert(
-                self.voice_id, text=text, model_id="eleven_turbo_v2_5", output_format="mp3_22050_32"))
+                self.voice_id, text=text, model_id=self.tts_model, output_format="mp3_22050_32"))
         except Exception as e:  # noqa: BLE001
             log.warning("TTS failed: %s", e)
             return
@@ -250,6 +287,12 @@ def _selftest() -> None:
     assert RulesStore(tmp).list() == rules.list() == cmds[0::2]
     rules.append(cmds[0])  # dedupe
     assert len(RulesStore(tmp).list()) == 2
+    rules.append("third rule here")
+    assert rules.move(2, -1) and rules.list()[1] == "third rule here"
+    assert not rules.move(0, -1) and not rules.move(9, 1)
+    assert rules.delete(1) == "third rule here" and rules.delete(99) is None
+    assert RulesStore(tmp).list() == rules.list() and len(rules.list()) == 2
+    assert v.peek() == [] and v.last_transcript == ""
     v.speak("selftest speaking")  # logs only unless key + player available
     v.stop()
     print("selftest OK")

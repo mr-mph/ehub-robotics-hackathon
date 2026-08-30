@@ -32,8 +32,9 @@ each iteration into a persistent RULES list sent with every prompt.
 | `calibrate.py`, `calibrate_aruco.py` | calib | teleop calibration session/controller (HUD actions), legacy ArUco+Kabsch flow |
 | `perception.py` | perception | segment candidates, `DetectedObject`s, overlay render |
 | `vlm.py` | vlm | prompt + tool schema, OpenAI call -> `Command` |
-| `voice.py` | voice | ElevenLabs/mic in, keyboard fallback, queue of corrections |
-| `hud.py` | hud | FastAPI status page + generic action registry (`register(name, fn, label, group)` -> `POST /action/{name}`) |
+| `voice.py` | voice | ElevenLabs/mic in, keyboard fallback, queue of corrections, `transcribe_bytes` for HUD push-to-talk |
+| `models.py` | models | selectable OpenAI/ElevenLabs model listings (cached 5 min) + `yaml_set` config.yaml persistence |
+| `hud.py` | hud | FastAPI status page + generic action registry (`register(name, fn, label, group, params, help)` -> `POST /action/{name}`; `help` is served in `GET /actions` for tooltips) |
 | `main.py` | main | server-first Session (modes, RUN/ROBOT actions, E-STOP) + the loop |
 
 ## Frames
@@ -69,7 +70,7 @@ forget rules), `--config PATH`.
 ## HUD (browser page, everything works without the terminal)
 
 Layout: header (mode pills + phase/step counter + red **E-STOP**), left column overhead (large) + wrist streams,
-right column status card and one tab per action group (run / robot / calibration / voice), rendered dynamically
+right column status card and one tab per action group (run / robot / calibration / voice / rules / models), rendered dynamically
 from `GET /actions` (button rows with input fields derived from each action's parameters). While no run is
 active a preview thread keeps the camera streams live.
 
@@ -95,8 +96,28 @@ ROBOT group (all through the normal safety envelope; refused while the loop is r
 `torque_on`, and the loop is paused. `GET /state` carries `robot: {ee_pose, joints_deg, gripper_open, holding,
 torque}`.
 
-VOICE group: `say_to_robot(text)` pushes a correction into the same queue as the microphone/stdin
-("put white things in wires", "stop", ...).
+VOICE group: `say_to_bot(text)` (alias `say_to_robot`) sends a typed correction through the voice classifier --
+rule-shaped sentences are persisted to RULES immediately (or by the loop while running), short bare commands
+(`open`, `home`, `stop`, ...) execute at the next step, anything else becomes a one-shot `(human)` hint for the
+VLM. **Push-to-talk**: hold the mic button; the page records with MediaRecorder (webm/opus) and POSTs the clip to
+`transcribe(audio_b64, mime)`, which runs ElevenLabs STT (`voice.stt_model`, default `scribe_v2`) and feeds the
+transcript through `say_to_bot`; the transcript is shown on the page and in `/state` (`voice.last_transcript`).
+A note appears if the browser has no microphone access. `speak(text)` is a TTS test (plays on the server machine).
+`GET /state` carries `voice: {mode, queue, last_transcript, tts_model, stt_model, voice_id}`.
+
+RULES group: `add_rule(text)`, `delete_rule(i)`, `move_rule(i, dir: up|down)` and `clear_hints()` manage the
+persistent RULES list (same RulesStore the voice path uses; survives restarts via `--rules-file`) and the
+one-shot hints of the current run. The rules tab renders the list with per-rule up/down/delete controls;
+`GET /state` carries `rules: {list, hints}`.
+
+MODELS group: `get_models()` lists what is selectable -- OpenAI vision-capable ids from `models.list()`
+(gpt-5 / gpt-4.1 / gpt-4o / o3 / o4 families, cached 5 min, graceful when the key is missing) and the
+ElevenLabs TTS/STT model ids plus the first ~30 voices from `voices.search()`. `set_model(provider, value)`
+with `provider: openai|elevenlabs_tts|elevenlabs_stt|elevenlabs_voice` hot-swaps the live VLM/VoiceIO **and**
+persists to `config.yaml` (`vlm.model`, `voice.tts_model`, `voice.stt_model`, `voice.elevenlabs_voice_id`)
+via a minimal text edit that preserves comments. The models tab shows one dropdown per provider; beside the
+OpenAI one the last VLM call's latency and a rough per-call $ estimate (from token usage and a small built-in
+price table) are shown, also served as `/state` `vlm: {model, last_latency_ms, last_cost_usd, last_usage}`.
 
 Loop behaviour: every iteration starts with `home()`, so objects and drop points must be within `max_step_mm`
 of HOME (with the default config: x 160-300 mm, |y| <= 160 mm). Rejected/unsafe commands are returned to the VLM
@@ -135,4 +156,5 @@ aruco mode and the workspace AABB xy in ball mode.
 the HUD overlay grid / zone outlines stop lining up with the table. Old `calib.json` files without the new keys
 still load (rigid `table_T_base` only, no fixed H).
 
-Keys: `OPENAI_API_KEY` (and optional `ELEVENLABS_API_KEY`) in `.env` at repo root.
+Keys: `OPENAI_API_KEY` (and optional `ELEVENLABS_API_KEY`) in `.env` at repo root. Without the ElevenLabs key,
+push-to-talk/`speak` report the missing key in their response instead of failing silently.

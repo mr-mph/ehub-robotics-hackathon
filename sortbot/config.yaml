@@ -44,6 +44,8 @@ vlm:
   model: gpt-5
 voice:
   elevenlabs_voice_id: 21m00Tcm4TlvDq8ikWAM
+  tts_model: eleven_turbo_v2_5   # eleven_flash_v2_5 | eleven_turbo_v2_5 | eleven_multilingual_v2 | eleven_v3
+  stt_model: scribe_v2           # scribe_v2 | scribe_v1
 hud:
   port: 8765
 calib_file: sortbot/calib/calib.json

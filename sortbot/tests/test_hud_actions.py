@@ -1,12 +1,14 @@
-"""HTTP tests for the HUD action endpoints (server-first main, RUN + ROBOT groups), all in mock mode.
+"""HTTP tests for the HUD action endpoints (server-first main, RUN/ROBOT/VOICE/RULES/MODELS groups), all in mock mode.
 
 `python -m sortbot.tests.test_hud_actions` or pytest. Every feature is exercised over POST /action/<name>
 against a live HUD server, exactly as the page drives it.
 """
 from __future__ import annotations
 
+import base64
 import json
 import logging
+import shutil
 import socket
 import tempfile
 import time
@@ -50,8 +52,11 @@ def _wait(fn, timeout=20.0, what=""):
 def test_hud_actions() -> None:
     logging.disable(logging.WARNING)
     port = _free_port()
+    tmp = Path(tempfile.mkdtemp())
+    cfg_copy = tmp / "config.yaml"  # set_model persists here, never into the real config.yaml
+    shutil.copy(Path(m.__file__).parent / "config.yaml", cfg_copy)
     args = Namespace(mock=False, real=False, max_steps=40, no_hud=False, no_voice=True, hud_port=port,
-                     live_vlm=False, rules_file=str(Path(tempfile.mkdtemp()) / "rules.json"), config=None)
+                     live_vlm=False, rules_file=str(tmp / "rules.json"), config=str(cfg_copy))
     session = m.serve(args)
     session.step_delay_s = 0.3  # slow the mock loop enough that pause/stop hit it mid-run
     get, post = _mk(f"http://127.0.0.1:{port}")
@@ -168,12 +173,118 @@ def test_hud_actions() -> None:
         c = get("/state")["calibration"]
         assert c["n"] >= 4 and c["residual_mean_mm"] is not None and c["residual_mean_mm"] < 3.0, c
         assert session._calib_out is not None and session._calib_out.exists()
+
+        # --- VOICE group: say_to_bot / transcribe / speak (fake ElevenLabs client; the HTTP path is real) ---
+        class _O:
+            def __init__(self, **kw):
+                self.__dict__.update(kw)
+
+        class _FakeEL:
+            class speech_to_text:
+                last: dict = {}
+
+                @classmethod
+                def convert(cls, **kw):
+                    cls.last = kw
+                    return _O(text="always put wires on the left")
+
+            class text_to_speech:
+                @staticmethod
+                def convert(voice_id, **kw):
+                    return iter([b"mp3bytes"])
+
+            class voices:
+                @staticmethod
+                def search(page_size=30):
+                    return _O(voices=[_O(voice_id="v1", name="Rachel"), _O(voice_id="v2", name="Sam")])
+
+        session.voice._client = _FakeEL()
+        session.voice._player = None  # no audio playback during tests
+        acts = {a["name"]: a for a in get("/actions")}
+        for name, group in (("say_to_bot", "voice"), ("transcribe", "voice"), ("speak", "voice"),
+                            ("add_rule", "rules"), ("delete_rule", "rules"), ("move_rule", "rules"),
+                            ("clear_hints", "rules"), ("get_models", "models"), ("set_model", "models")):
+            assert name in acts and acts[name]["group"] == group, (name, acts.get(name))
+            assert acts[name]["help"], f"{name} has no help text in GET /actions"
+        r = post("say_to_bot", {"text": "screws go in the actuators bin"})  # idle + rule -> persisted now
+        assert r["ok"] and r["data"]["kind"] == "rule", r
+        assert "screws go in the actuators bin" in get("/state")["rules"]["list"]
+        r = post("say_to_bot", {"text": "open"})  # idle + immediate command -> queued for the next run
+        assert r["ok"] and r["data"]["kind"] == "action" and "queued" in r["message"], r
+        assert "open" in get("/state")["voice"]["queue"]
+        r = post("transcribe", {"audio_b64": base64.b64encode(b"\x1aE\xdf\xa3 fake webm").decode(),
+                                "mime": "audio/webm"})
+        assert r["ok"] and r["data"]["text"] == "always put wires on the left", r
+        assert _FakeEL.speech_to_text.last["model_id"] == "scribe_v2"
+        assert _FakeEL.speech_to_text.last["file"][2] == "audio/webm"
+        assert get("/state")["voice"]["last_transcript"] == "always put wires on the left"
+        assert "always put wires on the left" in get("/state")["rules"]["list"]  # classified as a rule
+        assert not post("transcribe", {"audio_b64": ""})["ok"]
+        assert post("speak", {"text": "test sentence"})["ok"]
+        assert not post("speak", {"text": ""})["ok"]
+
+        # --- RULES group ---
+        rules0 = get("/state")["rules"]["list"]
+        assert post("add_rule", {"text": "red things are wires"})["ok"]
+        lst = get("/state")["rules"]["list"]
+        assert lst == rules0 + ["red things are wires"], lst
+        i = lst.index("red things are wires")
+        while i > 0:  # walk it to the top
+            assert post("move_rule", {"i": i, "dir": "up"})["ok"]
+            i -= 1
+        assert get("/state")["rules"]["list"][0] == "red things are wires"
+        assert not post("move_rule", {"i": 0, "dir": "up"})["ok"]
+        assert not post("move_rule", {"i": 0, "dir": "sideways"})["ok"]
+        assert post("delete_rule", {"i": 0})["ok"]
+        assert "red things are wires" not in get("/state")["rules"]["list"]
+        assert not post("delete_rule", {"i": 99})["ok"]
+        assert post("clear_hints")["ok"]
+
+        # --- MODELS group (fake clients injected; caching, filtering and persistence are real) ---
+        class _FakeOpenAI:
+            class models:
+                calls = 0
+
+                @classmethod
+                def list(cls):
+                    cls.calls += 1
+                    return [_O(id=i) for i in ("gpt-4o", "gpt-5", "gpt-5-mini", "o3",
+                                               "gpt-4o-audio-preview", "whisper-1", "gpt-3.5-turbo")]
+
+        session.models._openai_client = _FakeOpenAI()
+        session.models._el_client = _FakeEL()
+        r = post("get_models")
+        assert r["ok"], r
+        d = r["data"]
+        assert d["openai"][0] == d["current"]["openai"] and set(d["openai"]) >= {"gpt-4o", "gpt-5", "gpt-5-mini", "o3"}, d
+        assert "gpt-4o-audio-preview" not in d["openai"] and "whisper-1" not in d["openai"] and "gpt-3.5-turbo" not in d["openai"]
+        assert d["elevenlabs"]["tts"] == ["eleven_flash_v2_5", "eleven_turbo_v2_5", "eleven_multilingual_v2", "eleven_v3"]
+        assert d["elevenlabs"]["stt"] == ["scribe_v2", "scribe_v1"]
+        assert {v["id"] for v in d["elevenlabs"]["voices"]} == {"v1", "v2"}
+        post("get_models")
+        assert _FakeOpenAI.models.calls == 1, "openai listing not cached for 5 min"
+        r = post("set_model", {"provider": "elevenlabs_stt", "value": "scribe_v1"})
+        assert r["ok"] and "persisted" in r["message"] and session.voice.stt_model == "scribe_v1", r
+        assert post("set_model", {"provider": "openai", "value": "gpt-4o"})["ok"] and session.cfg.openai_model == "gpt-4o"
+        assert post("set_model", {"provider": "elevenlabs_voice", "value": "v2"})["ok"] and session.voice.voice_id == "v2"
+        assert post("set_model", {"provider": "elevenlabs_tts", "value": "eleven_v3"})["ok"] and session.voice.tts_model == "eleven_v3"
+        assert not post("set_model", {"provider": "bananas", "value": "x"})["ok"]
+        import yaml as _yaml
+        ytext = cfg_copy.read_text()
+        y = _yaml.safe_load(ytext)
+        assert y["vlm"]["model"] == "gpt-4o" and y["voice"]["stt_model"] == "scribe_v1", y
+        assert y["voice"]["tts_model"] == "eleven_v3" and y["voice"]["elevenlabs_voice_id"] == "v2", y
+        assert "# indices verified" in ytext, "config.yaml comments were clobbered"
+        d = post("get_models")["data"]
+        assert d["openai"][0] == "gpt-4o" and d["current"]["elevenlabs_voice"] == "v2", d
+        assert get("/state")["vlm"]["model"] == "mock"  # mock vlm is connected; latency card present
     finally:
         session.shutdown()
         session.voice.stop()
         if session.hud is not None:
             session.hud.stop()
-    print("hud actions OK: server-first, RUN/ROBOT groups, E-STOP, restart, calibration all over HTTP")
+    print("hud actions OK: RUN/ROBOT/VOICE/RULES/MODELS groups, E-STOP, restart, calibration, "
+          "push-to-talk transcribe + model hot-swap all over HTTP")
 
 
 if __name__ == "__main__":

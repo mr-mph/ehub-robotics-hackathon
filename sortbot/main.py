@@ -15,6 +15,7 @@ HUD calibration: "Start calibration" runs immediately when idle, else at the nex
 from __future__ import annotations
 
 import argparse
+import base64
 import io
 import logging
 import tempfile
@@ -28,6 +29,7 @@ import numpy as np
 from sortbot import config as cfgmod
 from sortbot import perception
 from sortbot.types import Command, DetectedObject, ExecResult, RobotAPI, WorldState
+from sortbot.models import PROVIDERS, ModelRegistry, yaml_set
 from sortbot.vlm import VLM, MockVLM
 from sortbot.voice import RulesStore, VoiceIO, classify
 
@@ -402,6 +404,7 @@ class Session:
         self.robot_lock = threading.RLock()
         self._robot_cache: dict = {}
         self.calib, self._calib_out = None, None
+        self.models = ModelRegistry()
         self.last_overhead: np.ndarray | None = None
         self._shutdown = threading.Event()
         self._register()
@@ -427,9 +430,31 @@ class Session:
         h.register("goto", self.goto, "Go to", "robot")
         h.register("torque_off", self.torque_off, "E-STOP (torque off)", "robot", params=[])
         h.register("torque_on", self.torque_on, "Torque on", "robot", params=[])
-        h.register("say_to_robot", self.say_to_robot, "Send correction", "voice")
+        h.register("say_to_bot", self.say_to_bot, "Send to bot", "voice",
+                   help="Send a typed correction through the voice classifier (rule / hint / immediate command), exactly like speech.")
+        h.register("say_to_robot", self.say_to_bot, None, "voice",
+                   help="Alias of say_to_bot, kept for older pages/scripts.")
+        h.register("transcribe", self.transcribe, None, "voice",
+                   help="Push-to-talk: POST base64 audio (webm/opus and friends); ElevenLabs STT transcribes it and the text goes through say_to_bot.")
+        h.register("speak", self.speak, "Speak (TTS test)", "voice",
+                   help="Say the text aloud via ElevenLabs TTS with the current voice/model (plays on the server machine).")
+        h.register("add_rule", self.add_rule, "Add rule", "rules",
+                   help="Append a persistent rule; rules ride along with every VLM prompt and survive restarts.")
+        h.register("delete_rule", self.delete_rule, None, "rules",
+                   help="Delete the rule at 0-based index i (the x button in the list).")
+        h.register("move_rule", self.move_rule, None, "rules",
+                   help="Move rule i one slot up or down (dir: up|down); earlier rules read as higher priority.")
+        h.register("clear_hints", self.clear_hints, "Clear hints", "rules",
+                   help="Drop the one-shot (human) hints accumulated during the current run; persisted rules are kept.")
+        h.register("get_models", self.get_models, "Refresh models", "models",
+                   help="List selectable OpenAI / ElevenLabs models and voices (OpenAI listing cached 5 min).")
+        h.register("set_model", self.set_model, None, "models",
+                   help="Hot-swap a model (provider: openai|elevenlabs_tts|elevenlabs_stt|elevenlabs_voice) on the live clients and persist it to config.yaml.")
         h.add_state_source("run", self._run_state)
         h.add_state_source("robot", self._robot_state)
+        h.add_state_source("voice", self._voice_state)
+        h.add_state_source("rules", self._rules_state)
+        h.add_state_source("vlm", self._vlm_state)
         self._register_calib_placeholders()
 
     def _register_calib_placeholders(self) -> None:
@@ -507,7 +532,7 @@ class Session:
         self.vlm, self.mode["vlm"] = None, None
         if v == "off":
             return
-        self.vlm = MockVLM() if v == "mock" else VLM()
+        self.vlm = MockVLM() if v == "mock" else VLM(self.cfg.openai_model)
         self.mode["vlm"] = v
 
     def _refresh_rig(self) -> None:
@@ -669,9 +694,110 @@ class Session:
             self.loop.task = self.task
         return {"ok": True, "message": f"task: {self.task or '(default: sort sensibly)'}", "data": None}
 
-    def say_to_robot(self, text: str) -> dict:
-        self.voice.push(str(text))
-        return {"ok": True, "message": f"queued: {text}", "data": None}
+    def say_to_bot(self, text: str) -> dict:
+        """Same path as spoken corrections: classifier -> rule / immediate command / VLM hint."""
+        text = str(text).strip()
+        if not text:
+            return {"ok": False, "message": "empty text", "data": None}
+        it = classify(text)
+        if it.kind == "rule" and not self._running():
+            self.rules.append(it.text)  # nothing drains the queue while idle; persist now so the page shows it
+            return {"ok": True, "message": f"rule added: {it.text}", "data": {"kind": "rule"}}
+        self.voice.push(text)
+        kind = {"rule": "rule", "action": "command", "unknown": "hint"}[it.kind]
+        when = "" if self._running() else " (queued until the next run)"
+        return {"ok": True, "message": f"heard as {kind}: {it.text}{when}", "data": {"kind": it.kind}}
+
+    def transcribe(self, audio_b64: str, mime: str = "audio/webm") -> dict:
+        """HUD push-to-talk: base64 audio -> ElevenLabs STT -> say_to_bot."""
+        try:
+            data = base64.b64decode(str(audio_b64))
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "message": f"bad base64 audio: {e}", "data": None}
+        if not data:
+            return {"ok": False, "message": "empty audio", "data": None}
+        text = self.voice.transcribe_bytes(data, str(mime))  # raises without a key -> reported by the HUD wrapper
+        if not text:
+            return {"ok": False, "message": "no speech recognized", "data": None}
+        r = self.say_to_bot(text)
+        return {"ok": True, "message": f'"{text}" -> {r["message"]}',
+                "data": {"text": text, "kind": (r.get("data") or {}).get("kind")}}
+
+    def speak(self, text: str) -> dict:
+        text = str(text).strip()
+        if not text:
+            return {"ok": False, "message": "empty text", "data": None}
+        self.voice.speak(text)
+        if self.voice._client is None:
+            return {"ok": True, "message": "no ELEVENLABS_API_KEY: logged to the server console only", "data": None}
+        return {"ok": True, "message": f"speaking ({self.voice.tts_model}, voice {self.voice.voice_id})", "data": None}
+
+    # ------------------------------------------------ RULES actions
+    def add_rule(self, text: str) -> dict:
+        text = str(text).strip()
+        if not text:
+            return {"ok": False, "message": "empty rule", "data": None}
+        self.rules.append(text)
+        return {"ok": True, "message": f"rule added: {text}", "data": {"rules": self.rules.list()}}
+
+    def delete_rule(self, i: int) -> dict:
+        r = self.rules.delete(int(i))
+        if r is None:
+            return {"ok": False, "message": f"no rule at index {i}", "data": None}
+        return {"ok": True, "message": f"deleted rule {i}: {r}", "data": {"rules": self.rules.list()}}
+
+    def move_rule(self, i: int, dir: str = "up") -> dict:
+        d = str(dir).lower()
+        if d not in ("up", "down"):
+            return {"ok": False, "message": "dir must be up|down", "data": None}
+        if not self.rules.move(int(i), -1 if d == "up" else 1):
+            return {"ok": False, "message": f"cannot move rule {i} {d}", "data": None}
+        return {"ok": True, "message": f"moved rule {i} {d}", "data": {"rules": self.rules.list()}}
+
+    def clear_hints(self) -> dict:
+        n = len(self.loop.hints) if self.loop is not None else 0
+        if self.loop is not None:
+            self.loop.hints = []
+        return {"ok": True, "message": f"cleared {n} hint(s)", "data": None}
+
+    # ------------------------------------------------ MODELS actions
+    def _model_current(self) -> dict:
+        return {"openai": self.cfg.openai_model, "elevenlabs_tts": self.voice.tts_model,
+                "elevenlabs_stt": self.voice.stt_model, "elevenlabs_voice": self.voice.voice_id}
+
+    def get_models(self) -> dict:
+        d = self.models.get(self._model_current())
+        msg = "; ".join(d["notes"]) or f"{len(d['openai'])} openai models, {len(d['elevenlabs']['voices'])} voices"
+        return {"ok": True, "message": msg, "data": d}
+
+    def set_model(self, provider: str, value: str) -> dict:
+        """Hot-swap on the live objects (VLM / VoiceIO) + persist to config.yaml (comments preserved)."""
+        provider, value = str(provider).lower(), str(value).strip()
+        if provider not in PROVIDERS:
+            return {"ok": False, "message": f"provider must be one of {'|'.join(PROVIDERS)}", "data": None}
+        if not value:
+            return {"ok": False, "message": "empty value", "data": None}
+        if provider == "openai":
+            self.cfg.openai_model = value
+            if isinstance(self.vlm, VLM):
+                self.vlm.model = value
+            sec, key = "vlm", "model"
+        elif provider == "elevenlabs_tts":
+            self.voice.tts_model = self.cfg.tts_model = value
+            sec, key = "voice", "tts_model"
+        elif provider == "elevenlabs_stt":
+            self.voice.stt_model = self.cfg.stt_model = value
+            sec, key = "voice", "stt_model"
+        else:
+            self.voice.voice_id = self.cfg.elevenlabs_voice_id = value
+            sec, key = "voice", "elevenlabs_voice_id"
+        try:
+            yaml_set(self.cfg.source_path, sec, key, value)
+            persisted = f"persisted to {self.cfg.source_path.name}"
+        except Exception as e:  # noqa: BLE001
+            persisted = f"NOT persisted: {e}"
+        return {"ok": True, "message": f"{provider} = {value} (live; {persisted})",
+                "data": {"current": self._model_current()}}
 
     # ------------------------------------------------ ROBOT actions
     def _robot_act(self, fn, allow_while_running: bool = False) -> dict:
@@ -737,6 +863,21 @@ class Session:
                 "task": self.task, "last_error": self.last_error, "result": self.result,
                 "connected": self._connected()}
 
+    def _voice_state(self) -> dict:
+        v = self.voice
+        return {"mode": v.mode, "queue": v.peek(), "last_transcript": v.last_transcript,
+                "tts_model": v.tts_model, "stt_model": v.stt_model, "voice_id": v.voice_id}
+
+    def _rules_state(self) -> dict:
+        return {"list": self.rules.list(), "hints": list(self.loop.hints) if self.loop is not None else []}
+
+    def _vlm_state(self) -> dict | None:
+        v = self.vlm
+        if v is None:
+            return None
+        return {"model": getattr(v, "model", "?"), "last_latency_ms": getattr(v, "last_latency_ms", None),
+                "last_cost_usd": getattr(v, "last_cost_usd", None), "last_usage": getattr(v, "last_usage", None)}
+
     def _robot_state(self) -> dict | None:
         r = self.robot
         if r is None:
@@ -792,7 +933,7 @@ def serve(args) -> Session:
         hud = HUD(port=args.hud_port or cfg.hud_port)
         hud.start()
     voice = VoiceIO(cfg.elevenlabs_voice_id, stdin=io.StringIO("") if (args.no_voice or args.mock) else None,
-                    force_text=not args.real)
+                    force_text=not args.real, tts_model=cfg.tts_model, stt_model=cfg.stt_model)
     voice.start()
     rules = RulesStore(args.rules_file) if args.rules_file else RulesStore()
     return Session(cfg, hud, voice, rules, max_steps=args.max_steps)

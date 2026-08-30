@@ -10,6 +10,7 @@ import argparse
 import base64
 import json
 import os
+import time
 from typing import Iterable
 
 from sortbot.types import Command, DetectedObject, WorldState, Zone
@@ -35,6 +36,23 @@ TOOLS = [
 ]
 # Tool name -> Command.tool (types.Command uses open/close for the gripper tools).
 TOOL_TO_CMD = {"open_gripper": "open", "close_gripper": "close"}
+
+# Rough $ / 1M tokens (input, output); longest-prefix match. Good enough for a per-call HUD estimate.
+PRICES_PER_MTOK = {
+    "gpt-5-nano": (0.05, 0.40), "gpt-5-mini": (0.25, 2.00), "gpt-5": (1.25, 10.00),
+    "gpt-4.1-nano": (0.10, 0.40), "gpt-4.1-mini": (0.40, 1.60), "gpt-4.1": (2.00, 8.00),
+    "gpt-4o-mini": (0.15, 0.60), "gpt-4o": (2.50, 10.00),
+    "o3-pro": (20.00, 80.00), "o3": (2.00, 8.00), "o4-mini": (1.10, 4.40),
+}
+
+
+def estimate_cost_usd(model: str, input_tokens: int, output_tokens: int) -> float | None:
+    """Rough per-call cost from the price table; None for unknown models."""
+    for prefix in sorted(PRICES_PER_MTOK, key=len, reverse=True):
+        if model.startswith(prefix):
+            i, o = PRICES_PER_MTOK[prefix]
+            return (input_tokens * i + output_tokens * o) / 1e6
+    return None
 
 SYSTEM_PROMPT = """You are the planner for a small tabletop robot arm that sorts objects into zones.
 Each step you see an overhead photo with numbered candidate objects (and zone outlines) and a wrist-camera photo,
@@ -76,6 +94,9 @@ class VLM:
             from sortbot import config
             model = config.load().openai_model
         self.model = model
+        self.last_latency_ms: int | None = None
+        self.last_usage: dict | None = None
+        self.last_cost_usd: float | None = None
         if client is None:
             from dotenv import load_dotenv
             from openai import OpenAI
@@ -87,6 +108,7 @@ class VLM:
         content = [{"type": "input_text", "text": "Overhead camera (numbered objects, zones):"}, _img(overhead_overlay_png),
                    {"type": "input_text", "text": "Wrist camera:"}, _img(wrist_png),
                    {"type": "input_text", "text": _state_text(world, history)}]
+        t0 = time.time()
         resp = self.client.responses.create(
             model=self.model,
             instructions=SYSTEM_PROMPT,
@@ -95,6 +117,12 @@ class VLM:
             tool_choice="required",
             parallel_tool_calls=False,
         )
+        self.last_latency_ms = int((time.time() - t0) * 1000)
+        u = getattr(resp, "usage", None)
+        if u is not None:
+            self.last_usage = {"input_tokens": u.input_tokens, "output_tokens": u.output_tokens,
+                               "total_tokens": u.total_tokens}
+            self.last_cost_usd = estimate_cost_usd(self.model, u.input_tokens, u.output_tokens)
         calls = [o for o in resp.output if getattr(o, "type", "") == "function_call"]
         if not calls:
             raise RuntimeError(f"VLM returned no tool call: {resp.output_text!r}")
@@ -106,7 +134,10 @@ class MockVLM:
     """Deterministic: pick lowest id -> place in zones round-robin -> done when no objects remain."""
 
     def __init__(self, model: str | None = None):
+        self.model = model or "mock"
         self._zone_i = 0
+        self.last_latency_ms: int | None = None
+        self.last_usage = self.last_cost_usd = None
 
     def plan_step(self, overhead_overlay_png: bytes, wrist_png: bytes, world: WorldState, history: list) -> Command:
         if world.holding is not None:
@@ -160,6 +191,10 @@ def _selftest() -> None:
     assert all(t["name"] in {"pick", "place_in_zone", "place_at", "open_gripper", "close_gripper",
                              "move_to", "turn_to", "say", "done"} for t in TOOLS)
     assert "RULES" in _state_text(world, hist) and "put red things" in _state_text(world, hist)
+    c = estimate_cost_usd("gpt-5", 10_000, 1_000)
+    assert c is not None and abs(c - 0.0225) < 1e-9, c
+    assert estimate_cost_usd("gpt-5-mini-2025", 1000, 0) == 0.00025
+    assert estimate_cost_usd("mock", 1, 1) is None
     print("selftest OK:", seq)
 
 

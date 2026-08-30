@@ -26,6 +26,7 @@ workspace:
   max_step_mm: 250.0
   aabb_mm: {min: [120.0, -220.0, 0.0], max: [420.0, 220.0, 250.0]}
   home: {x: 150.0, y: 0.0, z: 180.0, roll_deg: 0.0}
+  z_trim_mm: -10
 aruco:
   dict: DICT_4X4_50
   tag_size_mm: 40.0
@@ -44,7 +45,18 @@ calibration:
   ball_radius_mm: 20.0
   min_sample_spacing_mm: 15.0
 vlm:
-  model: gpt-5.6-luna
+  model: gpt-5.6-luna       # the PLANNER: sees the photos, emits one tool call per step
+  # The CHAT worker ("Luna") answers the human while the planner keeps working: small + fast + vision.
+  chat_model: gpt-5.4-mini
+  chat_effort: low         # none | low | medium | high  (reasoning effort for chat + verify; keep it low)
+  # The grasp-alignment check before every close (overhead + wrist -> aligned/dx/dy). Defaults to chat_model.
+  verify_model: gpt-5.4-mini
+grasp:
+  # NEVER close the claw without first checking BOTH cameras that the jaws are over the object.
+  verify: true              # false is possible but logs a loud warning at startup -- keep it true
+  max_correction_cm: 2.0    # a single re-centring nudge is clamped to this
+  max_retries: 2            # re-checks after a correction; still not aligned -> the pick is ABORTED
+  min_confidence: 0.5       # a low-confidence "aligned" verdict does not count as aligned
 voice:
   elevenlabs_voice_id: 21m00Tcm4TlvDq8ikWAM
   tts_model: eleven_flash_v2_5    # eleven_flash_v2_5 | eleven_turbo_v2_5 | eleven_multilingual_v2 | eleven_v3

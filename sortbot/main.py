@@ -12,6 +12,42 @@ runs immediately when idle, else at the next step boundary (loop pauses).
 Tests inject doubles through Session(..., factories=...) (see sortbot/testing.py); no mock is reachable
 from this CLI or the page.
 
+MULTI-QUEUE CONVERSATION ARCHITECTURE (feature: talk to "Luna" while she keeps working)
+--------------------------------------------------------------------------------------
+One loop doing perception -> one planner call -> one tool cannot also hold a conversation: a reply that
+costs a whole `say` tool call lands ten seconds late and a step behind. So talking and acting are split
+across FOUR queues and two threads, and the action loop NEVER waits on the conversation:
+
+  q_heard      voice.VoiceIO._q      everything the human says (mic PTT / the Listening toggle / the HUD
+                                     text box / say_to_bot). Produced by voice.py, exactly as before.
+                CONSUMER: the Chat worker (or, when a Loop is built without a Session -- tests, selftests
+                -- the Loop's own legacy classifier path, so nothing is ever silently dropped).
+
+  q_directives main.DirectiveQueue   what the conversation decided the ACTION loop must obey:
+                                     kind "rule"  -> persisted into RulesStore (rides every planner prompt)
+                                     kind "hint"  -> one-shot "(human) ..." for the next planner prompt
+                                     kind "cmd"   -> a bare open/close/home the loop runs under the bus lock
+                                     kind "stop"  -> end the run at the step boundary
+                PRODUCER: the Chat worker.  CONSUMER: Loop.drain_inputs(), at the SAME drain point voice
+                corrections used to be read -- a non-blocking drain(), never a wait.
+
+  q_say        voice.VoiceIO._speak_q ONE TTS worker, so the bot never talks over itself. A conversational
+                                     reply is queued with priority=True, which drops the stale backlog so
+                                     the fresh reply wins over queued planner chatter.
+
+  q_log        main.DecisionLog       unchanged: every decision/event for the HUD.
+
+THREAD "luna-chat" (main.ChatWorker): drains q_heard at 20 Hz and answers immediately.
+  * URGENT PATH FIRST, no LLM: voice.urgent_kind() (regex) catches stop/pause/E-STOP-shaped speech and
+    sets the existing Control events THEN AND THERE. A conversational reply must never delay a stop.
+    voice.bare_command() likewise short-circuits "open"/"close"/"home" straight into q_directives.
+  * Everything else: ONE fast call (vlm.chat, config vlm.chat_model, low effort, short max output) with the
+    LATEST CACHED overhead+wrist JPEGs (<= 512 px, published by the preview/loop threads) plus a text
+    snapshot of phase/step/holding/last tool call/rules/task -> {reply, rules, hints, urgent}.
+    The reply goes to q_say, the rules/hints to q_directives.
+  * IT NEVER TOUCHES THE ROBOT OR THE BUS and never captures a frame of its own: it reads cached state
+    only, so it cannot violate the bus invariant below (and holds no lock anything else waits on).
+
 THREADING INVARIANT -- the Feetech serial bus: EXACTLY ONE THREAD MAY TOUCH THE MOTOR BUS AT A TIME.
 Every bus access in the app goes through Session.robot_lock (shared by the Loop thread, the HUD /state
 poller, the HUD ROBOT actions and the calibration teleop thread); any component that cannot get the lock
@@ -29,6 +65,7 @@ import argparse
 import base64
 import collections
 import io
+import json
 import logging
 import os
 import threading
@@ -43,7 +80,7 @@ from sortbot import perception
 from sortbot.types import Command, ExecResult, Pose, RobotAPI, WorldState
 from sortbot.models import PROVIDERS, ModelRegistry, yaml_set
 from sortbot.vlm import VLM
-from sortbot.voice import RulesStore, VoiceIO, classify
+from sortbot.voice import RulesStore, VoiceIO, bare_command, classify, urgent_kind
 
 log = logging.getLogger("sortbot.main")
 
@@ -150,6 +187,204 @@ def png(rgb: np.ndarray) -> bytes:
     return buf.tobytes()
 
 
+def small_jpeg(rgb: np.ndarray | None, max_w: int = 512, quality: int = 72) -> bytes | None:
+    """Downscale to <= max_w and JPEG-encode. Every latency-sensitive VLM call (chat, grasp check) sends
+    these, not full-resolution PNGs: the upload dominates the round trip."""
+    if rgb is None:
+        return None
+    try:
+        h, w = rgb.shape[:2]
+        if w > max_w:
+            rgb = cv2.resize(rgb, (max_w, max(1, round(h * max_w / w))), interpolation=cv2.INTER_AREA)
+        ok, buf = cv2.imencode(".jpg", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, quality])
+        return buf.tobytes() if ok else None
+    except Exception as e:  # noqa: BLE001
+        log.debug("small_jpeg: %s", e)
+        return None
+
+
+class DirectiveQueue:
+    """q_directives (see the MULTI-QUEUE block): what the conversation decided the ACTION loop must obey.
+    kind: "rule" (persistent) | "hint" (one-shot) | "cmd" (bare open/close/home) | "stop".
+    drain() is non-blocking on purpose -- the action loop must never wait on the conversation."""
+
+    KINDS = ("rule", "hint", "cmd", "stop")
+
+    def __init__(self):
+        self._q: collections.deque = collections.deque()
+        self._lock = threading.Lock()
+
+    def put(self, kind: str, text: str = "") -> None:
+        assert kind in self.KINDS, kind
+        with self._lock:
+            self._q.append({"kind": kind, "text": str(text).strip(), "t": round(time.time(), 2)})
+
+    def drain(self) -> list[dict]:
+        with self._lock:
+            out, self._q = list(self._q), collections.deque()
+        return out
+
+    def peek(self) -> list[dict]:
+        with self._lock:
+            return list(self._q)
+
+
+class Transcript:
+    """Ring buffer of the conversation for the HUD panel: {t, who: 'you'|'luna', text}, oldest first."""
+
+    def __init__(self, maxlen: int = 60):
+        self._d: collections.deque = collections.deque(maxlen=maxlen)
+        self._lock = threading.Lock()
+        self._n = 0
+
+    def add(self, who: str, text: str) -> None:
+        text = str(text).strip()
+        if not text:
+            return
+        with self._lock:
+            self._n += 1
+            self._d.append({"i": self._n, "who": who, "t": round(time.time(), 2), "text": text})
+
+    def entries(self) -> list[dict]:
+        with self._lock:
+            return list(self._d)
+
+    def clear(self) -> int:
+        with self._lock:
+            n = len(self._d)
+            self._d.clear()
+            return n
+
+
+class ChatWorker:
+    """Thread "luna-chat": the CONVERSATION channel. Drains q_heard immediately, answers in one fast LLM
+    call, and turns what it learns into q_directives for the action loop. See the MULTI-QUEUE block above.
+
+    IT NEVER TOUCHES THE ROBOT OR THE BUS, and it never captures a frame: `frames_fn` hands it the latest
+    CACHED overhead/wrist JPEGs that the preview and loop threads already publish."""
+
+    POLL_S = 0.05
+    ACKS = {"stop": "Stopping.", "pause": "Pausing."}
+
+    def __init__(self, voice: VoiceIO, directives: DirectiveQueue, transcript: Transcript,
+                 vlm_fn, ctx_fn, frames_fn, urgent_fn=None, log_fn=None):
+        self.voice, self.directives, self.transcript = voice, directives, transcript
+        self.vlm_fn, self.ctx_fn, self.frames_fn = vlm_fn, ctx_fn, frames_fn
+        self.urgent_fn, self.log_fn = urgent_fn, log_fn
+        self.last_latency_ms: int | None = None
+        self.last_error = ""
+        self.busy = False
+        self.replies = 0
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    # -- lifecycle
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="luna-chat")
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+
+    @property
+    def alive(self) -> bool:
+        return bool(self._thread is not None and self._thread.is_alive())
+
+    # -- work
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            heard = self.voice.drain()
+            if not heard:
+                time.sleep(self.POLL_S)
+                continue
+            try:
+                self.handle(heard)
+            except Exception as e:  # noqa: BLE001 - the conversation must never kill its own thread
+                self.last_error = str(e)
+                log.warning("chat worker: %s", e)
+
+    def handle(self, heard: list[str] | str) -> dict | None:
+        """One turn. Utterances that piled up are merged so the reply is to the LATEST thing said, not to
+        a backlog. Returns the chat result (tests call this synchronously)."""
+        lines = [heard] if isinstance(heard, str) else list(heard)
+        lines = [s.strip() for s in lines if s and s.strip()]
+        if not lines:
+            return None
+        text = " ".join(lines)
+        self.transcript.add("you", text)
+
+        # ---- URGENT PATH: regex only, no LLM. A stop must never wait for a model. ----
+        kind = urgent_kind(text)
+        if kind != "none":
+            self._urgent(kind, text)
+            return {"reply": self.ACKS[kind], "rules": [], "hints": [], "urgent": kind}
+
+        # ---- bare "open" / "close" / "home": the loop can just do it, no model needed ----
+        cmd = bare_command(text)
+        if cmd is not None:
+            self.directives.put("cmd", cmd)
+            self._record("chat", {"heard": text}, f"command queued for the loop: {cmd}")
+            return {"reply": "", "rules": [], "hints": [], "urgent": "none"}
+
+        vlm = self.vlm_fn()
+        if vlm is None or not hasattr(vlm, "chat"):  # no model connected: fall back to the old classifier
+            it = classify(text)
+            self.directives.put("rule" if it.kind == "rule" else "hint", it.text)
+            self._record("chat", {"heard": text}, f"no chat model; kept as {it.kind}: {it.text}", ok=False)
+            return None
+
+        ov, wr = self.frames_fn()
+        self.busy = True
+        t0 = time.time()
+        try:
+            d = vlm.chat(text, self.ctx_fn(), ov, wr)
+        finally:
+            self.busy = False
+        self.last_latency_ms = int((time.time() - t0) * 1000)
+        self.replies += 1
+
+        if d.get("urgent") in ("stop", "pause"):  # the model heard a stop the regex did not
+            self._urgent(d["urgent"], text, speak=False)
+        reply = str(d.get("reply", "")).strip()
+        if reply:
+            self.transcript.add("luna", reply)
+            self.voice.speak(reply, priority=True)  # q_say: a fresh reply pre-empts stale chatter
+        for r in d.get("rules") or []:
+            self.directives.put("rule", r)
+        for h in d.get("hints") or []:
+            self.directives.put("hint", h)
+        self._record("chat", {"heard": text}, f"{reply or '(no reply)'}"
+                     + (f"  [rules: {d.get('rules')}]" if d.get("rules") else "")
+                     + (f"  [hints: {d.get('hints')}]" if d.get("hints") else ""),
+                     say=reply, latency_ms=self.last_latency_ms)
+        return d
+
+    def _urgent(self, kind: str, text: str, speak: bool = True) -> None:
+        """Take effect IMMEDIATELY: set the control events, then talk about it."""
+        if self.urgent_fn is not None:
+            try:
+                self.urgent_fn(kind)
+            except Exception as e:  # noqa: BLE001
+                log.warning("urgent %s: %s", kind, e)
+        if kind == "stop":
+            self.directives.put("stop", text)
+        ack = self.ACKS[kind]
+        if speak:
+            self.transcript.add("luna", ack)
+            self.voice.speak(ack, priority=True)
+        self._record("chat", {"heard": text}, f"URGENT {kind} (regex pre-filter, no model call)",
+                     ok=False, say=ack if speak else "")
+
+    def _record(self, tool, args, result, ok=True, say="", latency_ms=None) -> None:
+        if self.log_fn is not None:
+            try:
+                self.log_fn(tool, args, result, ok, say, latency_ms)
+            except Exception as e:  # noqa: BLE001
+                log.debug("chat log: %s", e)
+
+
 class DecisionLog:
     """Ring buffer (last 200) of decisions/events for the HUD LOG tab, served newest-first at GET /log.
     Entries: {i, step, t, tool, args, result, ok, say, latency_ms, thumb_b64 (160px overlay jpeg)}."""
@@ -192,11 +427,16 @@ class DecisionLog:
 class Loop:
     def __init__(self, cfg, robot, vlm, voice, hud, homography, rules: RulesStore, max_steps: int,
                  task: str = "", ctl: Control | None = None, lock: threading.RLock | None = None,
-                 step_delay_s: float = 0.0):
+                 step_delay_s: float = 0.0, directives: "DirectiveQueue | None" = None):
         self.cfg, self.robot, self.vlm, self.voice, self.hud = cfg, robot, vlm, voice, hud
         self.homog, self.rules, self.max_steps = homography, rules, max_steps
         self.task, self.ctl, self.lock = task, ctl, lock or threading.RLock()
         self.step_delay_s = step_delay_s
+        # q_directives: set by the Session, and then the Chat worker owns q_heard (see the MULTI-QUEUE
+        # block). None (a Loop built directly, e.g. tests/selftests) = no chat worker, so this loop keeps
+        # draining q_heard itself through the old classifier and nothing is dropped.
+        self.directives = directives
+        self.last_verdict: dict | None = None  # last pre-grasp alignment verdict (HUD + decision log)
         self.step = 0
         self.history: list[dict] = []
         self.hints: list[str] = []
@@ -227,9 +467,28 @@ class Loop:
         except Exception as e:  # noqa: BLE001
             log.debug("pose cache refresh: %s", e)
 
-    # ---- voice ----
-    def drain_voice(self) -> bool:
-        """Returns False if a stop was requested."""
+    # ---- conversation -> action (q_directives; see the MULTI-QUEUE block at the top) ----
+    def drain_inputs(self) -> bool:
+        """The loop's ONE drain point for everything the human said. Non-blocking: the action loop never
+        waits on the conversation. Returns False if a stop was requested."""
+        keep_going = True
+        for d in (self.directives.drain() if self.directives is not None else []):
+            kind, text = d["kind"], d["text"]
+            log.info("directive %s: %s", kind, text)
+            if kind == "rule":
+                self.rules.append(text)
+            elif kind == "hint":
+                self.hints.append(f"(human) {text}")
+            elif kind == "cmd":
+                self._run_bare(text)
+            elif kind == "stop":
+                keep_going = False
+        if self.directives is None:  # no chat worker: legacy classifier path, this loop owns q_heard
+            keep_going = self._drain_voice_legacy() and keep_going
+        return keep_going
+
+    def _drain_voice_legacy(self) -> bool:
+        """Pre-chat-worker path, still used when a Loop is built without a Session (tests, selftests)."""
         for text in self.voice.drain():
             it = classify(text)
             log.info("voice %s: %s", it.kind, it.text)
@@ -240,28 +499,29 @@ class Loop:
                 if w in ("stop", "halt", "freeze"):
                     return False
                 # only short bare commands act immediately; "drop the red one in LEFT" is a hint for the VLM
-                bare = len(it.text.split()) <= 2
-                if bare and w in ("open", "release", "drop", "let"):
-                    with self.lock:  # every bus access goes through the shared lock (module invariant)
-                        r = self.robot.open_gripper()
-                        self._refresh_pose_locked()
-                    self.record("open", {}, r)
-                    self.holding = None
-                elif bare and w == "close":
-                    with self.lock:
-                        r = self.robot.close_gripper()
-                        self._refresh_pose_locked()
-                    self.record("close", {}, r)
-                elif bare and w in ("home", "retract", "go"):
-                    with self.lock:
-                        r = self.robot.home()
-                        self._refresh_pose_locked()
-                    self.record("home", {}, r)
+                cmd = bare_command(it.text)
+                if cmd is not None:
+                    self._run_bare(cmd)
                 else:
                     self.hints.append(f"(human) {it.text}")
             else:
                 self.hints.append(f"(human) {it.text}")
         return True
+
+    def _run_bare(self, cmd: str) -> None:
+        """open / close / home, executed here on the LOOP thread -- the conversation must never touch the
+        bus itself (module invariant); every access goes through the shared lock."""
+        fns = {"open": lambda r: r.open_gripper(), "close": lambda r: r.close_gripper(),
+               "home": lambda r: r.home()}
+        fn = fns.get(cmd)
+        if fn is None:
+            return
+        with self.lock:
+            r = fn(self.robot)
+            self._refresh_pose_locked()
+        self.record(cmd, {}, r)
+        if cmd == "open":
+            self.holding = None
 
     def record(self, tool: str, args: dict, r: ExecResult) -> None:
         self.history.append({"tool": tool, "args": args, "result": ("ok: " if r.ok else "FAILED: ") + r.message})
@@ -396,7 +656,7 @@ class Loop:
                 self._refresh_pose_locked()
             if not hr.ok:  # routine homing is not worth a history slot; failures are
                 self.record("home", {}, hr)
-            if not self.drain_voice():  # before capture so voice actions cannot stale the frame
+            if not self.drain_inputs():  # before capture so voice actions cannot stale the frame
                 return "stopped by voice"
             overhead, wrist = self.robot.capture("overhead"), self.robot.capture("wrist")
             self.last_overhead = overhead
@@ -521,7 +781,9 @@ def _real_vlm(session: "Session"):
     load_dotenv(cfgmod.REPO_ROOT / ".env")
     if not os.environ.get("OPENAI_API_KEY"):
         raise RuntimeError("OPENAI_API_KEY missing -- put it in .env at the repo root")
-    return VLM(session.cfg.openai_model)
+    c = session.cfg
+    return VLM(c.openai_model, chat_model=c.chat_model, verify_model=c.verify_model,
+               chat_effort=c.chat_effort)
 
 
 def _real_homography(session: "Session"):
@@ -575,8 +837,27 @@ class Session:
         self._overlay_hold: tuple[float, np.ndarray] | None = None  # (until_ts, overlay) held briefly while idle
         self._calib_flag: tuple[float, bool] | None = None  # (calib.json mtime, has fitted H) cache
         self.last_overhead: np.ndarray | None = None
+        self.last_wrist: np.ndarray | None = None
+        # --- conversation channel (see the MULTI-QUEUE block at the top of this module) ---
+        self.directives = DirectiveQueue()
+        self.transcript = Transcript()
+        self.chat = ChatWorker(self.voice, self.directives, self.transcript, lambda: self.vlm,
+                               self._chat_context, self._chat_frames, self._chat_urgent, self._chat_log)
         self._shutdown = threading.Event()
+        import sortbot.robot as _rb
+        if _rb.large_trim(cfg):
+            log.warning("grasp depth trim is %+.1f mm (grasp height %.1f mm) -- that is a LARGE trim; "
+                        "check the arm clears the table before running",
+                        _rb.z_trim_mm(cfg), _rb.grasp_z_mm(cfg))
+        if not cfg.grasp_verify:
+            log.warning("!" * 78)
+            log.warning("!! grasp.verify is FALSE in %s -- the claw will CLOSE WITHOUT CHECKING the",
+                        cfg.source_path)
+            log.warning("!! overhead and wrist views that the jaws are on the object. This is unsafe;")
+            log.warning("!! set grasp.verify: true unless you are deliberately debugging the arm.")
+            log.warning("!" * 78)
         self._register()
+        self.chat.start()
         threading.Thread(target=self._preview_loop, daemon=True, name="preview").start()
 
     # ------------------------------------------------ registration
@@ -616,6 +897,9 @@ class Session:
                    help="Move the gripper to table-frame (x, y, z) mm, through the safety envelope.")
         h.register("torque_off", self.torque_off, "E-STOP (torque off)", "robot", params=[],
                    help="E-STOP: cut motor torque immediately and pause the run; all motion is refused until torque_on.")
+        h.register("set_z_trim", self.set_z_trim, "Set grasp depth trim", "robot",
+                   help="Grasp depth trim: negative lowers the plane the gripper descends to. Increase (more "
+                        "negative) if it stops short of the table, decrease if it presses into it.")
         h.register("torque_on", self.torque_on, "Torque on", "robot", params=[],
                    help="Re-enable motor torque after an E-STOP.")
         h.register("say_to_bot", self.say_to_bot, "Send to bot", "voice",
@@ -646,12 +930,16 @@ class Session:
                    help="Convert an overhead pixel (u, v) to table-frame mm via the current homography -- click the overhead image to read a position off it.")
         h.register("log_clear", self.log_clear, "Clear log", "log", params=[],
                    help="Empty the decision log (ring buffer of the last 200 decisions/events, served at GET /log).")
+        h.register("clear_chat", self.clear_chat, "Clear conversation", "voice", params=[],
+                   help="Empty the conversation transcript panel (what you said / what Luna said). Rules and hints are kept.")
         h.add_state_source("run", self._run_state)
         h.add_state_source("robot", self._robot_state)
         h.add_state_source("voice", self._voice_state)
         h.add_state_source("rules", self._rules_state)
         h.add_state_source("vlm", self._vlm_state)
         h.add_state_source("perception", self._perception_state)
+        h.add_state_source("chat", self._chat_state)
+        h.add_state_source("grasp", self._grasp_state)
         h.add_route("/log", self.dlog.entries)
         self._register_calib_placeholders()
 
@@ -775,6 +1063,68 @@ class Session:
             return self.cams.read(name)
         raise RuntimeError("no cameras connected (connect_cameras)")
 
+    # ------------------------------------------------ conversation channel ("luna-chat")
+    def _chat_context(self) -> str:
+        """Cached state ONLY -- this runs on the chat thread, which never reads the bus."""
+        run, loop = self._run_state(), self.loop
+        lines = [f"You are Luna. phase={run['phase']} step={run['step']}/{run['max_steps']} "
+                 f"devices={'+'.join(k for k, v in run['connected'].items() if v) or 'none'}",
+                 f"task: {self.task or '(none given - group similar things sensibly)'}",
+                 f"holding: {(loop.holding if loop is not None else None) or 'nothing'}"]
+        if loop is not None and loop.history:
+            h = loop.history[-1]
+            lines.append(f"last thing the planner did: {h['tool']}({json.dumps(h.get('args', {}))}) -> {h['result']}")
+        if loop is not None and loop.last_verdict:
+            v = loop.last_verdict
+            lines.append(f"last grasp check: {'aligned' if v.get('accepted') else 'NOT aligned'} - {v.get('reason', '')}")
+        rules = self.rules.list()
+        lines.append("rules in force: " + ("; ".join(rules) if rules else "(none)"))
+        pend = self.directives.peek()
+        if pend:
+            lines.append("already queued for the planner: " + "; ".join(f"{d['kind']}:{d['text']}" for d in pend))
+        return "\n".join(lines)
+
+    def _chat_frames(self) -> tuple[bytes | None, bytes | None]:
+        """The LATEST CACHED frames the preview/loop threads published -- never a capture of its own."""
+        return small_jpeg(self.last_overhead), small_jpeg(self.last_wrist)
+
+    def _chat_urgent(self, kind: str) -> None:
+        """Urgent speech, applied IMMEDIATELY on the chat thread: only the Control events, never the bus."""
+        if self.ctl is None:
+            return
+        self.ctl.pause_ev.set()
+        if kind == "stop":
+            self.ctl.stop_ev.set()
+
+    def _chat_log(self, tool, args, result, ok=True, say="", latency_ms=None) -> None:
+        self.dlog.add(tool, args, result, ok=ok, say=say, latency_ms=latency_ms,
+                      step=self.loop.step if self.loop is not None else 0)
+
+    def _chat_state(self) -> dict:
+        v = self.vlm
+        return {"transcript": self.transcript.entries(), "thinking": self.chat.busy,
+                "alive": self.chat.alive, "replies": self.chat.replies,
+                "last_latency_ms": self.chat.last_latency_ms, "last_error": self.chat.last_error,
+                "model": getattr(v, "chat_model", None) if v is not None else None,
+                "directives": self.directives.peek()}
+
+    def _grasp_state(self) -> dict:
+        """The last pre-grasp alignment verdict, so the page can show WHY a grasp was refused."""
+        import sortbot.robot as robot_mod
+        return {"verify": bool(self.cfg.grasp_verify), "max_correction_cm": self.cfg.grasp_max_correction_cm,
+                "z_trim_mm": round(float(self.cfg.z_trim_mm), 2),
+                "grasp_z_cm": round(robot_mod.grasp_z_mm(self.cfg) / 10.0, 2),
+                "grasp_z_mm": round(robot_mod.grasp_z_mm(self.cfg), 1),
+                "hard_floor_mm": round(robot_mod.hard_floor_mm(self.cfg), 1),
+                "large_trim": robot_mod.large_trim(self.cfg),
+                "max_retries": self.cfg.grasp_max_retries, "min_confidence": self.cfg.grasp_min_confidence,
+                "verify_model": getattr(self.vlm, "verify_model", None) if self.vlm is not None else None,
+                "last": self.loop.last_verdict if self.loop is not None else None}
+
+    def clear_chat(self) -> dict:
+        n = self.transcript.clear()
+        return {"ok": True, "message": f"cleared {n} conversation line(s)", "data": None}
+
     # ------------------------------------------------ RUN actions
     def start(self, paused: bool = False) -> dict:
         if self._running():
@@ -793,7 +1143,7 @@ class Session:
             self.ctl.pause_ev.set()
         self.loop = Loop(self.cfg, rig, self.vlm, self.voice, self.hud, self.homog, self.rules,
                          self.max_steps, task=self.task, ctl=self.ctl, lock=self.robot_lock,
-                         step_delay_s=self.step_delay_s)
+                         step_delay_s=self.step_delay_s, directives=self.directives)
         self.loop.calib, self.loop._calib_out = self.calib, self._calib_out
         self.loop.frame_sink = lambda f: setattr(self, "last_overhead", f)
         self.loop.dlog = self.dlog
@@ -932,7 +1282,8 @@ class Session:
 
     # ------------------------------------------------ MODELS actions
     def _model_current(self) -> dict:
-        return {"openai": self.cfg.openai_model, "elevenlabs_tts": self.voice.tts_model,
+        return {"openai": self.cfg.openai_model, "openai_chat": self.cfg.chat_model,
+                "openai_verify": self.cfg.verify_model, "elevenlabs_tts": self.voice.tts_model,
                 "elevenlabs_stt": self.voice.stt_model, "elevenlabs_voice": self.voice.voice_id}
 
     def get_models(self) -> dict:
@@ -952,6 +1303,16 @@ class Session:
             if isinstance(self.vlm, VLM):
                 self.vlm.model = value
             sec, key = "vlm", "model"
+        elif provider == "openai_chat":
+            self.cfg.chat_model = value
+            if isinstance(self.vlm, VLM):
+                self.vlm.chat_model = value
+            sec, key = "vlm", "chat_model"
+        elif provider == "openai_verify":
+            self.cfg.verify_model = value
+            if isinstance(self.vlm, VLM):
+                self.vlm.verify_model = value
+            sec, key = "vlm", "verify_model"
         elif provider == "elevenlabs_tts":
             self.voice.tts_model = self.cfg.tts_model = value
             sec, key = "voice", "tts_model"
@@ -1068,6 +1429,39 @@ class Session:
     def goto(self, x: float, y: float, z: float) -> dict:
         return self._robot_act(lambda r: r.move_to(float(x), float(y), float(z)))
 
+    def set_z_trim(self, mm: float) -> dict:
+        """workspace.z_trim_mm: shift the plane the arm works to, live and persisted. Negative = lower.
+        Applied to the live Config object every robot/loop call reads, so no restart is needed."""
+        import sortbot.robot as robot_mod
+        try:
+            v = round(float(mm), 2)
+        except (TypeError, ValueError):
+            return {"ok": False, "message": f"mm must be a number, got {mm!r}", "data": None}
+        lim = robot_mod.Z_TRIM_LIMIT_MM
+        if not -lim <= v <= lim:
+            return {"ok": False, "message": f"trim must be within [-{lim:g}, {lim:g}] mm", "data": None}
+        self.cfg.z_trim_mm = v  # one shared Config: the robot, the Loop and the envelope all read it
+        for obj in (self.robot, self.loop):
+            c = getattr(obj, "cfg", None)
+            if c is not None and c is not self.cfg:
+                c.z_trim_mm = v
+        try:
+            yaml_set(self.cfg.source_path, "workspace", "z_trim_mm", f"{v:g}")
+            persisted = f"persisted to {self.cfg.source_path.name}"
+        except Exception as e:  # noqa: BLE001
+            persisted = f"NOT persisted: {e}"
+        zg = robot_mod.grasp_z_mm(self.cfg)
+        warn = (f" LARGE TRIM ({v:+g} mm): check the arm clears the table before running."
+                if robot_mod.large_trim(self.cfg) else "")
+        if warn:
+            log.warning("grasp depth trim %+g mm is large -- check the arm clears the table", v)
+        self.dlog.add("set_z_trim", {"mm": v}, f"grasp depth trim {v:+g} mm -> grasp height {zg:.1f} mm{warn}",
+                      ok=not warn, step=self.loop.step if self.loop is not None else 0)
+        return {"ok": True, "message": f"grasp depth trim {v:+g} mm -> the gripper now descends to "
+                                       f"{zg / 10:.2f} cm ({zg:.1f} mm); {persisted}.{warn}",
+                "data": {"z_trim_mm": v, "grasp_z_mm": round(zg, 1), "grasp_z_cm": round(zg / 10.0, 2),
+                         "large_trim": bool(warn), "hard_floor_mm": round(robot_mod.hard_floor_mm(self.cfg), 1)}}
+
     def torque_off(self) -> dict:
         """E-STOP: flag first (any in-flight motion aborts within one tick), pause the loop, then cut bus torque."""
         if self.robot is None:
@@ -1107,7 +1501,12 @@ class Session:
 
     def _voice_state(self) -> dict:
         v = self.voice
-        return {"mode": v.mode, "listening": v.listening, "queue": v.peek(), "last_transcript": v.last_transcript,
+        # "queue" = everything heard but not yet acted on by the loop: q_heard not yet taken by the chat
+        # worker, plus the q_directives it has already distilled and handed on.
+        return {"mode": v.mode, "listening": v.listening,
+                "queue": v.peek() + [d["text"] for d in self.directives.peek() if d["text"]],
+                "say_queue": v.pending_say(), "last_said": v.last_said,
+                "last_transcript": v.last_transcript,
                 "tts_model": v.tts_model, "stt_model": v.stt_model, "voice_id": v.voice_id}
 
     def _rules_state(self) -> dict:
@@ -1155,7 +1554,7 @@ class Session:
                 calib_busy = calib is not None and calib.active
                 if self.hud is not None and not calib_busy and self.cams is not None:
                     ov, wr = self.cams.read("overhead"), self.cams.read("wrist")
-                    self.last_overhead = ov
+                    self.last_overhead, self.last_wrist = ov, wr
                     hold = self._overlay_hold
                     if hold is not None and time.time() < hold[0]:
                         show = hold[1]
@@ -1182,6 +1581,7 @@ class Session:
 
     def shutdown(self) -> None:
         self._shutdown.set()
+        self.chat.stop()
         if self.ctl is not None:
             self.ctl.stop_ev.set()
         if self.thread is not None:

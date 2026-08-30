@@ -5,9 +5,13 @@ whenever a second thread (the HUD /state poller, or the Loop drawing the HUD) re
 Loop thread was mid-motion.
 
 The robot double's bus methods detect concurrent entry (non-reentrant flag) and raise exactly like the
-real port does; the Loop, the /state pollers and the idle preview thread all run concurrently, and the
-run must finish with zero overlaps. SORTBOT_BUS_ASSERT=1 is on, so any bus call made without holding
-Session.robot_lock raises immediately as well.
+real port does; the Loop, the /state pollers, the idle preview thread AND the "luna-chat" conversation
+worker all run concurrently, and the run must finish with zero overlaps. SORTBOT_BUS_ASSERT=1 is on, so
+any bus call made without holding Session.robot_lock raises immediately as well.
+
+The two newer features are deliberately exercised here: the chat worker is hammered with utterances for
+the whole run (it must answer, and queue directives, without ever touching the bus), and every pick runs
+the pre-grasp both-cameras alignment check (which captures through the CAMERAS and moves under the lock).
 
 `python -m sortbot.tests.test_bus_lock` or pytest.
 """
@@ -135,7 +139,21 @@ def test_bus_lock() -> None:
                     errs.append(e)
                     return
 
+        # the CONVERSATION thread runs the whole time too: it must answer and queue directives without
+        # ever touching the bus (SORTBOT_BUS_ASSERT would raise on the luna-chat thread if it did)
+        def chatter():
+            i = 0
+            while not stop.is_set():
+                try:
+                    post("say_to_bot", {"text": f"Luna, how is it going? ({i})"})
+                    i += 1
+                except Exception as e:  # noqa: BLE001
+                    errs.append(e)
+                    return
+                time.sleep(0.05)
+
         threads = [threading.Thread(target=hammer, daemon=True, name=f"state-hammer-{i}") for i in range(3)]
+        threads.append(threading.Thread(target=chatter, daemon=True, name="chat-hammer"))
         assert post("start")["ok"]
         for t in threads:
             t.start()

@@ -48,6 +48,45 @@ TILT_W = 3.0  # mm of cost per radian of gripper tilt (position dominates)
 HOME_JOINTS = np.array([0.0, -30.0, 60.0, 60.0, 0.0, GRIPPER_OPEN])
 
 
+# ---------------------------------------------------------------- table plane / grasp depth
+#: How far workspace.z_trim_mm may shift the plane. The trim is the USER's knob (their table can genuinely
+#: sit far below the assumed plane -- a high-mounted base, or a wrong table_z_mm), so this is deliberately
+#: generous; the backstop is workspace.z_floor_mm, which exists only to catch a typo or a runaway.
+Z_TRIM_LIMIT_MM = 150.0
+#: |trim| above this is legal but unusual -- warned about at startup and in the HUD, never blocked.
+LARGE_TRIM_MM = 40.0
+DEFAULT_Z_FLOOR_MM = -150.0
+
+
+def z_trim_mm(cfg) -> float:
+    """workspace.z_trim_mm, clamped. NEGATIVE lowers the plane the gripper descends to -- the one knob for
+    "the jaws stop short of the table" (raise it if the gripper presses into the table instead)."""
+    v = float(getattr(cfg, "z_trim_mm", 0.0) or 0.0)
+    return max(-Z_TRIM_LIMIT_MM, min(Z_TRIM_LIMIT_MM, v))
+
+
+def table_plane_mm(cfg) -> float:
+    """The table plane the ARM works to: the configured table_z_mm shifted by the trim."""
+    return float(cfg.table_z_mm) + z_trim_mm(cfg)
+
+
+def grasp_z_mm(cfg) -> float:
+    """The commanded z of every grasp/pre-place descent, and the floor of the safety envelope.
+    EVERY z-floor in the app comes from here, so one trim moves them all together."""
+    return max(float(cfg.grasp_z_mm), float(cfg.table_z_mm) + float(cfg.gripper_clearance_mm)) + z_trim_mm(cfg)
+
+
+def hard_floor_mm(cfg) -> float:
+    """workspace.z_floor_mm: the absolute minimum commanded z, in table-frame mm, independent of the trim.
+    A backstop against a typo or a runaway -- not a policy limit; lower it if your table really is deeper."""
+    return float(getattr(cfg, "z_floor_mm", DEFAULT_Z_FLOOR_MM))
+
+
+def large_trim(cfg) -> bool:
+    """Legal but worth a warning: at this depth the gripper can genuinely drive into the table."""
+    return abs(z_trim_mm(cfg)) > LARGE_TRIM_MM
+
+
 class SafetyError(RuntimeError):
     pass
 

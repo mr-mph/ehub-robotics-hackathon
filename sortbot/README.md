@@ -7,17 +7,27 @@ sensibly. There are no zones: the VLM chooses coordinates.
 ## Architecture
 
 ```
- voice.py ──(corrections -> RULES)──┐
-                                    v
- overhead cam ─┐              ┌── main.py loop ──┐
+ you speak/type ─> q_heard ─> "luna-chat" thread ─> q_say  ──> voice.py (ONE TTS worker)
+ (voice.py)                   (ONE fast VLM call)  └─> q_directives ─┐   rules / hints / open|close|home / stop
+                                                                     v
+ overhead cam ─┐              ┌────────────── main.py ACTION loop ───┴──┐
  wrist cam  ───┴─> perception.py ─> vlm.py ─> robot.py ─> SO101
-                   (cm-grid overlay, (sees the   (safety
-                    EE marker)       photos, one envelope, IK)
-                        │             tool call)  │
+                   (cm-grid overlay, (sees the   (safety      ^
+                    EE marker)       photos, one envelope, IK) └─ verify_grasp: BOTH cameras must agree
+                        │             tool call)  │               the jaws are on the object before ANY close
                         └── hud.py <──────────────┘   (browser HUD, port 8765)
  calibration.py: overhead px <-> table mm (teleop-fitted H, or ArUco mat) + table_T_base -> calib/calib.json
  calibrate.py:   teleoperated calibration session (leader arm + coloured target in the gripper), HUD buttons + keys
 ```
+
+**Two threads, four queues.** The action loop (perception -> one planner call -> one tool) is far too slow
+to hold a conversation, so talking and acting are split. `q_heard` (everything you say) is drained by the
+**`luna-chat`** thread, which answers in ONE fast call (`vlm.chat_model`) within a second or so and pushes the
+spoken reply to `q_say` and any instructions it distilled to `q_directives`; the action loop drains
+`q_directives` at its existing drain point and never waits on the conversation. Stop/pause-shaped speech is
+caught by a **regex pre-filter before any model call**, so an E-STOP can never queue behind a chat reply. The
+chat worker reads only cached state and the latest cached camera JPEGs -- it never captures, and never touches
+the robot or the bus. Full contract: the MULTI-QUEUE block at the top of `main.py`.
 
 There is NO object detector: the VLM does the seeing itself. Loop: `home()` -> capture overhead + wrist ->
 composite the cached cm-grid overlay -> VLM reads the photos and emits ONE coordinate-based tool call
@@ -30,6 +40,15 @@ top of each iteration into a persistent RULES list sent with every prompt.
 everything internal (robot, config.yaml, calib.json, safety envelope) stays MILLIMETERS. The cm->mm
 conversion happens in exactly one place (`main._mm_args`; `vlm._state_text` + the overlay labels are the
 mm->cm half). Recalibrating is never needed after unit changes — calib.json is untouched.
+
+**Grasping**: the claw NEVER closes on an object unchecked. `pick_at` descends with the jaws open, then
+`Loop.verify_alignment` takes BOTH camera views and makes one structured call on the fast `vlm.verify_model`
+-> `{aligned, dx_cm, dy_cm, reason, confidence}`. Not aligned (or aligned below `grasp.min_confidence`) ->
+a correction clamped to `grasp.max_correction_cm` through the normal safety envelope, then another check, up
+to `grasp.max_retries` more times. Still not aligned -> the arm retreats with the jaws still OPEN and the
+planner gets `FAILED: alignment not confirmed after N tries: <reason>` to re-plan from. The low-level
+`close_gripper` tool goes through the same check. Every verdict, with a side-by-side overhead|wrist
+thumbnail, lands in the decision log; the last one shows in the Operate tab.
 
 **Threading**: exactly one thread may touch the Feetech serial bus at a time — every bus access goes
 through `Session.robot_lock`, and components that cannot get the lock serve cached state (see the invariant
@@ -44,12 +63,12 @@ at the top of `main.py`; `SORTBOT_BUS_ASSERT=1` arms a proxy that fails loudly o
 | `calibration.py` | calib | colour-target detector, homography px->mm (fitted or ArUco), `table_T_base`, calib.json I/O |
 | `calibrate.py`, `calibrate_aruco.py` | calib | teleop calibration session/controller (HUD actions), legacy ArUco+Kabsch flow |
 | `perception.py` | perception | overlay render (cached cm-grid layer + EE marker) + px<->mm helpers |
-| `vlm.py` | vlm | prompt + coordinate tool schema (cm), OpenAI call -> `Command` |
-| `voice.py` | voice | ElevenLabs/mic in, keyboard fallback, queue of corrections, `transcribe_bytes` for HUD push-to-talk |
+| `vlm.py` | vlm | planner prompt + coordinate tool schema (cm) -> `Command`; plus the two FAST structured calls on the small model: `chat()` (Luna's reply + directives) and `verify_grasp()` (both-cameras alignment) |
+| `voice.py` | voice | ElevenLabs/mic in, keyboard fallback, `q_heard` + `q_say` (one TTS worker, priority pre-emption), the `urgent_kind`/`bare_command` regex pre-filter, `transcribe_bytes` for HUD push-to-talk |
 | `models.py` | models | selectable OpenAI/ElevenLabs model listings (cached 5 min) + `yaml_set` config.yaml persistence |
 | `hud.py` | hud | FastAPI status page + generic action registry (`register(name, fn, label, group, params, help)` -> `POST /action/{name}`; `help` is served in `GET /actions` for tooltips) |
-| `main.py` | main | server-first Session (device connects, RUN/ROBOT actions, E-STOP) + the loop |
-| `testing.py` | — | test fixtures (MockRobot, MockVLM, SimScene, FakeRig, VirtualLeader, `session_factories()`) — not reachable from the app; imported only by `tests/*` and `--selftest` blocks |
+| `main.py` | main | server-first Session (device connects, RUN/ROBOT actions, E-STOP) + the loop + the queues/`ChatWorker` |
+| `testing.py` | — | test fixtures (MockRobot, MockVLM with scriptable `verify_script` / `chat_script`, SimScene, FakeRig, VirtualLeader, `session_factories()`) — not reachable from the app; imported only by `tests/*` and `--selftest` blocks |
 
 ## Frames
 
@@ -157,14 +176,26 @@ torque on/off -- served newest-first at `GET /log` as
 thumbnails; rejections / safety errors / E-STOP (`ok: false`, `FAILED:`/`rejected:`/`safety:` results) are red.
 `log_clear()` empties it.
 
+CHAT group (VOICE actions): everything you say reaches `q_heard` the same way as before; the `luna-chat`
+worker answers it. `GET /state` carries `chat: {transcript, thinking, alive, replies, model,
+last_latency_ms, directives}` (the Operate transcript panel) and `voice.queue` now shows both the undrained
+utterances and the directives already distilled for the loop. `clear_chat()` empties the transcript.
+`GET /state` `grasp: {verify, max_correction_cm, max_retries, min_confidence, verify_model, z_trim_mm,
+grasp_z_cm, large_trim, last: {aligned, accepted, dx_cm, dy_cm, reason, confidence, try, tries, x_cm, y_cm}}`.
+
 MODELS group: `get_models()` lists what is selectable -- OpenAI vision-capable ids from `models.list()`
 (gpt-5 / gpt-4.1 / gpt-4o / o3 / o4 families, cached 5 min, graceful when the key is missing) and the
 ElevenLabs TTS/STT model ids plus the first ~30 voices from `voices.search()`. `set_model(provider, value)`
-with `provider: openai|elevenlabs_tts|elevenlabs_stt|elevenlabs_voice` hot-swaps the live VLM/VoiceIO **and**
-persists to `config.yaml` (`vlm.model`, `voice.tts_model`, `voice.stt_model`, `voice.elevenlabs_voice_id`)
+with `provider: openai|openai_chat|openai_verify|elevenlabs_tts|elevenlabs_stt|elevenlabs_voice` hot-swaps the
+live VLM/VoiceIO **and** persists to `config.yaml` (`vlm.model`, `vlm.chat_model`, `vlm.verify_model`,
+`voice.tts_model`, `voice.stt_model`, `voice.elevenlabs_voice_id`)
 via a minimal text edit that preserves comments. The models tab shows one dropdown per provider; beside the
 OpenAI one the last VLM call's latency and a rough per-call $ estimate (from token usage and a small built-in
 price table) are shown, also served as `/state` `vlm: {model, last_latency_ms, last_cost_usd, last_usage}`.
+
+Grasp config (`config.yaml`): `grasp: {verify: true, max_correction_cm: 2.0, max_retries: 2,
+min_confidence: 0.5}`. `verify: false` is possible but logs a loud multi-line warning at startup and shows
+the check as OFF in the HUD -- the default is and should stay `true`.
 
 Loop behaviour: every iteration starts with `home()`, so objects and drop points must be within `max_step_mm`
 of HOME (with the default config: x 160-300 mm, |y| <= 160 mm). Rejected/unsafe commands are returned to the VLM
@@ -244,6 +275,11 @@ After that the **table frame is the base frame** in xy (x fwd, y left, mm). `H` 
 **Recalibrate** whenever the overhead camera or the robot base is moved/bumped, the camera resolution changes, or
 the HUD overlay grid stops lining up with the table. Old `calib.json` files without the new keys
 still load (rigid `table_T_base` only, no fixed H).
+
+Model config (`config.yaml`): `vlm.model` is the planner; `vlm.chat_model` (default `gpt-5.4-mini`) is
+Luna's conversational voice and `vlm.verify_model` (default the same) the pre-grasp checker -- both are on a
+human-visible latency path, so they run a small fast model at `vlm.chat_effort: low` with a short max output
+and images downscaled to 512 px. All three are swappable from the HUD Tune tab.
 
 Keys: `OPENAI_API_KEY` (and optional `ELEVENLABS_API_KEY`) in `.env` at repo root. Without the ElevenLabs key,
 push-to-talk/`speak` report the missing key in their response instead of failing silently.

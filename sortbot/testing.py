@@ -56,14 +56,26 @@ class MockVLM:
     """Deterministic coordinate planner (the app's VLM does its own seeing, so this double works from a
     script): pick_at each target in turn, place_at the matching drop coordinate, done when the script is
     exhausted. All coordinates are cm, like the real tool surface. Default targets: the SIM_OBJECTS
-    positions, so it 'sees' the default SimScene."""
+    positions, so it 'sees' the default SimScene.
+
+    It also doubles for the two FAST calls the real VLM makes on the small model, both scriptable:
+      verify_grasp() -> the pre-grasp alignment verdict. `verify_script` is a list of verdicts (dicts, or
+        the shorthands "aligned" / "off:DX:DY" / "blind") consumed in order; the LAST entry repeats
+        forever, so a one-element script fixes the behaviour for the whole run. Default: always aligned.
+      chat() -> {reply, rules, hints, urgent}. `chat_script` is consumed the same way; the default echoes
+        the utterance back as a hint so a Session with no script still behaves sanely.
+    `verify_calls` / `chat_calls` record every call for assertions."""
 
     #: where picked items are put down (cm) -- three tidy clusters, cycled
     DROPS_CM = [(27.5, 14.0), (27.5, 0.0), (27.5, -14.0)]
+    ALIGNED = {"aligned": True, "dx_cm": 0.0, "dy_cm": 0.0, "reason": "jaws centred on the object",
+               "confidence": 0.92}
 
     def __init__(self, model: str | None = None, targets_cm: list[tuple[float, float]] | None = None,
-                 drops_cm: list[tuple[float, float]] | None = None):
+                 drops_cm: list[tuple[float, float]] | None = None,
+                 verify_script: list | None = None, chat_script: list | None = None):
         self.model = model or "mock"
+        self.chat_model = self.verify_model = self.model
         # mm -> cm: the doubles speak the same cm tool surface as the real VLM (see sortbot.vlm)
         self.targets = list(targets_cm) if targets_cm is not None \
             else [(x / 10.0, y / 10.0) for (x, y), _ in SIM_OBJECTS]
@@ -72,10 +84,59 @@ class MockVLM:
         self._drop_i = 0
         self.last_latency_ms: int | None = None
         self.last_usage = self.last_cost_usd = None
+        self.last_chat_latency_ms = self.last_verify_latency_ms = None
+        self.verify_script = list(verify_script) if verify_script else None
+        self.chat_script = list(chat_script) if chat_script else None
+        self.verify_calls: list[dict] = []
+        self.chat_calls: list[dict] = []
+        self._v_i = self._c_i = 0
 
     def reset(self) -> None:
         """Fresh script for a fresh run (Session.start resets every device that supports it)."""
         self._i = self._drop_i = 0
+
+    # -- scripted fast calls ------------------------------------------------
+    @staticmethod
+    def _next(script: list, i: int):
+        """Consume `script` in order; the last entry repeats forever."""
+        return script[min(i, len(script) - 1)]
+
+    @staticmethod
+    def _verdict(spec) -> dict:
+        """dict | "aligned" | "off:DX:DY" (not aligned, correct by DX/DY cm) | "blind" (cannot tell)."""
+        if isinstance(spec, dict):
+            return {**MockVLM.ALIGNED, **spec}
+        if spec == "aligned":
+            return dict(MockVLM.ALIGNED)
+        if spec == "blind":
+            return {"aligned": False, "dx_cm": 0.0, "dy_cm": 0.0, "confidence": 0.1,
+                    "reason": "wrist view too dark to tell what is under the jaws"}
+        if isinstance(spec, str) and spec.startswith("off:"):
+            _, dx, dy = spec.split(":")
+            return {"aligned": False, "dx_cm": float(dx), "dy_cm": float(dy), "confidence": 0.8,
+                    "reason": f"object is {abs(float(dx)):g} cm forward / {abs(float(dy)):g} cm left of the jaws"}
+        raise ValueError(f"bad verify spec {spec!r}")
+
+    def verify_grasp(self, overhead_jpeg, wrist_jpeg, x_cm: float, y_cm: float, attempt: int = 1) -> dict:
+        assert overhead_jpeg and wrist_jpeg, "the grasp check must get BOTH camera views"
+        self.verify_calls.append({"x_cm": round(float(x_cm), 2), "y_cm": round(float(y_cm), 2),
+                                  "attempt": int(attempt)})
+        self.last_verify_latency_ms = 7
+        if self.verify_script is None:
+            return dict(self.ALIGNED)
+        v = self._verdict(self._next(self.verify_script, self._v_i))
+        self._v_i += 1
+        return v
+
+    def chat(self, heard: str, context: str, overhead_jpeg=None, wrist_jpeg=None) -> dict:
+        self.chat_calls.append({"heard": heard, "context": context,
+                                "images": int(bool(overhead_jpeg)) + int(bool(wrist_jpeg))})
+        self.last_chat_latency_ms = 9
+        if self.chat_script is None:
+            return {"reply": f"Got it: {heard}", "rules": [], "hints": [heard], "urgent": "none"}
+        d = self._next(self.chat_script, self._c_i)
+        self._c_i += 1
+        return {"reply": "", "rules": [], "hints": [], "urgent": "none", **d}
 
     def plan_step(self, overhead_overlay_png: bytes, wrist_png: bytes, world: WorldState, history: list,
                   workspace_mm=None) -> Command:
@@ -284,13 +345,14 @@ class ArucoFakeRig:
 # ---------------------------------------------------------------- Session injection seam
 
 
-def session_factories(make_robot=None) -> dict:
+def session_factories(make_robot=None, make_vlm=None) -> dict:
     """Factories dict for main.Session(factories=...) / main.serve(args, factories=...): a MockRobot-backed
     SimScene serves as both the robot and (via SceneCams) the cameras, MockVLM plans, the homography is the
     scene's fixed synthetic H, and the calibration controller is a FakeRig/VirtualLeader teleop session that
     writes to a temp file (never the real calib.json). Connect the robot before the cameras.
     make_robot: optional cfg -> robot override for the wrapped base robot (default MockRobot; the bus-lock
-    regression test injects a robot whose bus methods detect concurrent access)."""
+    regression test injects a robot whose bus methods detect concurrent access).
+    make_vlm: optional () -> planner override (a MockVLM with a verify_script / chat_script)."""
     box: dict = {}
 
     def robot(s):
@@ -304,7 +366,7 @@ def session_factories(make_robot=None) -> dict:
         return SceneCams(lambda: box["scene"])
 
     def vlm(s):
-        return MockVLM()
+        return make_vlm() if make_vlm is not None else MockVLM()
 
     def homography(s):
         from sortbot.main import Homography

@@ -1,5 +1,14 @@
 """Voice I/O: ElevenLabs TTS/STT with graceful fallbacks, plus a persistent RulesStore.
 
+Two queues live here (see the MULTI-QUEUE block at the top of sortbot/main.py):
+  q_heard -- everything the human says (mic PTT / Listening toggle / the HUD text box) -> push()/drain().
+             The "luna-chat" worker is its consumer whenever a Session is running.
+  q_say   -- lines to speak; ONE TTS worker serializes synth + playback so the bot never talks over
+             itself. speak(text, priority=True) drops the whole stale backlog first, so a fresh
+             conversational reply always wins over queued planner chatter.
+The regex pre-filter (urgent_kind / bare_command) runs BEFORE any LLM: a stop/pause must never wait on
+a model, and a bare "open"/"close"/"home" needs no model at all.
+
 Deviations from spec: no sounddevice/pyaudio is installed, so mic capture uses `ffmpeg -f avfoundation`
 (macOS) in fixed 4 s chunks; push-to-talk is not implemented (no keyboard lib). Without ffmpeg or an
 ELEVENLABS_API_KEY the STT side falls back to a stdin line reader. TTS playback uses afplay/ffplay,
@@ -45,6 +54,18 @@ _RULE_PATTERNS = [
     r"\b(always|never|from now on|don't|do not|only)\b.+",
     r".+\b(are|is|count as|counts as)\b.+",
 ]
+# --- urgent pre-filter: E-STOP-shaped speech NEVER waits for an LLM (see main.ChatWorker) ---
+_URGENT_PATTERNS = [
+    (r"^(stop|halt|freeze|abort|cancel|quit|e-?stop|emergency)\b", "stop"),
+    (r"^(no|nope)[ ,]+(stop|halt|freeze)\b", "stop"),
+    (r"\b(stop|halt|freeze)\s+(now|right now|immediately|everything|please)\b", "stop"),
+    (r"^(pause|wait|hold on|hold up|hang on|hold it|stand ?by|one (second|sec|moment))\b", "pause"),
+    (r"\bpause\s+(now|please|for a (sec|second|moment))\b", "pause"),
+]
+#: bare one/two-word commands the loop can execute itself -- no model call, no conversation
+_BARE_COMMANDS = {"open": "open", "release": "open", "drop": "open", "let": "open",
+                  "close": "close", "home": "home", "retract": "home"}
+
 _ACTION_PATTERNS = [
     r"^(stop|halt|wait|pause|freeze|home|retract|go home)\b",
     r"^(open|close|release|drop|let go)\b",
@@ -56,8 +77,50 @@ _ACTION_PATTERNS = [
 ]
 
 
+#: leading filler / the bot's name: "Luna, stop!" and "hey Luna, open" must hit the same fast path as
+#: "stop" and "open" -- people address the robot, and an E-STOP cannot depend on them not doing so.
+_ADDRESS_RE = re.compile(r"^(?:hey|hi|yo|ok|okay|please|um|uh|luna|robot|bot|sortbot)\b[\s,;:]*")
+
+
+def _norm(cmd: str) -> str:
+    return re.sub(r"\s+", " ", cmd.strip().lower().rstrip(".!"))
+
+
+def _addressed(cmd: str) -> str:
+    """_norm() with any leading address stripped ("hey luna, stop" -> "stop")."""
+    t = _norm(cmd)
+    while True:
+        t2 = _ADDRESS_RE.sub("", t, count=1).strip()
+        if t2 == t or not t2:
+            return t
+        t = t2
+
+
+def urgent_kind(cmd: str) -> str:
+    """Regex-only pre-filter: "none" | "stop" | "pause". Must stay cheap and synchronous -- the chat
+    worker calls it before deciding whether an utterance is worth an LLM round trip at all."""
+    t = _addressed(cmd)
+    for pat, kind in _URGENT_PATTERNS:
+        if re.search(pat, t):
+            return kind
+    return "none"
+
+
+def bare_command(cmd: str) -> str | None:
+    """"open" / "close it" / "go home" -> the gripper/home command the ACTION loop should run, else None.
+    Only short bare phrases: "drop the red one in the left bin" is a sentence for the chat model."""
+    t = _addressed(cmd)
+    words = t.split()
+    if not (1 <= len(words) <= 2):
+        return None
+    w = words[0]
+    if w == "go" and len(words) == 2:
+        w = words[1]
+    return _BARE_COMMANDS.get(w)
+
+
 def classify(cmd: str) -> Intent:
-    t = re.sub(r"\s+", " ", cmd.strip().lower().rstrip(".!"))
+    t = _norm(cmd)
     if not t:
         return Intent("unknown", "")
     for p in _ACTION_PATTERNS:
@@ -131,7 +194,8 @@ class VoiceIO:
         self.voice_id = voice_id
         self.tts_model, self.stt_model = tts_model, stt_model
         self.last_transcript = ""
-        self._q: queue.Queue[str] = queue.Queue()
+        self.last_said = ""
+        self._q: queue.Queue[str] = queue.Queue()  # q_heard
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._stdin = stdin or sys.stdin
@@ -262,12 +326,16 @@ class VoiceIO:
         return text
 
     # -- speaking
-    def speak(self, text: str) -> None:
-        """Non-blocking: queues the line for the single speech worker (serialized synth + playback)."""
+    def speak(self, text: str, priority: bool = False) -> None:
+        """q_say: non-blocking, queued for the single speech worker (serialized synth + playback, so the
+        bot never talks over itself). priority=True is the CONVERSATION channel: a fresh reply to the human
+        drops the ENTIRE stale backlog so it is spoken next, instead of queueing behind planner chatter."""
         print(f"[robot says] {text}", flush=True)
+        self.last_said = text
         if not self._client or not self._player:
             return
-        while self._speak_q.qsize() >= 2:  # keep speech current: drop the oldest unspoken lines
+        # keep speech current: drop the oldest unspoken lines (all of them for a fresh reply)
+        while self._speak_q.qsize() >= (1 if priority else 2):
             try:
                 dropped = self._speak_q.get_nowait()
                 log.info("TTS backlog: dropping %r", dropped)
@@ -277,6 +345,10 @@ class VoiceIO:
         if self._speak_thread is None or not self._speak_thread.is_alive():
             self._speak_thread = threading.Thread(target=self._speak_loop, daemon=True, name="voice-tts")
             self._speak_thread.start()
+
+    def pending_say(self) -> list[str]:
+        """q_say snapshot (undrained lines), oldest first -- for the HUD."""
+        return list(self._speak_q.queue)
 
     def _speak_loop(self) -> None:
         while not self._stop.is_set():
@@ -355,6 +427,17 @@ def _selftest() -> None:
     assert rules.delete(1) == "third rule here" and rules.delete(99) is None
     assert RulesStore(tmp).list() == rules.list() and len(rules.list()) == 2
     assert v.peek() == [] and v.last_transcript == ""
+    # regex pre-filter: urgent speech never waits on a model, bare commands never need one
+    for s, k in [("stop", "stop"), ("STOP!", "stop"), ("stop right now", "stop"), ("e-stop", "stop"),
+                 ("no, stop", "stop"), ("pause", "pause"), ("hold on a moment", "pause"),
+                 ("wait", "pause"), ("what are you doing", "none"), ("put red things left", "none"),
+                 ("Luna, stop!", "stop"), ("hey luna, pause", "pause"), ("please stop", "stop"),
+                 ("luna", "none"), ("don't stop until the table is clear", "none")]:
+        assert urgent_kind(s) == k, (s, urgent_kind(s), k)
+    for s, c in [("open", "open"), ("close it", "close"), ("go home", "home"), ("release", "open"),
+                 ("drop the red one in the left bin", None), ("hello", None), ("home", "home"),
+                 ("Luna, open", "open"), ("hey luna go home", "home")]:
+        assert bare_command(s) == c, (s, bare_command(s), c)
     v.speak("selftest speaking")  # logs only unless key + player available
     v.stop()
     print("selftest OK")

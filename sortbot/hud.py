@@ -128,6 +128,14 @@ h1{font-size:15px;margin:0;letter-spacing:3px;color:var(--acc);font-weight:700}
 .sec h3{margin:0 0 8px;font-size:11px;text-transform:uppercase;letter-spacing:1.5px;color:var(--tx1)}
 .inline{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:6px 0}
 .btnrow{display:flex;gap:8px;flex-wrap:wrap;margin:6px 0}
+#chatlog{max-height:230px;overflow-y:auto;background:#0b0f14;border:1px solid var(--line);border-radius:var(--rs);padding:8px;display:flex;flex-direction:column;gap:6px;margin:6px 0}
+#chatlog .cl{max-width:88%;padding:6px 9px;border-radius:10px;white-space:pre-wrap;word-break:break-word;line-height:1.35}
+#chatlog .cl .who{display:block;font-size:10px;letter-spacing:.5px;text-transform:uppercase;color:var(--tx2);margin-bottom:2px}
+#chatlog .you{align-self:flex-end;background:var(--bg2);border:1px solid var(--line2)}
+#chatlog .luna{align-self:flex-start;background:rgba(55,177,131,.13);border:1px solid var(--acc2)}
+#chatlog .thinking{align-self:flex-start;color:var(--tx2);font-style:italic;border:none;background:none}
+#graspnote.bad{color:#ffb3b5}
+#graspnote.good{color:var(--acc)}
 input,select{background:#0b0f14;color:var(--tx);border:1px solid var(--line2);border-radius:var(--rs);padding:9px 10px;min-height:40px;font:12px var(--mono);width:80px}
 input:focus,select:focus{outline:1px solid var(--acc);border-color:var(--acc)}
 .grow{flex:1;min-width:140px;width:auto}
@@ -137,6 +145,7 @@ body.showhelp .help{display:block}
 .rowmsg{min-height:16px;font:11.5px var(--mono);color:var(--amber);white-space:pre-wrap;word-break:break-word;margin-top:4px}
 .rowmsg.err{color:#ff8a8e}
 .why{min-height:15px;font-size:11.5px;color:var(--tx2);font-style:italic;margin-top:3px}
+#why-ztrim:not(:empty){color:var(--amber);font-style:normal;font-weight:600}
 .note{color:var(--tx2);font-size:11.5px;margin-top:6px;line-height:1.5}
 .mono{font:12px/1.5 var(--mono);color:var(--tx1);white-space:pre-wrap;word-break:break-word}
 .empty{color:var(--tx2);font-style:italic;font-size:12px}
@@ -274,11 +283,13 @@ body.showhelp .help{display:block}
    <div class="inline"><button id="b-step" class="btn" data-h-title="step_once">Step once</button>
     <input id="maxsteps" placeholder="40" size="4"><button id="b-maxsteps" class="btn" data-h-title="set_max_steps">Set max steps</button></div>
    <div class="help" data-h="step_once"></div>
+   <div class="note">last grasp check (both cameras, before every close): <span id="graspnote" class="mono">none yet</span></div>
    <div class="rowmsg" id="msg-run"></div>
   </div>
   <div class="sec" id="sec-voice" hidden>
-   <h3>Talk to the bot</h3>
-   <div class="inline"><input id="corr" class="grow" placeholder='e.g. "put the shiny things on the left"'><button id="corrbtn" class="btn">Send</button></div>
+   <h3>Talk to Luna <span style="text-transform:none;letter-spacing:0">(she answers straight away &mdash; the arm keeps working)</span></h3>
+   <div id="chatlog"><span class="empty">Say something to Luna &mdash; ask what she is doing, or tell her a new rule.</span></div>
+   <div class="inline"><input id="corr" class="grow" placeholder='e.g. "Luna, what are you doing?" or "put the shiny things on the left"'><button id="corrbtn" class="btn">Send</button></div>
    <div class="help" data-h="say_to_bot"></div>
    <div class="inline"><button id="ptt" class="btn" data-h-title="transcribe">&#127908; Hold to talk</button>
     <button id="mictoggle" class="btn" hidden>Listening: OFF</button></div>
@@ -286,6 +297,8 @@ body.showhelp .help{display:block}
    <div class="note" id="micnote"></div>
    <div id="transcript"></div>
    <div class="note">queued for the next step: <span id="vqueue" class="mono">none</span></div>
+   <div class="inline"><span class="note" style="margin:0">chat model: <span id="chatmdl" class="mono">-</span></span>
+    <button id="b-clearchat" class="btn sm" data-h-title="clear_chat">Clear conversation</button></div>
    <div class="rowmsg" id="msg-voice"></div>
   </div>
   <div class="sec" id="sec-rules" hidden>
@@ -308,6 +321,23 @@ body.showhelp .help{display:block}
    <div class="note">last VLM call: <span id="vlmstat">-</span></div>
    <div class="note" id="mnotes"></div>
    <div class="rowmsg" id="msg-models"></div>
+  </div>
+  <div class="sec" id="sec-ztrim" hidden>
+   <h3>Grasp depth</h3>
+   <div class="note">The gripper descends to <span id="zgrasp" class="mono">-</span> above the table. If it
+    <b>stops short</b> of the table and closes on air, trim it <b>down</b> (more negative); if it
+    <b>presses into</b> the table, trim it up.</div>
+   <div class="inline"><span class="lbl2">trim</span><input id="ztrim" placeholder="0" size="5"><span class="note" style="margin:0">mm</span>
+    <button id="b-ztrim" class="btn" data-h-title="set_z_trim">Set</button></div>
+   <div class="btnrow" id="znudge">
+    <button class="btn" data-dz="-10">&minus;10 mm</button><button class="btn" data-dz="-2">&minus;2 mm</button>
+    <button class="btn" data-dz="2">+2 mm</button><button class="btn" data-dz="10">+10 mm</button>
+    <span class="note" style="margin:0">&rarr; grasp height <span id="zgrasp2" class="mono">-</span></span></div>
+   <div class="why" id="why-ztrim"></div>
+   <div class="help" data-h="set_z_trim"></div>
+   <div class="note">current trim <span id="ztrimcur" class="mono">-</span> &middot; absolute floor
+    <span id="zfloor" class="mono">-</span> (never crossed, whatever the trim says)</div>
+   <div class="rowmsg" id="msg-ztrim"></div>
   </div>
   <div id="extra-tune"></div>
  </section>
@@ -361,8 +391,8 @@ const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;',
 const TABS=['setup','operate','tune','debug'];
 const TABOF={run:'operate',robot:'debug',perception:'tune',calibration:'setup',voice:'operate',rules:'operate',models:'tune',log:'debug'};
 const CLAIMED=new Set(['connect_robot','connect_cameras','connect_vlm','start','pause','resume','stop','step_once','set_max_steps','set_task',
- 'home','open_gripper','close_gripper','jog','goto','torque_off','torque_on',
- 'say_to_bot','say_to_robot','transcribe','speak','mic_on','mic_off',
+ 'home','open_gripper','close_gripper','jog','goto','torque_off','torque_on','set_z_trim',
+ 'say_to_bot','say_to_robot','transcribe','speak','mic_on','mic_off','clear_chat',
  'add_rule','delete_rule','move_rule','clear_hints','get_models','set_model',
  'px_to_mm','log_clear',
  'calib_start','calib_touch','calib_capture','calib_undo','calib_finish','calib_cancel','calib_sample']);
@@ -507,6 +537,13 @@ $('newrule').onkeydown=e=>{if(e.key==='Enter')$('rulebtn').click();};
 $('rulebtn').onclick=async()=>{const t=$('newrule').value.trim();
  if(!t){showMsg($('rulebtn'),{ok:false,message:'type a rule first'});return;}
  rulesSig='';const j=await act('add_rule',{text:t},$('rulebtn'));if(j.ok)$('newrule').value='';};
+$('b-ztrim').onclick=()=>{const v=parseFloat($('ztrim').value);
+ if(isNaN(v)){showMsg($('b-ztrim'),{ok:false,message:'enter a trim in mm, e.g. -3'});return;}
+ act('set_z_trim',{mm:v},$('b-ztrim'));};
+document.querySelectorAll('#znudge button').forEach(b=>b.onclick=()=>{
+ const cur=(S.grasp&&S.grasp.z_trim_mm)||0;
+ act('set_z_trim',{mm:Math.round((cur+parseFloat(b.dataset.dz))*100)/100},b);});
+$('b-clearchat').onclick=()=>{chatSig='';act('clear_chat',{},$('b-clearchat'));};
 $('b-clearhints').onclick=()=>act('clear_hints',{},$('b-clearhints'));
 $('b-home').onclick=()=>act('home',{},$('b-home'));
 $('b-open').onclick=()=>act('open_gripper',{},$('b-open'));
@@ -590,11 +627,13 @@ $('ptt').onmousedown=pttDown;$('ptt').onmouseup=pttUp;$('ptt').onmouseleave=pttU
 $('ptt').ontouchstart=e=>{e.preventDefault();pttDown();};
 $('ptt').ontouchend=e=>{e.preventDefault();pttUp();};
 // ---------- models ----------
-const PROVIDERS=[['openai','vision model'],['elevenlabs_tts','tts model'],['elevenlabs_stt','stt model'],['elevenlabs_voice','voice']];
+const PROVIDERS=[['openai','planner model'],['openai_chat','chat model (Luna)'],['openai_verify','grasp check model'],
+ ['elevenlabs_tts','tts model'],['elevenlabs_stt','stt model'],['elevenlabs_voice','voice']];
 async function loadModels(){const j=await act('get_models');if(j.ok&&j.data){window._models=j.data;renderModels();}
  else $('mrows').innerHTML='<span class="empty">'+esc(j.message||'get_models failed')+'</span>';}
 function renderModels(){const d=window._models;if(!d)return;const cur=d.current||{};
- const opts={openai:d.openai||[],elevenlabs_tts:(d.elevenlabs||{}).tts||[],elevenlabs_stt:(d.elevenlabs||{}).stt||[],
+ const opts={openai:d.openai||[],openai_chat:d.openai||[],openai_verify:d.openai||[],
+  elevenlabs_tts:(d.elevenlabs||{}).tts||[],elevenlabs_stt:(d.elevenlabs||{}).stt||[],
   elevenlabs_voice:((d.elevenlabs||{}).voices||[]).map(v=>[v.id,v.name+' ('+v.id.slice(0,8)+')'])};
  $('mrows').innerHTML=PROVIDERS.map(([p,lbl])=>{let os=opts[p].map(o=>{const pair=Array.isArray(o)?o:[o,o];
    return '<option value="'+esc(pair[0])+'"'+(pair[0]===cur[p]?' selected':'')+'>'+esc(pair[1])+'</option>';}).join('');
@@ -604,6 +643,37 @@ function renderModels(){const d=window._models;if(!d)return;const cur=d.current|
  $('mrows').querySelectorAll('select').forEach(sl=>sl.onchange=async()=>{
   const j=await act('set_model',{provider:sl.dataset.prov,value:sl.value});
   showMsg(sl,j);window._models=null;loadModels();});}
+// ---------- conversation transcript (newest last, auto-scrolling) ----------
+let chatSig='';
+function renderChat(c){
+ const box=$('chatlog');if(!box)return;
+ const lines=(c&&c.transcript)||[];
+ const sig=lines.map(l=>l.i).join(',')+'|'+((c&&c.thinking)?'1':'0');
+ if(sig===chatSig)return;chatSig=sig;
+ const near=box.scrollHeight-box.scrollTop-box.clientHeight<60;
+ box.innerHTML=lines.map(l=>'<div class="cl '+(l.who==='luna'?'luna':'you')+'"><span class="who">'+
+   (l.who==='luna'?'Luna':'you')+' &middot; '+new Date(l.t*1000).toLocaleTimeString()+'</span>'+esc(l.text)+'</div>').join('')
+  +((c&&c.thinking)?'<div class="cl thinking">Luna is thinking...</div>':'')
+  ||'<span class="empty">Say something to Luna - ask what she is doing, or tell her a new rule.</span>';
+ if(near||lines.length)box.scrollTop=box.scrollHeight;}
+function renderGrasp(g){
+ const el=$('graspnote');if(!el)return;
+ if(!g){el.textContent='none yet';el.className='mono';return;}
+ if(g.grasp_z_cm!=null){$('zgrasp').textContent=g.grasp_z_cm.toFixed(2)+' cm ('+g.grasp_z_mm+' mm)';
+  $('zgrasp2').textContent=g.grasp_z_cm.toFixed(2)+' cm';
+  $('why-ztrim').textContent=g.large_trim?('large trim ('+g.z_trim_mm+' mm) - check the arm clears the table before running'):'';
+  $('ztrimcur').textContent=(g.z_trim_mm>0?'+':'')+g.z_trim_mm+' mm';
+  $('zfloor').textContent=g.hard_floor_mm+' mm';
+  if($('ztrim')!==document.activeElement&&$('ztrim').value==='')$('ztrim').placeholder=String(g.z_trim_mm);}
+ if(!g.verify){el.textContent='OFF - grasp.verify is false in config.yaml (the claw closes unchecked)';
+  el.className='mono bad';return;}
+ const v=g.last;
+ if(!v){el.textContent='none yet (checked before every close: overhead + wrist)';el.className='mono';return;}
+ el.textContent=(v.accepted?'aligned':'NOT aligned')+' at ('+v.x_cm+', '+v.y_cm+') cm - check '+v.try+'/'+v.tries+
+  (v.confidence!=null?', confidence '+v.confidence:'')+
+  ((v.dx_cm||v.dy_cm)?', off by dx '+v.dx_cm+' dy '+v.dy_cm+' cm':'')+
+  (v.reason?' - '+v.reason:'');
+ el.className='mono '+(v.accepted?'good':'bad');}
 // ---------- state-driven rendering ----------
 const fmt=v=>v==null?'-':(typeof v==='number'?v.toFixed(0):v);
 function dis(btn,reason){if(!btn)return;btn.disabled=!!reason;
@@ -785,6 +855,9 @@ async function tick(){let s;
  if(s.voice){$('vqueue').textContent=(s.voice.queue||[]).join(' | ')||'none';
   if(s.voice.last_transcript&&!$('transcript').textContent.startsWith('!!')&&$('transcript').textContent!=='transcribing...')
    $('transcript').textContent='heard: "'+s.voice.last_transcript+'"';}
+ renderChat(s.chat);
+ renderGrasp(s.grasp);
+ if(s.chat&&s.chat.model)$('chatmdl').textContent=s.chat.model+(s.chat.last_latency_ms!=null?'  '+s.chat.last_latency_ms+' ms':'');
  renderRules(s.rules);
  updateEnables();
  // toasts: bot speech, failures, run errors

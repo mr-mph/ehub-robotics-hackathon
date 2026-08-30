@@ -23,7 +23,10 @@ OPENAI_EXCLUDE = ("audio", "realtime", "transcribe", "tts", "search", "moderatio
                   "embedding", "image", "deep-research", "codex")
 ELEVENLABS_TTS = ["eleven_flash_v2_5", "eleven_turbo_v2_5", "eleven_multilingual_v2", "eleven_v3"]
 ELEVENLABS_STT = ["scribe_v2", "scribe_v1"]
-PROVIDERS = ("openai", "elevenlabs_tts", "elevenlabs_stt", "elevenlabs_voice")
+# openai      = the PLANNER (vlm.model)
+# openai_chat = the conversational "luna-chat" worker (vlm.chat_model) -- small + fast + vision
+# openai_verify = the pre-grasp both-cameras alignment check (vlm.verify_model)
+PROVIDERS = ("openai", "openai_chat", "openai_verify", "elevenlabs_tts", "elevenlabs_stt", "elevenlabs_voice")
 
 
 def _errmsg(e: Exception) -> str:
@@ -130,6 +133,8 @@ class ModelRegistry:
     def get(self, current: dict) -> dict:
         """current: {provider: value} for the PROVIDERS above."""
         notes: list[str] = []
+        # one listing serves all three OpenAI slots (planner / chat / verify); the page marks the current
+        # value of each, prepending it if the listing does not contain it
         return {"openai": self.openai_ids(str(current.get("openai", "")), notes),
                 "elevenlabs": {"tts": list(ELEVENLABS_TTS), "stt": list(ELEVENLABS_STT),
                                "voices": self.voices(notes), "current": current.get("elevenlabs_voice", "")},
@@ -176,8 +181,12 @@ def _selftest() -> None:
                 return _O(voices=[_O(voice_id="v1", name="Rachel")])
 
     reg = ModelRegistry(openai_client=FakeOpenAI(), el_client=FakeEL())
-    d = reg.get({"openai": "gpt-5", "elevenlabs_tts": "eleven_turbo_v2_5", "elevenlabs_stt": "scribe_v2",
+    d = reg.get({"openai": "gpt-5", "openai_chat": "gpt-4o", "openai_verify": "gpt-4o",
+                 "elevenlabs_tts": "eleven_turbo_v2_5", "elevenlabs_stt": "scribe_v2",
                  "elevenlabs_voice": "v1"})
+    assert d["current"]["openai_chat"] == "gpt-4o" and d["current"]["openai_verify"] == "gpt-4o", d["current"]
+    assert set(PROVIDERS) == {"openai", "openai_chat", "openai_verify", "elevenlabs_tts", "elevenlabs_stt",
+                              "elevenlabs_voice"}, PROVIDERS
     assert d["openai"] == ["gpt-5", "gpt-4o", "o3"], d["openai"]
     assert d["elevenlabs"]["voices"] == [{"id": "v1", "name": "Rachel"}] and d["elevenlabs"]["current"] == "v1"
     assert d["elevenlabs"]["tts"][0] == "eleven_flash_v2_5" and d["notes"] == []
@@ -205,7 +214,8 @@ if __name__ == "__main__":
         reg = ModelRegistry()
         from sortbot import config
         cfg = config.load()
-        d = reg.get({"openai": cfg.openai_model, "elevenlabs_tts": cfg.tts_model,
+        d = reg.get({"openai": cfg.openai_model, "openai_chat": cfg.chat_model,
+                     "openai_verify": cfg.verify_model, "elevenlabs_tts": cfg.tts_model,
                      "elevenlabs_stt": cfg.stt_model, "elevenlabs_voice": cfg.elevenlabs_voice_id})
         import json
         print(json.dumps(d, indent=1))

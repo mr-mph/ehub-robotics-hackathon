@@ -127,7 +127,7 @@ class CalibSession:
     """One teleoperated calibration run. Thread-safe; all triggers return {ok, message, data}."""
 
     def __init__(self, rig: RobotRig, leader, target: ColorTarget, out: Path, min_spacing_mm: float = 15.0,
-                 z_offset_mm: float | None = None, on_frame=None):
+                 z_offset_mm: float | None = None, on_frame=None, bus_lock=None):
         self.rig, self.leader, self.target, self.out = rig, leader, target, Path(out)
         self.min_spacing, self.on_frame = min_spacing_mm, on_frame
         self.z_off = z_offset_mm  # None until touch_table() (or a previous calib.json value is passed in)
@@ -137,6 +137,10 @@ class CalibSession:
         self.frame_rgb: np.ndarray | None = None
         self.state, self.message = "idle", ""
         self._lock, self._stop = threading.RLock(), threading.Event()
+        # Serializes ALL motor-bus / follower access. Share the caller's robot lock so no other thread
+        # (e.g. the HUD /state poller) sync-reads the serial port mid teleop tick -> feetech "Port is in use".
+        # Ordering: _bus is only ever taken inside _lock (or alone), never the other way around.
+        self._bus = bus_lock or threading.RLock()
         self._thread: threading.Thread | None = None
 
     # ---- teleop loop ----
@@ -150,9 +154,10 @@ class CalibSession:
         while not self._stop.is_set():
             t0 = time.monotonic()
             try:
-                a = self.leader.get_action()
                 with self._lock:
-                    self.rig.write_joints(np.array([float(a[f"{m}.pos"]) for m in MOTORS]))
+                    with self._bus:
+                        a = self.leader.get_action()
+                        self.rig.write_joints(np.array([float(a[f"{m}.pos"]) for m in MOTORS]))
                     if tick % DETECT_EVERY == 0:
                         self._observe()
             except Exception as e:  # noqa: BLE001
@@ -162,9 +167,10 @@ class CalibSession:
             time.sleep(max(0.0, dt - (time.monotonic() - t0)))
 
     def _observe(self) -> tuple[np.ndarray, tuple | None, np.ndarray]:
-        self.frame_rgb = self.rig.frame()
+        with self._bus:  # frame may come through the follower; joints always do
+            self.frame_rgb = self.rig.frame()
+            self.fk = self.rig.fk_base_mm(self.rig.read_joints())
         self.det = detect_target(self.frame_rgb, self.target)
-        self.fk = self.rig.fk_base_mm(self.rig.read_joints())
         if self.on_frame:
             self.on_frame(self.annotated())
         return self.frame_rgb, self.det, self.fk
@@ -203,7 +209,8 @@ class CalibSession:
 
     def touch_table(self) -> dict:
         with self._lock:
-            fk = self.rig.fk_base_mm(self.rig.read_joints())
+            with self._bus:
+                fk = self.rig.fk_base_mm(self.rig.read_joints())
             self.z_off = -float(fk[2])
             self.message = f"table plane: base_link origin is {self.z_off:.1f} mm above the table"
             return _r(True, self.message, {"z_offset_mm": self.z_off})
@@ -235,14 +242,24 @@ class CalibSession:
             return _r(True, self.message)
 
     def sample(self, u: float, v: float) -> dict:
-        """Pick the target colour from the latest frame at (u, v)."""
+        """Pick the target colour from the latest frame at (u, v). A click that clearly sampled the table /
+        floor (or detects an implausibly large blob) is rejected and the previous target is kept."""
         with self._lock:
-            frame = self.frame_rgb if self.frame_rgb is not None else self.rig.frame()
-            self.target = ColorTarget.from_sample(frame, u, v)
-            self.det = det = detect_target(frame, self.target)
-            self.message = f"target {self.target.name} hsv {self.target.hsv_lo.tolist()}..{self.target.hsv_hi.tolist()}: " + (
+            if self.frame_rgb is not None:
+                frame = self.frame_rgb
+            else:
+                with self._bus:
+                    frame = self.rig.frame()
+            cand = ColorTarget.from_sample(frame, u, v)
+            det = detect_target(frame, cand)
+            err = _target_sanity(frame, u, v, det)
+            if err:
+                self.message = err
+                return _r(False, err, {"target": self.target.to_dict(), "det": None})
+            self.target, self.det = cand, det
+            self.message = f"target {cand.name} hsv {cand.hsv_lo.tolist()}..{cand.hsv_hi.tolist()}: " + (
                 f"detected at ({det[0]:.0f},{det[1]:.0f}) r={det[2]:.0f}" if det else "not detected")
-            return _r(det is not None, self.message, {"target": self.target.to_dict(), "det": det})
+            return _r(det is not None, self.message, {"target": cand.to_dict(), "det": det})
 
     # ---- fit / status ----
     def _arrays(self):
@@ -281,6 +298,22 @@ def _r(ok: bool, message: str, data=None) -> dict:
     return {"ok": ok, "message": message, "data": data}
 
 
+def _target_sanity(frame_rgb: np.ndarray, u: float, v: float, det) -> str | None:
+    """None if the sampled colour looks like a compact coloured target, else a rejection message.
+    Guards against clicks that landed on the bare table/floor: a low-saturation window matches half the
+    frame and detect_target then returns a giant blob (seen live: r=146 px on a 640 px frame)."""
+    h, w = frame_rgb.shape[:2]
+    ui, vi = int(round(u)), int(round(v))
+    patch = frame_rgb[max(0, vi - 6):min(h, vi + 7), max(0, ui - 6):min(w, ui + 7)]
+    hsv = cv2.cvtColor(patch.reshape(-1, 1, 3), cv2.COLOR_RGB2HSV).reshape(-1, 3)
+    if int(np.median(hsv[:, 1])) < 60:
+        return "that doesn't look like a compact coloured target (gray/brown surface?) -- click directly on the ball"
+    if det is not None and det[2] > 0.12 * w:
+        return (f"that doesn't look like a compact coloured target -- click directly on the ball "
+                f"(detected radius {det[2]:.0f}px is too big)")
+    return None
+
+
 # ---------------------------------------------------------------- controller (HUD actions, shared by main + CLI)
 
 
@@ -289,9 +322,10 @@ class CalibController:
     source. rig_fn/leader_fn are lazy so main.py can open the leader only when a session starts."""
 
     def __init__(self, cfg: cfgmod.Config, rig_fn, leader_fn, target: ColorTarget, out: Path | None = None,
-                 on_done=None, latest_frame=None, driver=None):
+                 on_done=None, latest_frame=None, driver=None, bus_lock=None):
         self.cfg, self.rig_fn, self.leader_fn, self.target = cfg, rig_fn, leader_fn, target
         self.out, self.on_done, self.latest_frame, self.driver = Path(out or cfg.calib_file), on_done, latest_frame, driver
+        self.bus_lock = bus_lock  # shared motor-bus lock (main.py passes Session.robot_lock)
         self.session: CalibSession | None = None
         self.hud = None
 
@@ -309,7 +343,8 @@ class CalibController:
         prev = load_calib_dict(self.out)
         z_prev = prev["base_z_offset_mm"] if prev.get("method") else None
         on_frame = (lambda img: self.hud.update(img, None, {})) if self.hud else None
-        self.session = CalibSession(rig, leader, self.target, self.out, self.cfg.calib_min_spacing_mm, z_prev, on_frame)
+        self.session = CalibSession(rig, leader, self.target, self.out, self.cfg.calib_min_spacing_mm, z_prev,
+                                    on_frame, bus_lock=self.bus_lock)
         self.session.start()
         if self.driver:  # --mock: virtual leader scripts the human
             threading.Thread(target=self.driver, args=(leader, self), daemon=True, name="calib-driver").start()
@@ -340,11 +375,15 @@ class CalibController:
         frame = self.latest_frame() if self.latest_frame else None
         if frame is None:
             return _r(False, "no overhead frame yet")
-        self.target = ColorTarget.from_sample(frame, u, v)
-        det = detect_target(frame, self.target)
-        return _r(det is not None, f"target hsv {self.target.hsv_lo.tolist()}..{self.target.hsv_hi.tolist()}: " +
+        cand = ColorTarget.from_sample(frame, u, v)
+        det = detect_target(frame, cand)
+        err = _target_sanity(frame, u, v, det)
+        if err:  # keep the previous target: a bad click must not poison the calibration
+            return _r(False, err, {"target": self.target.to_dict(), "det": None})
+        self.target = cand
+        return _r(det is not None, f"target hsv {cand.hsv_lo.tolist()}..{cand.hsv_hi.tolist()}: " +
                   (f"detected at ({det[0]:.0f},{det[1]:.0f}) r={det[2]:.0f}" if det else "not detected"),
-                  {"target": self.target.to_dict(), "det": det})
+                  {"target": cand.to_dict(), "det": det})
 
     def status(self) -> dict:
         if self.session is None:

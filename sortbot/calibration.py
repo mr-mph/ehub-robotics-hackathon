@@ -185,7 +185,9 @@ class ColorTarget:
         patch = frame_rgb[max(0, v - radius_px):min(h, v + radius_px + 1), max(0, u - radius_px):min(w, u + radius_px + 1)]
         hsv = cv2.cvtColor(patch.reshape(-1, 1, 3), cv2.COLOR_RGB2HSV).reshape(-1, 3)
         hm, sm, vm = (int(np.median(hsv[:, i])) for i in range(3))
-        lo = ((hm - h_tol) % 180, max(0, sm - s_tol), max(0, vm - v_tol))
+        # a genuinely colourful target keeps a saturation floor so the window can't swallow gray surfaces
+        lo_s = max(40, sm - s_tol) if sm >= 100 else max(0, sm - s_tol)
+        lo = ((hm - h_tol) % 180, lo_s, max(0, vm - v_tol))
         hi = ((hm + h_tol) % 180, min(255, sm + s_tol), min(255, vm + v_tol))
         return cls(lo, hi, f"sampled@{u},{v}")
 

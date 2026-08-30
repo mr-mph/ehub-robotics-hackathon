@@ -378,7 +378,10 @@ const GUIDE=[
  'Rest the fingertip on the table and press <b>Touch table</b> (records the table height).',
  'Press <b>Finish</b> to save. <b>Cancel</b> writes nothing.'];
 let ACT={},actsig='',S={},curTab='setup';
-let ring=null,frameW=640,frameH=480,dropZone=null,dragging=null,zoneSig='',rulesSig='',logSig='',tickerSig='';
+let ring=null,frameW=640,frameH=480,haveWH=false,dropZone=null,dragging=null,zoneSig='',rulesSig='',logSig='',tickerSig='';
+// Frame size for px scaling: prefer the live size from /state (haveWH) — an <img> on an mjpeg stream can keep
+// a stale naturalWidth from before a server restart at another resolution, mis-scaling clicks and the ring.
+function frameWH(im){return haveWH?[frameW,frameH]:[im.naturalWidth||frameW,im.naturalHeight||frameH];}
 let lastSay='',lastCallSig='',lastErrSig='',lastPickColor='',targetLocked=false,ckDismissed=false;
 function toast(msg,kind){const t=document.createElement('div');t.className='toast'+(kind?' '+kind:'');
  t.textContent=msg;$('toasts').appendChild(t);
@@ -524,7 +527,7 @@ $('mictoggle').onclick=async()=>{const on=S.voice&&S.voice.listening;
  $('micnote').textContent=j.message||'';tick();};
 // ---------- overhead click: zone drop placement or calibration target pick ----------
 $('ov').onclick=async e=>{const im=$('ov'),r=im.getBoundingClientRect();
- const nw=im.naturalWidth||frameW,nh=im.naturalHeight||frameH;
+ const [nw,nh]=frameWH(im);
  const u=Math.round((e.clientX-r.left)/r.width*nw),v=Math.round((e.clientY-r.top)/r.height*nh);
  if(dropZone){const z=dropZone;dropZone=null;zoneSig='';
   const j=await act('px_to_mm',{u:u,v:v});
@@ -537,9 +540,12 @@ $('ov').onclick=async e=>{const im=$('ov'),r=im.getBoundingClientRect();
   ring=(j.data&&j.data.det)?j.data.det:null;drawRing();
   const m=$('msg-calib');if(m){m.textContent=j.message||'';m.classList.toggle('err',!j.ok);}}};
 function drawRing(){const im=$('ov'),el=$('ring');if(!ring){el.style.display='none';return;}
- const nw=im.naturalWidth||frameW,nh=im.naturalHeight||frameH,sx=im.clientWidth/nw,sy=im.clientHeight/nh,u=ring[0],v=ring[1],rad=ring[2];
- el.style.display='block';el.style.left=(u-rad)*sx+'px';el.style.top=(v-rad)*sy+'px';
- el.style.width=2*rad*sx+'px';el.style.height=2*rad*sy+'px';}
+ const [nw,nh]=frameWH(im),sx=im.clientWidth/nw,sy=im.clientHeight/nh,u=ring[0],v=ring[1];
+ const rad=Math.min(ring[2],Math.min(nw,nh)/2);  // cap: never draw beyond the image box
+ el.style.display='block';
+ el.style.left=Math.max(0,(u-rad)*sx)+'px';el.style.top=Math.max(0,(v-rad)*sy)+'px';
+ el.style.width=Math.min(2*rad*sx,im.clientWidth)+'px';el.style.height=Math.min(2*rad*sy,im.clientHeight)+'px';}
+window.addEventListener('resize',drawRing);
 // ---------- push to talk ----------
 let rec=null,chunks=[];
 function b64(buf){const u=new Uint8Array(buf);let t='';for(let i=0;i<u.length;i+=0x8000)t+=String.fromCharCode.apply(null,u.subarray(i,i+0x8000));return btoa(t);}
@@ -682,7 +688,7 @@ async function tick(){let s;
  try{s=await(await fetch('/state')).json();}catch(e){return;}
  S=s;
  const r=s.run,rb=s.robot,cal=s.calibration;
- if(s.frame_wh){frameW=s.frame_wh[0];frameH=s.frame_wh[1];}
+ if(s.frame_wh){frameW=s.frame_wh[0];frameH=s.frame_wh[1];haveWH=true;}
  // header: connection dots
  const modes=(r&&r.mode)||{},conn=(r&&r.connected)||{};
  [['robot','cd-robot'],['cams','cd-cams'],['vlm','cd-vlm']].forEach(([k,id])=>{const el=$(id);

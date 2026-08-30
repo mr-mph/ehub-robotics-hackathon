@@ -672,12 +672,13 @@ class Session:
 
             self.calib = cal.CalibController(self.cfg, lambda: make()[0], lambda: make()[1], target, self._calib_out,
                                              self._calib_done, lambda: self.last_overhead,
-                                             driver=lambda ld, c: ld.drive(c, dwell_s=0.2))
+                                             driver=lambda ld, c: ld.drive(c, dwell_s=0.2), bus_lock=self.robot_lock)
         else:
             self._calib_out = None
             rig = cal.RobotRig(self.robot, lambda: self._grab_frame("overhead"))
             self.calib = cal.CalibController(self.cfg, lambda: rig, lambda: cal.open_leader(self.cfg), target,
-                                             self.cfg.calib_file, self._calib_done, lambda: self.last_overhead)
+                                             self.cfg.calib_file, self._calib_done, lambda: self.last_overhead,
+                                             bus_lock=self.robot_lock)
         if self.hud is not None:
             self.calib.register(self.hud)
             self.hud.register("calib_start", self._calib_start, "Start calibration", "calibration", params=[],
@@ -1143,7 +1144,10 @@ class Session:
         r = self.robot
         if r is None:
             return None
-        if self.robot_lock.acquire(timeout=0.2):
+        # While a calibration teleop session owns the bus, never sync-read the serial port from here
+        # (feetech: "Port is in use!"); serve the cached last pose instead.
+        calib_busy = self.calib is not None and self.calib.active
+        if not calib_busy and self.robot_lock.acquire(timeout=0.2):
             try:
                 p = r.get_ee_pose()
                 self._robot_cache = {"ee_pose": {"x": round(p.x, 1), "y": round(p.y, 1), "z": round(p.z, 1),

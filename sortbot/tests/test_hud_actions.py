@@ -11,6 +11,7 @@ import logging
 import shutil
 import socket
 import tempfile
+import threading
 import time
 import urllib.request
 from argparse import Namespace
@@ -215,13 +216,36 @@ def test_hud_actions() -> None:
         # --- calibration from the page while idle (mock teleop session, temp calib file) ---
         assert post("calib_start")["ok"]
         _wait(lambda: get("/state")["calibration"]["state"] == "running", what="calibration running")
+        # hammer /state while the teleop session runs: the single bus lock + cached pose must keep every
+        # response consistent (regression: concurrent bus reads -> feetech "Port is in use!")
+        hammer_errs: list = []
+        hammer_stop = threading.Event()
+
+        def _hammer():
+            while not hammer_stop.is_set():
+                try:
+                    s = get("/state")
+                    assert s["robot"] is not None and "torque" in s["robot"], s["robot"]
+                    assert s["calibration"]["state"] in ("running", "fitted"), s["calibration"]
+                except Exception as e:  # noqa: BLE001
+                    hammer_errs.append(e)
+                    return
+
+        hammer = threading.Thread(target=_hammer, daemon=True)
+        hammer.start()
         r = post("set_mode", {"robot": "off"})  # refused while calibrating: the teleop thread owns the arm
         assert not r["ok"] and "calibration" in r["message"], r
         assert get("/state")["calibration"]["state"] in ("running", "fitted"), "calibration must survive set_mode"
         _wait(lambda: get("/state")["calibration"]["state"] == "fitted", timeout=40, what="calibration fitted")
+        hammer_stop.set()
+        hammer.join(timeout=5)
+        assert not hammer_errs, hammer_errs[:1]
         c = get("/state")["calibration"]
         assert c["n"] >= 4 and c["residual_mean_mm"] is not None and c["residual_mean_mm"] < 3.0, c
         assert session._calib_out is not None and session._calib_out.exists()
+        # a click on the bare mat (gray pixel) must be rejected, keeping the previous target
+        r = post("calib_sample", {"u": 5, "v": 5})
+        assert not r["ok"] and "target" in r["message"].lower() and r["data"]["det"] is None, r
         r = post("set_mode", {"vlm": "mock"})  # the guard releases once the session has finished
         assert r["ok"], r
 

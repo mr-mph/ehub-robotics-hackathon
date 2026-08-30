@@ -29,7 +29,7 @@ import numpy as np
 
 from lerobot.model.kinematics import RobotKinematics
 from sortbot import config as cfgmod
-from sortbot.types import DetectedObject, ExecResult, Pose, RobotAPI
+from sortbot.types import ExecResult, Pose, RobotAPI
 
 log = logging.getLogger("sortbot.robot")
 
@@ -321,10 +321,10 @@ class _KinematicBase:
                 return ExecResult(False, f"{label} failed: {r.message}")
         return ExecResult(True, label)
 
-    def pick(self, obj: DetectedObject) -> ExecResult:
-        x, y = obj.centroid_mm
+    def pick(self, x_mm: float, y_mm: float) -> ExecResult:
+        x, y = float(x_mm), float(y_mm)
         zg = max(self.cfg.grasp_z_mm, self.cfg.table_z_mm + self.cfg.gripper_clearance_mm)
-        return self._run(f"picked #{obj.id}",
+        return self._run(f"picked at ({x:.0f},{y:.0f})",
                          self.open_gripper,
                          lambda: self.move_to(x, y, zg),
                          self.close_gripper,
@@ -451,9 +451,8 @@ def _selftest() -> None:
     assert r.move_to(275, 0, 60).ok
     assert r.turn_to(45).ok and abs(r.get_ee_pose().roll_deg - 45) < 1e-9 and abs(r.q[4] - 45) < 1e-9
     assert r.turn_to(0).ok
-    obj = DetectedObject(1, (300.0, 120.0), (0, 0, 10, 10), 100.0, "red")
     n0 = len(r.log)
-    assert r.pick(obj).ok and not r.gripper_open
+    assert r.pick(300.0, 120.0).ok and not r.gripper_open
     zs = [r.fk_table(q)[2, 3] for q in r.log[n0:]]
     assert min(zs) >= cfg.gripper_clearance_mm - 2.0, min(zs)
     assert r.place_at(*cfg.zone("MIDDLE").drop_point_mm).ok and r.gripper_open

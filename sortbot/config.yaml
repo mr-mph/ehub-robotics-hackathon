@@ -36,13 +36,6 @@ calibration:
   target: green            # green | orange | hsv:lo_h,lo_s,lo_v,hi_h,hi_s,hi_v   (or click the HUD overhead image)
   ball_radius_mm: 20.0
   min_sample_spacing_mm: 15.0
-perception:
-  # ClassicalDetector thresholds (HUD perception tab tunes these live and persists here):
-  # a pixel is foreground if HSV V > v_min OR S > s_min; blobs kept if area_min <= px area <= area_max
-  v_min: 70
-  s_min: 90
-  area_min: 300
-  area_max: 60000
 zones:
   # generic bins seen from the robot (y+ is its left). Rename freely: the VLM only sees the names,
   # and the spoken task / RULES supply what goes where at runtime.

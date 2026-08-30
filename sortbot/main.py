@@ -40,15 +40,27 @@ import numpy as np
 
 from sortbot import config as cfgmod
 from sortbot import perception
-from sortbot.types import Command, DetectedObject, ExecResult, Pose, RobotAPI, WorldState
+from sortbot.types import Command, ExecResult, Pose, RobotAPI, WorldState
 from sortbot.models import PROVIDERS, ModelRegistry, yaml_set
 from sortbot.vlm import VLM
 from sortbot.voice import RulesStore, VoiceIO, classify
 
 log = logging.getLogger("sortbot.main")
 
-HIGH_LEVEL = {"pick", "place_in_zone", "place_at", "done", "say"}
+HIGH_LEVEL = {"pick_at", "place_in_zone", "place_at", "done", "say"}
 LOW_LEVEL = {"move_to", "open", "close", "turn_to"}
+
+# ============================== UNIT BOUNDARY (cm <-> mm) ==============================
+# The VLM surface (tool args, overlay grid labels, prompt state, history, rejection messages) is
+# CENTIMETERS; everything internal (robot, config.yaml, calib.json, safety envelope, zones) is
+# MILLIMETERS. _mm_args() below is the ONLY place VLM centimeters become internal millimeters
+# (sortbot.vlm._state_text and sortbot.perception's grid labels are the mm -> cm half).
+_CM_KEYS = {"x_cm": "x", "y_cm": "y", "z_cm": "z"}
+
+
+def _mm_args(args: dict) -> dict:
+    """{'x_cm': 25.0, ...} -> {'x': 250.0, ...} (mm). Non-coordinate args pass through unchanged."""
+    return {_CM_KEYS.get(k, k): (float(v) * 10.0 if k in _CM_KEYS else v) for k, v in args.items()}
 
 
 class CamRig:
@@ -174,18 +186,14 @@ class Loop:
         self.step = 0
         self.history: list[dict] = []
         self.hints: list[str] = []
-        self.holding: int | None = None
-        self.holding_obj: DetectedObject | None = None  # ids are renumbered every frame; keep what was picked
-        self.filled: set[str] = set()
+        self.holding: str | None = None  # description of the last pick ("object picked at (x, y) cm"), or None
         self.placed = 0
         self.last_say = ""
         self.calib = None  # CalibController (see attach_calibration / Session)
         self._calib_requested = threading.Event()
         self.last_overhead: np.ndarray | None = None
         self.frame_sink = None  # optional callable(overhead) so the Session sees the latest raw frame
-        self.detector = None    # shared perception.ClassicalDetector (Session-tuned); default per detect_objects
         self.dlog: DecisionLog | None = None
-        self.view = None        # optional callable(overlay, raw) -> frame shown on /overhead.mjpg (mask view)
         self._overlay: np.ndarray | None = None  # overlay at decision time (log thumbnails)
         self._t0: float | None = None
         self._pose_cache: Pose | None = None  # last pose read under the bus lock; hud_update NEVER reads the bus
@@ -223,7 +231,7 @@ class Loop:
                         r = self.robot.open_gripper()
                         self._refresh_pose_locked()
                     self.record("open", {}, r)
-                    self.holding = self.holding_obj = None
+                    self.holding = None
                 elif bare and w == "close":
                     with self.lock:
                         r = self.robot.close_gripper()
@@ -251,57 +259,65 @@ class Loop:
 
     # ---- validate + execute ----
     def validate(self, cmd: Command, world: WorldState) -> str | None:
+        """Coordinate tools are validated against the workspace AABB + the zone names; rejection
+        messages are written in CENTIMETERS (the VLM's units — it must be able to react to them)."""
         a, t = cmd.args, cmd.tool
         if t not in HIGH_LEVEL | LOW_LEVEL:
             return f"unknown tool {t!r}"
         lo, hi = self.cfg.aabb_min_mm, self.cfg.aabb_max_mm
-        if t == "pick":
-            if self.holding is not None:
-                return f"already holding #{self.holding}; place it first"
-            if not any(o.id == a.get("id") for o in world.objects):
-                return f"object id {a.get('id')} not in candidates {[o.id for o in world.objects]}"
-        elif t == "place_in_zone":
+        if t == "place_in_zone":
             if self.holding is None:
                 return "not holding anything"
             if self.cfg.zone(str(a.get("zone", ""))) is None:
                 return f"unknown zone {a.get('zone')!r}; zones: {[z.name for z in self.cfg.zones]}"
-        elif t in ("place_at", "move_to"):
-            x, y = a.get("x_mm", a.get("x")), a.get("y_mm", a.get("y"))
+        elif t in ("pick_at", "place_at", "move_to"):
+            if t == "pick_at" and self.holding is not None:
+                return f"already holding ({self.holding}); place it first"
             if t == "place_at" and self.holding is None:
                 return "not holding anything"
+            m = _mm_args(a)
+            x, y = m.get("x"), m.get("y")
             if x is None or y is None:
-                return "missing x/y"
+                return "missing x_cm/y_cm"
             if not (lo[0] <= x <= hi[0] and lo[1] <= y <= hi[1]):
-                return f"({x},{y}) outside workspace x[{lo[0]},{hi[0]}] y[{lo[1]},{hi[1]}]"
-            if t == "move_to" and not (lo[2] <= a.get("z", -1) <= hi[2]):
-                return f"z outside [{lo[2]},{hi[2]}]"
+                return (f"({x / 10:g}, {y / 10:g}) cm is outside the reachable workspace "
+                        f"x [{lo[0] / 10:g}, {hi[0] / 10:g}] cm, y [{lo[1] / 10:g}, {hi[1] / 10:g}] cm")
+            if t == "move_to":
+                z = m.get("z")
+                if z is None or not (lo[2] <= z <= hi[2]):
+                    return f"z must be within [{lo[2] / 10:g}, {hi[2] / 10:g}] cm"
         return None
 
     def execute(self, cmd: Command, world: WorldState) -> ExecResult:
-        a, t, r = cmd.args, cmd.tool, self.robot
-        if t == "pick":
-            obj = next(o for o in world.objects if o.id == a["id"])
-            res = r.pick(obj)
+        a, t, r = _mm_args(cmd.args), cmd.tool, self.robot  # mm from here down (see the UNIT BOUNDARY)
+        if t == "pick_at":
+            res = r.pick(a["x"], a["y"])
             if res.ok:
-                self.holding, self.holding_obj = obj.id, obj
+                self.holding = f"object picked at ({a['x'] / 10:g}, {a['y'] / 10:g}) cm"
+                return ExecResult(True, self.holding.replace("object picked", "picked the object"))
             return res
         if t == "place_in_zone":
             z = self.cfg.zone(a["zone"])
             res = r.place_at(*z.drop_point_mm)
             if res.ok:
-                self.holding, self.holding_obj, self.placed = None, None, self.placed + 1
-                self.filled.add(z.name)
+                self.holding, self.placed = None, self.placed + 1
+                return ExecResult(True, f"placed in {z.name} at its drop point "
+                                        f"({z.drop_point_mm[0] / 10:g}, {z.drop_point_mm[1] / 10:g}) cm")
             return res
         if t == "place_at":
-            res = r.place_at(float(a.get("x_mm", a.get("x"))), float(a.get("y_mm", a.get("y"))))
+            res = r.place_at(a["x"], a["y"])
             if res.ok:
-                self.holding, self.holding_obj, self.placed = None, None, self.placed + 1
+                self.holding, self.placed = None, self.placed + 1
+                return ExecResult(True, f"placed at ({a['x'] / 10:g}, {a['y'] / 10:g}) cm")
             return res
         if t == "move_to":
-            return r.move_to(float(a["x"]), float(a["y"]), float(a["z"]))
+            res = r.move_to(a["x"], a["y"], a["z"])
+            if res.ok:
+                return ExecResult(True, f"at ({a['x'] / 10:g}, {a['y'] / 10:g}, {a['z'] / 10:g}) cm")
+            return res
         if t == "open":
             res = r.open_gripper()
-            self.holding = self.holding_obj = None
+            self.holding = None
             return res
         if t == "close":
             return r.close_gripper()
@@ -373,14 +389,9 @@ class Loop:
                 self.hud_update(overhead, wrist, step, t0, "no homography - calibrate")
                 time.sleep(0.5)
                 continue
-            objects = perception.detect_objects(overhead, H, self.cfg, detector=self.detector,
-                                                filled_zones=sorted(self.filled), method=self.homog.method)
             rules = ([f"GOAL: {self.task}"] if self.task else []) + self.rules.list() + self.hints
-            if self.holding_obj is not None:
-                o = self.holding_obj
-                rules = rules + [f"holding: the {o.color_hint} object picked from ({o.centroid_mm[0]:.0f},{o.centroid_mm[1]:.0f}); object ids below are renumbered"]
-            world = WorldState(objects, self.cfg.zones, self._read_pose(), self.robot.gripper_open, self.holding, rules)
-            overlay = perception.render_overlay(overhead, H, objects, self.cfg.zones, world.ee_pose, rules)
+            world = WorldState(self.cfg.zones, self._read_pose(), self.robot.gripper_open, self.holding, rules)
+            overlay = perception.render_overlay(overhead, H, self.cfg.zones, world.ee_pose, rules)
             self._overlay = overlay
             self.hud_update(overlay, wrist, step, t0, "planning")
             try:
@@ -404,11 +415,7 @@ class Loop:
                         self._refresh_pose_locked()
             except SafetyError as e:
                 res = ExecResult(False, f"safety: {e}")
-            args = dict(cmd.args)
-            if cmd.tool == "pick" and res.ok:
-                o = self.holding_obj
-                args.update(color=o.color_hint, at=[round(o.centroid_mm[0]), round(o.centroid_mm[1])])
-            self.record(cmd.tool, args, res)
+            self.record(cmd.tool, dict(cmd.args), res)
             self.hud_update(overlay, wrist, step, t0, f"{cmd.tool} -> {res.message}")
             if cmd.tool == "done":
                 return f"done: {res.message}"
@@ -419,8 +426,6 @@ class Loop:
     def hud_update(self, overlay, wrist, step, t0, status) -> None:
         if self.hud is None:
             return
-        if self.view is not None:
-            overlay = self.view(overlay, self.last_overhead)
         # cached pose only: hud_update must NEVER read the bus (it runs outside the locked motion sections
         # and would race the /state poller's locked read -> feetech "Port is in use!" / serial garbage)
         self.hud.update(overlay, wrist, dict(
@@ -539,11 +544,8 @@ class Session:
         self._robot_cache: dict = {}
         self.calib, self._calib_out = None, None
         self.models = ModelRegistry()
-        self.det_params = perception.DetectorParams(cfg.det_v_min, cfg.det_s_min, cfg.det_area_min, cfg.det_area_max)
-        self.detector = perception.ClassicalDetector(self.det_params)  # shared: loop + redetect + mask view
-        self.mask_view = False
         self.dlog = DecisionLog()
-        self._overlay_hold: tuple[float, np.ndarray] | None = None  # (until_ts, overlay) shown while idle after redetect
+        self._overlay_hold: tuple[float, np.ndarray] | None = None  # (until_ts, overlay) shown while idle after a zone edit
         self._calib_flag: tuple[float, bool] | None = None  # (calib.json mtime, has fitted H) cache
         self.last_overhead: np.ndarray | None = None
         self._shutdown = threading.Event()
@@ -613,12 +615,6 @@ class Session:
                    help="List selectable OpenAI / ElevenLabs models and voices (OpenAI listing cached 5 min).")
         h.register("set_model", self.set_model, None, "models",
                    help="Hot-swap a model (provider: openai|elevenlabs_tts|elevenlabs_stt|elevenlabs_voice) on the live clients and persist it to config.yaml.")
-        h.register("set_detector_params", self.set_detector_params, None, "perception",
-                   help="Tune the blob detector live (v_min/s_min HSV foreground thresholds, area_min/area_max px^2); persists to config.yaml perception:. Driven by the sliders.")
-        h.register("redetect", self.redetect, "Redetect", "perception", params=[],
-                   help="Re-run detection on the latest overhead frame and refresh the overlay, without a robot step.")
-        h.register("toggle_mask", self.toggle_mask, "Toggle mask view", "perception", params=[],
-                   help="Stream the detector's binary foreground mask on /overhead.mjpg instead of the overlay (toggle back for the overlay).")
         h.register("set_zone_drop", self.set_zone_drop, "Set zone drop", "perception",
                    help="Move a zone's drop point to table-frame (x, y) mm and persist it to config.yaml zones; or use 'set drop' + click on the overhead image.")
         h.register("px_to_mm", self.px_to_mm, None, "perception",
@@ -747,8 +743,8 @@ class Session:
         missing = [k for k, ok in self._connected().items() if not ok]
         if missing:
             return {"ok": False, "message": f"not connected: {', '.join(missing)} -- connect the devices in Setup", "data": None}
-        for dev in (self.robot, self.cams):
-            if hasattr(dev, "reset"):  # a device that supports it starts every run fresh (test scenes do)
+        for dev in (self.robot, self.cams, self.vlm):
+            if hasattr(dev, "reset"):  # a device that supports it starts every run fresh (test doubles do)
                 dev.reset()
         if self.homog is None:
             self.homog = self.factories["homography"](self)
@@ -761,7 +757,7 @@ class Session:
                          step_delay_s=self.step_delay_s)
         self.loop.calib, self.loop._calib_out = self.calib, self._calib_out
         self.loop.frame_sink = lambda f: setattr(self, "last_overhead", f)
-        self.loop.detector, self.loop.dlog, self.loop.view = self.detector, self.dlog, self._overhead_view
+        self.loop.dlog = self.dlog
         self.result = ""
         self.thread = threading.Thread(target=self._run_loop, daemon=True, name="sortbot-loop")
         self.thread.start()
@@ -943,73 +939,19 @@ class Session:
             self.homog = self.factories["homography"](self)
         return self.homog.update(self.last_overhead)
 
-    def _homog_method(self) -> str:
-        return self.homog.method if self.homog is not None else "ball"
-
-    def set_detector_params(self, v_min=None, s_min=None, area_min=None, area_max=None) -> dict:
-        """Any subset; applied to the shared DetectorParams (live) and persisted under config.yaml perception:."""
-        p, sets = self.det_params, {}
-        for k, v, lo, hi in (("v_min", v_min, 0, 255), ("s_min", s_min, 0, 255),
-                             ("area_min", area_min, 0, 10**7), ("area_max", area_max, 1, 10**7)):
-            if v is None:
-                continue
-            v = int(float(v))
-            if not (lo <= v <= hi):
-                return {"ok": False, "message": f"{k}={v} out of range [{lo}, {hi}]", "data": {"params": p.to_dict()}}
-            sets[k] = v
-        if not sets:
-            return {"ok": False, "message": "nothing to set (v_min, s_min, area_min, area_max)", "data": {"params": p.to_dict()}}
-        trial = {**p.to_dict(), **sets}
-        if trial["area_min"] >= trial["area_max"]:
-            return {"ok": False, "message": f"area_min {trial['area_min']} must be < area_max {trial['area_max']}",
-                    "data": {"params": p.to_dict()}}
-        for k, v in sets.items():
-            setattr(p, k, v)
-            setattr(self.cfg, f"det_{k}", v)
-        try:
-            for k, v in sets.items():
-                yaml_set(self.cfg.source_path, "perception", k, str(v))
-            persisted = f"persisted to {self.cfg.source_path.name}"
-        except Exception as e:  # noqa: BLE001
-            persisted = f"NOT persisted: {e}"
-        return {"ok": True, "message": ", ".join(f"{k}={v}" for k, v in sets.items()) + f" (live; {persisted})",
-                "data": {"params": p.to_dict()}}
-
-    def redetect(self) -> dict:
-        """Detection + overlay on the latest overhead frame, no robot step (idle: shown for a few seconds)."""
+    def _refresh_overlay(self) -> None:
+        """Re-render the grid + zone overlay on the latest overhead frame (no robot step); shown for a
+        few seconds while idle so zone-drop edits are visible immediately."""
         frame = self.last_overhead
         if frame is None:
-            return {"ok": False, "message": "no overhead frame yet (connect the cameras in Setup)", "data": None}
+            return
         H = self._current_H()
         if H is None:
-            return {"ok": False, "message": "no homography (run calibration / show the ArUco tags)", "data": None}
-        filled = sorted(self.loop.filled) if self.loop is not None else []
-        objs = perception.detect_objects(frame, H, self.cfg, detector=self.detector,
-                                         filled_zones=filled, method=self._homog_method())
-        overlay = perception.render_overlay(frame, H, objs, self.cfg.zones, None, self.rules.list())
+            return
+        overlay = perception.render_overlay(frame, H, self.cfg.zones, None, self.rules.list())
         self._overlay_hold = (time.time() + 5.0, overlay)
         if self.hud is not None and not self._running():
-            self.hud.update(self._overhead_view(overlay, frame), None, {})
-        data = {"n": len(objs),
-                "objects": [{"id": o.id, "x_mm": round(o.centroid_mm[0], 1), "y_mm": round(o.centroid_mm[1], 1),
-                             "px": [int(round(c)) for c in perception.mm_to_px(H, [o.centroid_mm])[0]],
-                             "area_px": o.area_px, "color": o.color_hint} for o in objs]}
-        return {"ok": True, "message": f"{len(objs)} object(s) detected", "data": data}
-
-    def toggle_mask(self) -> dict:
-        self.mask_view = not self.mask_view
-        return {"ok": True, "message": "mask view ON (binary detector mask on /overhead.mjpg)" if self.mask_view
-                else "mask view off (overlay)", "data": {"mask": self.mask_view}}
-
-    def _overhead_view(self, overlay: np.ndarray, raw: np.ndarray | None) -> np.ndarray:
-        """What /overhead.mjpg shows: the overlay, or the detector's binary mask while toggle_mask is on."""
-        if not self.mask_view or raw is None:
-            return overlay
-        m = cv2.cvtColor(self.detector.fg_mask(raw), cv2.COLOR_GRAY2RGB)
-        p = self.det_params
-        cv2.putText(m, f"MASK  v>{p.v_min} | s>{p.s_min}   area {p.area_min}-{p.area_max}", (6, 18),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
-        return m
+            self.hud.update(overlay, None, {})
 
     def set_zone_drop(self, name: str, x: float, y: float) -> dict:
         """Move a zone's drop point (table mm); persists into config.yaml zones (rect kept as is)."""
@@ -1032,7 +974,7 @@ class Session:
         self.dlog.add("set_zone_drop", {"name": z.name, "x": x, "y": y}, f"drop moved{warn}; {persisted}",
                       step=self.loop.step if self.loop is not None else 0)
         if not self._running():
-            self.redetect()  # re-render the overlay with the new drop marker
+            self._refresh_overlay()  # re-render the overlay with the new drop marker
         return {"ok": True, "message": f"{z.name} drop -> ({x}, {y}){warn}; {persisted}",
                 "data": {"zones": self._perception_state()["zones"]}}
 
@@ -1067,7 +1009,7 @@ class Session:
         return self._calib_flag[1]
 
     def _perception_state(self) -> dict:
-        return {"params": self.det_params.to_dict(), "mask": self.mask_view, "calibrated": self._calibrated(),
+        return {"calibrated": self._calibrated(),
                 "zones": [{"name": z.name, "drop": [z.drop_point_mm[0], z.drop_point_mm[1]],
                            "rect": [list(z.polygon_mm[0]), list(z.polygon_mm[2])]} for z in self.cfg.zones]}
 
@@ -1190,7 +1132,7 @@ class Session:
                     self.last_overhead = ov
                     hold = self._overlay_hold
                     show = hold[1] if hold is not None and time.time() < hold[0] else ov
-                    self.hud.update(self._overhead_view(show, ov), wr, {})
+                    self.hud.update(show, wr, {})
             except Exception as e:  # noqa: BLE001
                 log.debug("preview: %s", e)
             time.sleep(0.4)

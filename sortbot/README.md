@@ -10,18 +10,29 @@ The app is task-agnostic — your spoken task and RULES say what goes where; wit
                                     v
  overhead cam ─┐              ┌── main.py loop ──┐
  wrist cam  ───┴─> perception.py ─> vlm.py ─> robot.py ─> SO101
-                   (numbered objs,   (one tool   (safety
-                    table-frame mm)   call)       envelope, IK)
-                        │                │
-                        └── hud.py <─────┘   (browser HUD, port 8765)
+                   (cm-grid overlay, (sees the   (safety
+                    zones, EE)        photos, one envelope, IK)
+                        │             tool call)  │
+                        └── hud.py <──────────────┘   (browser HUD, port 8765)
  calibration.py: overhead px <-> table mm (teleop-fitted H, or ArUco mat) + table_T_base -> calib/calib.json
  calibrate.py:   teleoperated calibration session (leader arm + coloured target in the gripper), HUD buttons + keys
 ```
 
-Loop: `home()` -> capture overhead + wrist -> overlay numbered candidates -> VLM emits ONE tool call
-(`pick(id)`, `place_in_zone(zone)`, `place_at(x,y)`, `say(text)`, `done`; low-level `move_to/open/close/turn_to`
-for recovery) -> validate against safety envelope -> execute -> repeat. Voice corrections drain at the top of
-each iteration into a persistent RULES list sent with every prompt.
+There is NO object detector: the VLM does the seeing itself. Loop: `home()` -> capture overhead + wrist ->
+render the cm-labelled grid overlay -> VLM reads the photos and emits ONE coordinate-based tool call
+(`pick_at(x_cm,y_cm)`, `place_in_zone(zone)`, `place_at(x_cm,y_cm)`, `say(text)`, `done`; low-level
+`move_to/open_gripper/close_gripper/turn_to` for recovery) -> validate against the workspace envelope
+(rejections go back to the VLM as FAILED tool results) -> execute -> repeat. Voice corrections drain at the
+top of each iteration into a persistent RULES list sent with every prompt.
+
+**Units**: the VLM-facing surface (tool args, overlay grid labels, prompt state, history) is CENTIMETERS;
+everything internal (robot, config.yaml, calib.json, safety envelope, zones) stays MILLIMETERS. The cm->mm
+conversion happens in exactly one place (`main._mm_args`; `vlm._state_text` + the overlay labels are the
+mm->cm half). Recalibrating is never needed after unit changes — calib.json is untouched.
+
+**Threading**: exactly one thread may touch the Feetech serial bus at a time — every bus access goes
+through `Session.robot_lock`, and components that cannot get the lock serve cached state (see the invariant
+at the top of `main.py`; `SORTBOT_BUS_ASSERT=1` arms a proxy that fails loudly on unlocked bus calls).
 
 ## Modules / owners
 
@@ -31,8 +42,8 @@ each iteration into a persistent RULES list sent with every prompt.
 | `robot.py` | robot | `RobotAPI` real SO101; safety envelope, lift-translate-descend, IK sanity |
 | `calibration.py` | calib | colour-target detector, homography px->mm (fitted or ArUco), `table_T_base`, calib.json I/O |
 | `calibrate.py`, `calibrate_aruco.py` | calib | teleop calibration session/controller (HUD actions), legacy ArUco+Kabsch flow |
-| `perception.py` | perception | segment candidates, `DetectedObject`s, overlay render |
-| `vlm.py` | vlm | prompt + tool schema, OpenAI call -> `Command` |
+| `perception.py` | perception | overlay render (cm-labelled grid, zones, EE marker) + px<->mm helpers |
+| `vlm.py` | vlm | prompt + coordinate tool schema (cm), OpenAI call -> `Command` |
 | `voice.py` | voice | ElevenLabs/mic in, keyboard fallback, queue of corrections, `transcribe_bytes` for HUD push-to-talk |
 | `models.py` | models | selectable OpenAI/ElevenLabs model listings (cached 5 min) + `yaml_set` config.yaml persistence |
 | `hud.py` | hud | FastAPI status page + generic action registry (`register(name, fn, label, group, params, help)` -> `POST /action/{name}`; `help` is served in `GET /actions` for tooltips) |
@@ -78,7 +89,7 @@ microphone is listening, and the red **E-STOP** (always visible, key `e`). Below
 * **OPERATE** -- task text, big Start/Pause/Resume/Stop (+ Step once / max steps), corrections (text box,
   push-to-talk, and the **Listening** toggle mapped to `mic_on`/`mic_off` -- the mic NEVER runs unless that
   toggle is on, and it is off on every start), and the rules editor.
-* **TUNE** -- model dropdowns, detector sliders, zone drop points.
+* **TUNE** -- model dropdowns and zone drop points.
 * **DEBUG** -- manual arm control (home / gripper / jog pad / go-to / torque), the decision log, and a raw
   list of every registered action.
 
@@ -132,16 +143,11 @@ persistent RULES list (same RulesStore the voice path uses; survives restarts vi
 one-shot hints of the current run. The rules tab renders the list with per-rule up/down/delete controls;
 `GET /state` carries `rules: {list, hints}`.
 
-PERCEPTION group: `set_detector_params(v_min, s_min, area_min, area_max)` (any subset) tunes the shared
-`ClassicalDetector` thresholds **live** -- the running loop picks them up on the next frame -- and persists them
-under `config.yaml perception:` (sliders with live values on the page; a pixel is foreground if HSV V > `v_min`
-or S > `s_min`, blobs kept if `area_min <= px area <= area_max`). `redetect()` re-runs detection + overlay on the
-latest overhead frame without a robot step (shown for a few seconds while idle). `toggle_mask()` streams the
-detector's binary foreground mask on `/overhead.mjpg` instead of the overlay (toggle again for the overlay).
+PERCEPTION group (overlay-only -- the VLM does the seeing, there are no detector controls):
 `set_zone_drop(name, x, y)` moves a zone's drop point (table mm, validated against the workspace) and persists it
 into `config.yaml zones` (rect untouched, comments preserved); on the page press a zone's **set drop** then click
 the overhead image -- the click is converted px -> mm via the `px_to_mm(u, v)` action. `GET /state` carries
-`perception: {params, mask, zones: [{name, drop, rect}]}`.
+`perception: {calibrated, zones: [{name, drop, rect}]}`.
 
 LOG group: a ring buffer of the last 200 decisions/events -- every loop tool call (with a 160px overlay jpeg
 thumbnail at decision time, latency and the say text), plus voice events, mode changes, zone-drop moves and
@@ -163,8 +169,8 @@ Loop behaviour: every iteration starts with `home()`, so objects and drop points
 of HOME (with the default config: x 160-300 mm, |y| <= 160 mm). Rejected/unsafe commands are returned to the VLM
 as `FAILED: ...` history entries, never raised. Voice input: "rule"-shaped sentences are persisted to RULES,
 `stop` ends the run, `open`/`close`/`home` execute directly, anything else is passed to the VLM as a `(human) ...` hint.
-Zones that have received a placement are excluded from detection (`filled_zones`), so objects already inside a
-zone at start are treated as sorted.
+What counts as "already sorted" is the VLM's call: the prompt tells it to leave things that already sit in a
+sensible zone alone.
 
 ## Calibration (default: teleop / ball mode, no ArUco tags)
 
@@ -190,8 +196,7 @@ the HUD of a running `main` with the robot connected. A background thread teleop
 After that the **table frame is the base frame** in xy (x fwd, y left, mm). `H` is exact for object centroids at
 `plane_z_mm`; taller objects project slightly outward from the camera nadir, lower ones inward (a few mm at most).
 `calibration.mode` in config: `ball` = always the fitted H, `aruco` = tags only, `auto` (default) = fitted H, with the
-4 ArUco tags overriding per frame when all are visible. `detect_objects` uses the mat between the tags as ROI in
-aruco mode and the workspace AABB xy in ball mode.
+4 ArUco tags overriding per frame when all are visible.
 
 **Recalibrate** whenever the overhead camera or the robot base is moved/bumped, the camera resolution changes, or
 the HUD overlay grid / zone outlines stop lining up with the table. Old `calib.json` files without the new keys

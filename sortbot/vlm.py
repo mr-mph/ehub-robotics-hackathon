@@ -1,4 +1,11 @@
-"""VLM planner: one tool call per step via the OpenAI Responses API.
+"""VLM planner: one tool call per step via the OpenAI Responses API. The VLM does the SEEING itself:
+it gets the overhead photo with a cm-labelled grid overlay (plus the wrist photo) and emits
+coordinate-based tools — there is no object detector and no numbered object list anywhere.
+
+UNIT BOUNDARY: everything the VLM sees and emits is table-frame CENTIMETERS (x forward, y left,
+origin at the robot base, table z=0). Internally sortbot works in millimeters (robot, config.yaml,
+calib.json, safety envelope); sortbot.main.Loop converts each Command's *_cm args to mm in exactly
+one place (Loop._args_mm). _state_text's /10 conversions below are the mm->cm half of that boundary.
 
 plan_step(overhead_overlay_png, wrist_png, world, history) -> Command. Images are PNG bytes.
 history = list of dicts {"tool": str, "args": dict, "result": str} of prior steps (last 10 sent).
@@ -11,19 +18,20 @@ import base64
 import json
 import os
 import time
-from typing import Iterable
 
-from sortbot.types import Command, DetectedObject, WorldState, Zone
+from sortbot.types import Command, WorldState
 
 TOOLS: list[dict] = [
-    ("pick", "Pick up object <id> from the numbered object list.", {"id": {"type": "integer"}}),
+    ("pick_at", "Pick up the object whose centre is at table-frame (x, y) in CENTIMETERS. Read the "
+                "position off the labelled grid in the overhead image.",
+     {"x_cm": {"type": "number"}, "y_cm": {"type": "number"}}),
     ("place_in_zone", "Place the held object at the drop point of the named zone.", {"zone": {"type": "string"}}),
-    ("place_at", "Place the held object at a table-frame point (mm).",
-     {"x_mm": {"type": "number"}, "y_mm": {"type": "number"}}),
+    ("place_at", "Place the held object at a table-frame point (cm).",
+     {"x_cm": {"type": "number"}, "y_cm": {"type": "number"}}),
     ("open_gripper", "Low-level recovery: open the gripper.", {}),
     ("close_gripper", "Low-level recovery: close the gripper.", {}),
-    ("move_to", "Low-level recovery: move the end effector to table-frame x,y,z (mm).",
-     {"x": {"type": "number"}, "y": {"type": "number"}, "z": {"type": "number"}}),
+    ("move_to", "Low-level recovery: move the end effector to table-frame x, y, z (cm).",
+     {"x_cm": {"type": "number"}, "y_cm": {"type": "number"}, "z_cm": {"type": "number"}}),
     ("turn_to", "Low-level recovery: rotate the wrist roll to <deg>.", {"deg": {"type": "number"}}),
     ("say", "Speak a short message to the human. Use sparingly (questions, ambiguity, finish).",
      {"text": {"type": "string"}}),
@@ -54,28 +62,37 @@ def estimate_cost_usd(model: str, input_tokens: int, output_tokens: int) -> floa
             return (input_tokens * i + output_tokens * o) / 1e6
     return None
 
-SYSTEM_PROMPT = """You are the planner for a small tabletop robot arm that sorts objects into zones.
-Each step you see an overhead photo with numbered candidate objects (and zone outlines) and a wrist-camera photo,
-plus a text state block. Decide the single best next action and call exactly one tool.
-Policy: sort the items on the table into the zones. Follow the human's GOAL and RULES exactly when given;
-if no task is given, group similar items sensibly (by type, colour, size), one group per zone; if a zone name
-obviously matches an object, use it. Pick only objects that are not already in a sensible zone.
-If holding an object, place it. When everything is sorted, call done.
+SYSTEM_PROMPT = """You are the planner for a small tabletop robot arm that sorts things into zones.
+Each step you see an overhead photo overlaid with a labelled coordinate grid and the zone outlines, a
+wrist-camera photo, and a text state block. YOU do the seeing: look at the photos, decide what is on the
+table and where, and call exactly one tool.
+COORDINATES: everything you see and emit is CENTIMETERS in the table frame — x forward from the robot
+base, y left, z up, table at z=0, origin at the base. Read positions straight off the grid: the overlay
+lines are labelled in cm at both ends (x.. and y..) and the grid spacing is stated in the legend. Aim
+pick_at at the centre of an object. Every coordinate you send is validated against a safety envelope;
+an out-of-reach or unsafe command is not executed and comes back as a FAILED tool result in the history
+— read it and react (adjust the coordinate, or pick something else).
+Policy: sort the items on the table into the zones. Follow the human's GOAL and RULES exactly when
+given; if no task is given, group similar items sensibly (by type, colour, size), one group per zone;
+if a zone name obviously matches an item, use it. Ignore the robot arm itself, shadows, and anything
+already inside a sensible zone. If holding something, place it. When everything is sorted, call done.
 Use say() sparingly: only for genuine ambiguity, a question to the human, or a final summary.
 RULES from the human override everything else and must always be respected.
-Prefer pick / place_in_zone / place_at; use move_to / open_gripper / close_gripper / turn_to only to recover
-from a failure. Never invent object ids not in the list."""
+Prefer pick_at / place_in_zone / place_at; use move_to / open_gripper / close_gripper / turn_to only to
+recover from a failure."""
 
 
 def _state_text(world: WorldState, history: list) -> str:
+    # mm -> cm for everything the VLM reads (the unit boundary; see the module docstring)
     p = world.ee_pose
-    lines = [f"EE pose (table mm): x={p.x:.0f} y={p.y:.0f} z={p.z:.0f} roll={p.roll_deg:.0f}",
-             f"table_z=0  gripper_open={world.gripper_open}  holding={world.holding}",
-             "OBJECTS (id: centroid mm, colour, label):"]
-    lines += [f"  {o.id}: ({o.centroid_mm[0]:.0f}, {o.centroid_mm[1]:.0f}) {o.color_hint}"
-              + (f" {o.label}" if o.label else "") for o in world.objects] or ["  (none detected)"]
-    lines.append("ZONES (name: drop point mm):")
-    lines += [f"  {z.name}: ({z.drop_point_mm[0]:.0f}, {z.drop_point_mm[1]:.0f})" for z in world.zones]
+    lines = [f"EE pose (table cm): x={p.x / 10:.1f} y={p.y / 10:.1f} z={p.z / 10:.1f} roll={p.roll_deg:.0f}deg",
+             f"table z=0  gripper_open={world.gripper_open}  holding={world.holding or 'nothing'}",
+             "ZONES (name: corners cm -> drop point cm):"]
+    for z in world.zones:
+        (x0, y0), (x1, y1) = z.polygon_mm[0], z.polygon_mm[2]
+        d = z.drop_point_mm
+        lines.append(f"  {z.name}: ({x0 / 10:g}, {y0 / 10:g})..({x1 / 10:g}, {y1 / 10:g})"
+                     f" -> drop ({d[0] / 10:g}, {d[1] / 10:g})")
     lines.append("RULES:")
     lines += [f"  - {r}" for r in world.rules] or ["  (none)"]
     lines.append("HISTORY (most recent last):")
@@ -106,7 +123,7 @@ class VLM:
         self.client = client
 
     def plan_step(self, overhead_overlay_png: bytes, wrist_png: bytes, world: WorldState, history: list) -> Command:
-        content = [{"type": "input_text", "text": "Overhead camera (numbered objects, zones):"}, _img(overhead_overlay_png),
+        content = [{"type": "input_text", "text": "Overhead camera (cm grid + zone outlines):"}, _img(overhead_overlay_png),
                    {"type": "input_text", "text": "Wrist camera:"}, _img(wrist_png),
                    {"type": "input_text", "text": _state_text(world, history)}]
         t0 = time.time()
@@ -136,9 +153,7 @@ def _synthetic_png(w: int = 320, h: int = 240) -> bytes:
     import numpy as np
     img = np.full((h, w, 3), 200, np.uint8)
     cv2.rectangle(img, (40, 60), (100, 120), (0, 0, 255), -1)
-    cv2.putText(img, "1", (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 2)
     cv2.rectangle(img, (200, 100), (260, 160), (255, 0, 0), -1)
-    cv2.putText(img, "2", (210, 140), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 2)
     ok, buf = cv2.imencode(".png", img)
     assert ok
     return buf.tobytes()
@@ -147,32 +162,33 @@ def _synthetic_png(w: int = 320, h: int = 240) -> bytes:
 def _demo_world() -> WorldState:
     from sortbot import config
     cfg = config.load()
-    return WorldState(
-        objects=[DetectedObject(1, (250.0, 120.0), (40, 60, 100, 120), 3600, "red", "block"),
-                 DetectedObject(2, (300.0, -50.0), (200, 100, 260, 160), 3600, "blue", "ball")],
-        zones=cfg.zones, ee_pose=cfg.home, rules=["put red things in LEFT"])
+    return WorldState(zones=cfg.zones, ee_pose=cfg.home, rules=["put red things in LEFT"])
 
 
 def _selftest() -> None:
     from sortbot.testing import MockVLM  # test fixture; only reachable from this selftest
 
     world, png = _demo_world(), _synthetic_png()
-    vlm, seq, hist = MockVLM(), [], []
+    vlm = MockVLM(targets_cm=[(25.0, 12.0), (30.0, -5.0)])
+    seq, hist = [], []
     for _ in range(10):
         cmd = vlm.plan_step(png, png, world, hist)
         seq.append(cmd.tool)
         hist.append({"tool": cmd.tool, "args": cmd.args, "result": "ok"})
-        if cmd.tool == "pick":
-            world.holding = cmd.args["id"]
+        if cmd.tool == "pick_at":
+            world.holding = f"object picked at ({cmd.args['x_cm']:.1f}, {cmd.args['y_cm']:.1f}) cm"
         elif cmd.tool == "place_in_zone":
-            world.objects = [o for o in world.objects if o.id != world.holding]
             world.holding = None
         elif cmd.tool == "done":
             break
-    assert seq == ["pick", "place_in_zone", "pick", "place_in_zone", "done"], seq
-    assert all(t["name"] in {"pick", "place_in_zone", "place_at", "open_gripper", "close_gripper",
+    assert seq == ["pick_at", "place_in_zone", "pick_at", "place_in_zone", "done"], seq
+    assert all(t["name"] in {"pick_at", "place_in_zone", "place_at", "open_gripper", "close_gripper",
                              "move_to", "turn_to", "say", "done"} for t in TOOLS)
-    assert "RULES" in _state_text(world, hist) and "put red things" in _state_text(world, hist)
+    assert not any(t["name"] == "pick" for t in TOOLS), "id-based pick must be gone"
+    st = _state_text(world, hist)
+    assert "RULES" in st and "put red things" in st
+    assert "cm" in st and "ZONES" in st and "27.5" in st, st  # zone drops reported in cm
+    assert "object" not in SYSTEM_PROMPT.lower() or "numbered" not in SYSTEM_PROMPT.lower()
     c = estimate_cost_usd("gpt-5", 10_000, 1_000)
     assert c is not None and abs(c - 0.0225) < 1e-9, c
     assert estimate_cost_usd("gpt-5-mini-2025", 1000, 0) == 0.00025

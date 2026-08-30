@@ -16,16 +16,6 @@ class Pose:
 
 
 @dataclass
-class DetectedObject:
-    id: int
-    centroid_mm: tuple[float, float]
-    bbox_px: tuple[int, int, int, int]  # x0, y0, x1, y1 in overhead image
-    area_px: float
-    color_hint: str
-    label: str | None = None
-
-
-@dataclass
 class Zone:
     name: str
     polygon_mm: list[tuple[float, float]]
@@ -43,17 +33,19 @@ class Zone:
 
 @dataclass
 class WorldState:
-    objects: list[DetectedObject] = field(default_factory=list)
+    """Seeing is the VLM's job: no detected-object list here. `holding` is a human-readable description
+    of what the gripper holds (e.g. "object picked at (25.0, 12.0) cm"), or None."""
+
     zones: list[Zone] = field(default_factory=list)
     ee_pose: Pose = field(default_factory=lambda: Pose(0, 0, 0))
     gripper_open: bool = True
-    holding: int | None = None
+    holding: str | None = None
     rules: list[str] = field(default_factory=list)
 
 
 @dataclass
 class Command:
-    tool: str  # pick | place_in_zone | place_at | done | say | move_to | open | close | turn_to
+    tool: str  # pick_at | place_in_zone | place_at | done | say | move_to | open | close | turn_to
     args: dict = field(default_factory=dict)
 
 
@@ -75,5 +67,5 @@ class RobotAPI(Protocol):
     def get_ee_pose(self) -> Pose: ...
     def get_joints_deg(self) -> np.ndarray: ...
     def capture(self, name: str) -> np.ndarray: ...  # 'overhead' | 'wrist' -> RGB HxWx3
-    def pick(self, obj: DetectedObject) -> ExecResult: ...
+    def pick(self, x_mm: float, y_mm: float) -> ExecResult: ...
     def place_at(self, x: float, y: float) -> ExecResult: ...

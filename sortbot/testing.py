@@ -21,7 +21,7 @@ from sortbot import perception
 from sortbot.calibrate import MOTORS, RobotRig
 from sortbot.calibration import _ip, render_mat
 from sortbot.robot import HOME_JOINTS, _KinematicBase
-from sortbot.types import Command, DetectedObject, ExecResult, RobotAPI, WorldState
+from sortbot.types import Command, ExecResult, RobotAPI, WorldState
 
 
 # ---------------------------------------------------------------- robot / vlm doubles
@@ -53,23 +53,36 @@ class MockRobot(_KinematicBase):
 
 
 class MockVLM:
-    """Deterministic: pick lowest id -> place in zones round-robin -> done when no objects remain."""
+    """Deterministic coordinate planner (the app's VLM does its own seeing, so this double works from a
+    script): pick_at each target in turn (cm, like the real tool surface) -> place in zones round-robin ->
+    done when the script is exhausted. Default targets: the SIM_OBJECTS positions, so it 'sees' the
+    default SimScene. A pick_at that fails is retried before advancing."""
 
-    def __init__(self, model: str | None = None):
+    def __init__(self, model: str | None = None, targets_cm: list[tuple[float, float]] | None = None):
         self.model = model or "mock"
+        # mm -> cm: the doubles speak the same cm tool surface as the real VLM (see sortbot.vlm)
+        self.targets = list(targets_cm) if targets_cm is not None \
+            else [(x / 10.0, y / 10.0) for (x, y), _ in SIM_OBJECTS]
+        self._i = 0
         self._zone_i = 0
         self.last_latency_ms: int | None = None
         self.last_usage = self.last_cost_usd = None
 
+    def reset(self) -> None:
+        """Fresh script for a fresh run (Session.start resets every device that supports it)."""
+        self._i = self._zone_i = 0
+
     def plan_step(self, overhead_overlay_png: bytes, wrist_png: bytes, world: WorldState, history: list) -> Command:
         if world.holding is not None:
             if not world.zones:
-                return Command("place_at", {"x_mm": 275.0, "y_mm": 0.0})
+                return Command("place_at", {"x_cm": 27.5, "y_cm": 0.0})
             z = world.zones[self._zone_i % len(world.zones)]
             self._zone_i += 1
             return Command("place_in_zone", {"zone": z.name})
-        if world.objects:
-            return Command("pick", {"id": min(o.id for o in world.objects)})
+        if self._i < len(self.targets):
+            x, y = self.targets[self._i]
+            self._i += 1
+            return Command("pick_at", {"x_cm": float(x), "y_cm": float(y)})
         return Command("done", {"summary": f"sorted {self._zone_i} objects"})
 
 
@@ -118,11 +131,12 @@ class SimScene:
             cv2.rectangle(img, (cx - 22, cy - 15), (cx + 22, cy + 15), col, -1)
         return img
 
-    def pick(self, obj: DetectedObject) -> ExecResult:
-        r = self.robot.pick(obj)
+    def pick(self, x_mm: float, y_mm: float) -> ExecResult:
+        r = self.robot.pick(x_mm, y_mm)
         if r.ok and self.blobs:
-            i = min(range(len(self.blobs)), key=lambda i: np.hypot(*(np.array(self.blobs[i][0]) - obj.centroid_mm)))
-            if np.hypot(*(np.array(self.blobs[i][0]) - obj.centroid_mm)) < 30:
+            at = np.array([x_mm, y_mm], float)
+            i = min(range(len(self.blobs)), key=lambda i: np.hypot(*(np.array(self.blobs[i][0]) - at)))
+            if np.hypot(*(np.array(self.blobs[i][0]) - at)) < 30:
                 self.held = self.blobs.pop(i)
         return r
 

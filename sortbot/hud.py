@@ -129,10 +129,6 @@ body.showhelp .help{display:block}
 .guide li.cur::before{background:var(--acc);border-color:var(--acc);color:#04120c;content:counter(g)}
 .guide li.done{color:var(--acc)}
 .guide li.done::before{content:'\2713';background:transparent;border-color:var(--acc);color:var(--acc)}
-.prow{display:flex;align-items:center;gap:10px;margin:8px 0}
-.prow .lbl2{color:var(--tx1);font-size:11px;text-transform:uppercase;width:64px;flex:none}
-.prow input[type=range]{flex:1;accent-color:var(--acc);min-height:28px;padding:0;border:0;background:none;width:auto}
-.prow .pv{font:12px var(--mono);color:var(--tx);width:52px;text-align:right;flex:none}
 .zrow{display:flex;align-items:center;gap:8px;margin:6px 0;font:12px var(--mono);color:var(--tx1);flex-wrap:wrap}
 .zrow .zn{color:var(--amber);width:82px;font-weight:600}
 .zrow .btn.arm{background:#4d3607;border-color:var(--amber);color:#ffe2ac}
@@ -284,16 +280,6 @@ body.showhelp .help{display:block}
    <div class="note" id="mnotes"></div>
    <div class="rowmsg" id="msg-models"></div>
   </div>
-  <div class="sec" id="sec-det" hidden>
-   <h3>Object detector</h3>
-   <div id="prows"></div>
-   <div class="help" data-h="set_detector_params"></div>
-   <div class="btnrow"><button id="b-redetect" class="btn" data-h-title="redetect">Redetect now</button>
-    <button id="b-mask" class="btn" data-h-title="toggle_mask">Show mask</button></div>
-   <div class="note">A pixel is foreground if V &gt; v_min or S &gt; s_min; blobs kept if area is between area_min and area_max.
-   Changes apply live and are saved to config.yaml.</div>
-   <div class="rowmsg" id="msg-det"></div>
-  </div>
   <div class="sec" id="sec-zones" hidden>
    <h3>Zone drop points</h3>
    <div id="zrows"><span class="empty">no zones</span></div>
@@ -355,7 +341,7 @@ const CLAIMED=new Set(['connect_robot','connect_cameras','connect_vlm','start','
  'home','open_gripper','close_gripper','jog','goto','torque_off','torque_on',
  'say_to_bot','say_to_robot','transcribe','speak','mic_on','mic_off',
  'add_rule','delete_rule','move_rule','clear_hints','get_models','set_model',
- 'set_detector_params','redetect','toggle_mask','set_zone_drop','px_to_mm','log_clear',
+ 'set_zone_drop','px_to_mm','log_clear',
  'calib_start','calib_touch','calib_capture','calib_undo','calib_finish','calib_cancel','calib_sample']);
 const DEVICES=[
  ['robot','connect_robot','Robot','SO-101 follower arm. Torque comes on when connected; the arm moves only on your actions.'],
@@ -369,11 +355,11 @@ const GUIDE=[
  'Rest the fingertip on the table and press <b>Touch table</b> (records the table height).',
  'Press <b>Finish</b> to save. <b>Cancel</b> writes nothing.'];
 let ACT={},actsig='',S={},curTab='setup';
-let ring=null,frameW=640,frameH=480,haveWH=false,dropZone=null,dragging=null,zoneSig='',rulesSig='',logSig='',tickerSig='';
+let ring=null,frameW=640,frameH=480,haveWH=false,dropZone=null,zoneSig='',rulesSig='',logSig='',tickerSig='';
 // Frame size for px scaling: prefer the live size from /state (haveWH) — an <img> on an mjpeg stream can keep
 // a stale naturalWidth from before a server restart at another resolution, mis-scaling clicks and the ring.
 function frameWH(im){return haveWH?[frameW,frameH]:[im.naturalWidth||frameW,im.naturalHeight||frameH];}
-let lastSay='',lastCallSig='',lastErrSig='',lastPickColor='',targetLocked=false,ckDismissed=false;
+let lastSay='',lastCallSig='',lastErrSig='',targetLocked=false,ckDismissed=false;
 function toast(msg,kind){const t=document.createElement('div');t.className='toast'+(kind?' '+kind:'');
  t.textContent=msg;$('toasts').appendChild(t);
  while($('toasts').children.length>4)$('toasts').firstChild.remove();
@@ -434,12 +420,6 @@ function buildExtras(){TABS.forEach(t=>{$('extra-'+t).innerHTML='';});
 function buildRaw(){const all=Object.values(ACT);
  $('rawlist').innerHTML=all.length?all.map(a=>genericRow(a,true)).join(''):'<span class="empty">no actions registered</span>';
  wireRows($('rawlist'));}
-function buildSliders(){const SL=[['v_min',0,255,1],['s_min',0,255,1],['area_min',0,5000,10],['area_max',1000,120000,500]];
- $('prows').innerHTML=SL.map(([n,lo,hi,st])=>'<div class="prow"><span class="lbl2">'+n+
-  '</span><input type="range" data-s="'+n+'" min="'+lo+'" max="'+hi+'" step="'+st+'"><span class="pv" data-v="'+n+'">-</span></div>').join('');
- $('prows').querySelectorAll('input[type=range]').forEach(sl=>{
-  sl.oninput=()=>{dragging=sl.dataset.s;$('prows').querySelector('[data-v="'+sl.dataset.s+'"]').textContent=sl.value;};
-  sl.onchange=async()=>{dragging=null;await act('set_detector_params',{[sl.dataset.s]:parseFloat(sl.value)},null);act('redetect');};});}
 function applyHelp(){document.querySelectorAll('[data-h]').forEach(el=>{el.textContent=helpOf(el.dataset.h);});
  document.querySelectorAll('[data-h-title]').forEach(el=>{const h=helpOf(el.dataset.hTitle);if(h)el.title=h;});}
 function renderAll(){
@@ -451,14 +431,12 @@ function renderAll(){
  $('sec-voice').hidden=!has('say_to_bot');
  $('sec-rules').hidden=!has('add_rule');
  $('sec-models').hidden=!has('get_models');
- $('sec-det').hidden=!has('set_detector_params');
  $('sec-zones').hidden=!has('set_zone_drop');
  $('sec-robot').hidden=!has('home');
  $('sec-log').hidden=!has('log_clear');
  $('mictoggle').hidden=!has('mic_on');
  if(has('connect_robot'))buildConn();
  if(has('calib_start'))buildCalib();
- if(has('set_detector_params'))buildSliders();
  if(has('home'))buildJog();
  buildExtras();buildRaw();applyHelp();
  if(curTab==='tune'&&has('get_models')&&!window._models)loadModels();}
@@ -503,8 +481,6 @@ $('rulebtn').onclick=async()=>{const t=$('newrule').value.trim();
  if(!t){showMsg($('rulebtn'),{ok:false,message:'type a rule first'});return;}
  rulesSig='';const j=await act('add_rule',{text:t},$('rulebtn'));if(j.ok)$('newrule').value='';};
 $('b-clearhints').onclick=()=>act('clear_hints',{},$('b-clearhints'));
-$('b-redetect').onclick=()=>act('redetect',{},$('b-redetect'));
-$('b-mask').onclick=()=>act('toggle_mask',{},$('b-mask'));
 $('b-home').onclick=()=>act('home',{},$('b-home'));
 $('b-open').onclick=()=>act('open_gripper',{},$('b-open'));
 $('b-close').onclick=()=>act('close_gripper',{},$('b-close'));
@@ -588,7 +564,7 @@ function bannerInfo(){
  if(!r)return[cal?'Calibration HUD - follow the steps in Setup.':'Waiting for the server...','','setup'];
  const ph=r.phase,c=r.connected||{};
  if(ph==='running'){let h='';
-  if(rb&&rb.holding!=null)h=lastPickColor?(' - holding the '+lastPickColor+' object'):(' - holding #'+rb.holding);
+  if(rb&&rb.holding)h=' - holding: '+rb.holding;
   return['Sorting - step '+r.step+'/'+r.max_steps+h+(S.status?(' - '+S.status):''),'ok','operate'];}
  if(ph==='paused')return['Paused at step '+r.step+' - Resume (key: p) to continue.','amber','operate'];
  if(ph==='error')return['Error - '+(r.last_error||'see the Debug log'),'err','debug'];
@@ -635,11 +611,7 @@ function renderRules(rl){if(!rl)return;const sig=JSON.stringify(rl);if(sig===rul
  $('rlist').querySelectorAll('a[data-del]').forEach(a=>a.onclick=()=>{rulesSig='';act('delete_rule',{i:+a.dataset.del});});
  const hints=(rl&&rl.hints)||[];
  $('hints').textContent=hints.length?hints.join(' | '):'none';}
-function renderPerc(pc){if(!pc||!pc.params)return;
- const SLN=['v_min','s_min','area_min','area_max'];
- for(const n of SLN){const sl=$('prows').querySelector('input[data-s="'+n+'"]');
-  if(sl&&dragging!==n){sl.value=pc.params[n];const pv=$('prows').querySelector('[data-v="'+n+'"]');if(pv)pv.textContent=pc.params[n];}}
- const mb=$('b-mask');if(mb)mb.textContent=pc.mask?'Show overlay':'Show mask';
+function renderPerc(pc){if(!pc)return;
  const sig=JSON.stringify([pc.zones,dropZone]);if(sig===zoneSig)return;zoneSig=sig;
  $('zrows').innerHTML=(pc.zones||[]).map(z=>'<div class="zrow"><span class="zn">'+esc(z.name)+'</span><span>drop ('+z.drop[0]+', '+z.drop[1]+')</span>'+
   '<button class="btn sm'+(dropZone===z.name?' arm':'')+'" data-z="'+esc(z.name)+'">'+(dropZone===z.name?'click the image...':'set drop')+'</button></div>').join('')
@@ -738,9 +710,7 @@ async function tick(){let s;
  const lc=s.last_call;
  const lcs=lc?JSON.stringify(lc):'';
  if(lcs&&lcs!==lastCallSig){lastCallSig=lcs;
-  if(lc.tool==='pick'&&lc.args&&lc.args.color)lastPickColor=lc.args.color;
   if(lc.result&&/^FAILED/.test(lc.result))toast(lc.tool+': '+lc.result,'err');}
- if(rb&&rb.holding==null)lastPickColor='';
  if(r&&r.last_error&&r.last_error!==lastErrSig){lastErrSig=r.last_error;toast(r.last_error,'err');}
  // demo view
  if(!$('demo').hidden){

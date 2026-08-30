@@ -47,11 +47,14 @@ def test_e2e(with_hud: bool = True) -> None:
     for xy, _ in scene.blobs:  # every blob now sits inside some zone
         assert any(z.contains(*xy) for z in cfg.zones), xy
     assert json.loads(rules_path.read_text()) == ["put white things on the left"]
-    assert [h["tool"] for h in loop.history].count("pick") == n_objects
-    # a rejected command is fed back as a history entry, not raised
-    world = m.WorldState(objects=[], zones=cfg.zones)
-    assert loop.validate(m.Command("pick", {"id": 99}), world)
-    assert loop.validate(m.Command("place_at", {"x_mm": 900, "y_mm": 0}), world)
+    assert [h["tool"] for h in loop.history].count("pick_at") == n_objects
+    # a rejected command is fed back as a history entry, not raised; coordinate tools are validated
+    # against the workspace AABB (cm on the VLM surface) and zone names, not an object-id list
+    world = m.WorldState(zones=cfg.zones)
+    assert "workspace" in loop.validate(m.Command("pick_at", {"x_cm": 90.0, "y_cm": 0.0}), world)
+    assert "cm" in loop.validate(m.Command("pick_at", {"x_cm": 5.0, "y_cm": 0.0}), world)
+    assert loop.validate(m.Command("place_at", {"x_cm": 27.5, "y_cm": 0.0}), world)  # not holding anything
+    assert loop.validate(m.Command("bogus", {}), world)
     print(f"e2e OK: {result}, placed {loop.placed}/{n_objects}, hud={'on' if hud else 'off'}")
 
 

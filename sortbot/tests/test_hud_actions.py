@@ -128,41 +128,23 @@ def test_hud_actions() -> None:
         assert post("torque_on")["ok"] and get("/state")["robot"]["torque"] is True
         assert post("home")["ok"]
 
-        # --- PERCEPTION group: live detector params, redetect, mask view, zone drop points ---
+        # --- PERCEPTION group is overlay-only now (the VLM does the seeing): zone drops + px->mm.
+        # No detector actions may exist at all.
         acts = {a["name"]: a for a in get("/actions")}
-        for name, group in (("set_detector_params", "perception"), ("redetect", "perception"),
-                            ("toggle_mask", "perception"), ("set_zone_drop", "perception"),
-                            ("px_to_mm", "perception"), ("log_clear", "log")):
+        for name, group in (("set_zone_drop", "perception"), ("px_to_mm", "perception"), ("log_clear", "log")):
             assert name in acts and acts[name]["group"] == group, (name, acts.get(name))
             assert acts[name]["help"], f"{name} has no help text in GET /actions"
+        for gone in ("set_detector_params", "redetect", "toggle_mask", "pick"):
+            assert gone not in acts, f"detector-era action {gone!r} still registered"
         p0 = get("/state")["perception"]
-        assert p0["params"] == {"v_min": 70, "s_min": 90, "area_min": 300, "area_max": 60000}, p0
-        assert p0["mask"] is False and {z["name"] for z in p0["zones"]} == {"LEFT", "MIDDLE", "RIGHT"}, p0
-        _wait(lambda: post("redetect")["ok"], what="first preview frame for redetect")
-        r = post("redetect")
-        assert r["ok"] and r["data"]["n"] == 4, r  # the 4 SimScene blobs
-        o = r["data"]["objects"][0]
-        r = post("px_to_mm", {"u": o["px"][0], "v": o["px"][1]})  # page click -> mm roundtrip
-        assert r["ok"] and abs(r["data"]["x"] - o["x_mm"]) < 2 and abs(r["data"]["y"] - o["y_mm"]) < 2, (r, o)
-        # live param change filters everything out, then back
-        assert post("set_detector_params", {"area_min": 50000})["ok"]
-        assert get("/state")["perception"]["params"]["area_min"] == 50000
-        assert post("redetect")["data"]["n"] == 0
-        assert post("set_detector_params", {"area_min": 300, "v_min": 80})["ok"]
-        assert post("redetect")["data"]["n"] == 4
-        assert not post("set_detector_params", {"v_min": 999})["ok"]
-        assert not post("set_detector_params", {"area_min": 90000})["ok"]  # would be >= area_max
-        assert not post("set_detector_params", {})["ok"]
-        import yaml as _y
-        ytext = cfg_copy.read_text()
-        y = _y.safe_load(ytext)
-        assert y["perception"] == {"v_min": 80, "s_min": 90, "area_min": 300, "area_max": 60000}, y["perception"]
-        assert "# ClassicalDetector thresholds" in ytext, "config.yaml comments were clobbered"
-        assert post("set_detector_params", {"v_min": 70})["ok"]  # back to default
-        # mask view toggles what /overhead.mjpg streams
-        assert post("toggle_mask")["ok"] and get("/state")["perception"]["mask"] is True
-        assert post("toggle_mask")["ok"] and get("/state")["perception"]["mask"] is False
+        assert "params" not in p0 and "mask" not in p0, p0  # detector state keys are gone
+        assert {z["name"] for z in p0["zones"]} == {"LEFT", "MIDDLE", "RIGHT"}, p0
+        # px -> mm conversion (drives the click-to-set-drop mode); needs the first preview frame
+        _wait(lambda: post("px_to_mm", {"u": 320, "v": 240})["ok"], what="first preview frame for px_to_mm")
+        r = post("px_to_mm", {"u": 320, "v": 240})
+        assert r["ok"] and 120 <= r["data"]["x"] <= 420 and -220 <= r["data"]["y"] <= 220, r
         # zone drop points: moved live + persisted (rect untouched)
+        import yaml as _y
         r = post("set_zone_drop", {"name": "MIDDLE", "x": 280, "y": 5})
         assert r["ok"], r
         z = next(z for z in get("/state")["perception"]["zones"] if z["name"] == "MIDDLE")
@@ -373,8 +355,9 @@ def test_hud_actions() -> None:
         assert lg[0]["i"] > lg[-1]["i"], "log not newest-first"
         tools = [e["tool"] for e in lg]
         assert "connect_robot" in tools and "voice" in tools and "set_zone_drop" in tools, tools
-        picks = [e for e in lg if e["tool"] == "pick"]
+        picks = [e for e in lg if e["tool"] == "pick_at"]
         assert picks and any(e["thumb_b64"] for e in picks), "no pick decisions with overlay thumbnails"
+        assert all("x_cm" in e["args"] for e in picks), picks  # the VLM surface is coordinates in cm
         assert any(e["thumb_b64"] and e["thumb_b64"].startswith("/9j/") for e in lg), "thumb is not a jpeg"
         assert any(e["tool"] == "torque_off" and e["ok"] is False for e in lg), "E-STOP not logged as red"
         assert any(e["tool"] == "place_in_zone" and e["ok"] for e in lg), tools
@@ -413,7 +396,7 @@ def test_hud_actions() -> None:
         if session.hud is not None:
             session.hud.stop()
     print("hud actions OK: RUN/ROBOT/PERCEPTION/VOICE/RULES/MODELS/LOG groups, E-STOP, restart, calibration, "
-          "push-to-talk transcribe, model hot-swap, live detector tuning + zone drops + /log, "
+          "push-to-talk transcribe, model hot-swap, zone drops + px->mm + /log, "
           "help on every action, mic toggle, page/action cross-check all over HTTP")
 
 

@@ -194,6 +194,8 @@ class _KinematicBase:
         q = self._read_joints()
         n = max(1, int(math.ceil(np.abs(q_target - q).max() / MOVE_STEP_DEG)))
         for i in range(1, n + 1):
+            if not self.torque:
+                raise SafetyError("torque cut mid-motion (E-STOP)")
             self._write_joints(q + (q_target - q) * (i / n))
             self._sleep(1.0 / MOVE_RATE_HZ)
         self._settle(q_target)
@@ -208,6 +210,9 @@ class _KinematicBase:
                 return
             if time.monotonic() > t_end:
                 log.warning("settle timeout: joints off by %s deg", np.round(err, 1))
+                return
+            if not self.torque:
+                log.warning("settle abandoned: torque cut (E-STOP)")
                 return
             self._write_joints(q_target)
             self._sleep(1.0 / MOVE_RATE_HZ)

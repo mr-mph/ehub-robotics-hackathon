@@ -266,15 +266,18 @@ class ArucoFakeRig:
 # ---------------------------------------------------------------- Session injection seam
 
 
-def session_factories() -> dict:
+def session_factories(make_robot=None) -> dict:
     """Factories dict for main.Session(factories=...) / main.serve(args, factories=...): a MockRobot-backed
     SimScene serves as both the robot and (via SceneCams) the cameras, MockVLM plans, the homography is the
     scene's fixed synthetic H, and the calibration controller is a FakeRig/VirtualLeader teleop session that
-    writes to a temp file (never the real calib.json). Connect the robot before the cameras."""
+    writes to a temp file (never the real calib.json). Connect the robot before the cameras.
+    make_robot: optional cfg -> robot override for the wrapped base robot (default MockRobot; the bus-lock
+    regression test injects a robot whose bus methods detect concurrent access)."""
     box: dict = {}
 
     def robot(s):
-        box["scene"] = SimScene(MockRobot(s.cfg, realtime=False), s.cfg)
+        base = make_robot(s.cfg) if make_robot is not None else MockRobot(s.cfg, realtime=False)
+        box["scene"] = SimScene(base, s.cfg)
         return box["scene"]
 
     def cams(s):

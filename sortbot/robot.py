@@ -42,6 +42,8 @@ XY_SUBSTEP_MM = 40.0  # cartesian waypoint spacing for the translate segment
 # pan, lift, elbow, wrist_flex: from the URDF (+/-110, +/-100, +/-96.8, +/-95); the motor calibration ranges agree
 JOINT_LIMITS_DEG = np.array([[-110, 110], [-100, 100], [-96.8, 96.8], [-95, 95]], float)
 SETTLE_TOL_DEG, SETTLE_TIMEOUT_S = 1.5, 1.5
+SETTLE_STEP_DEG = MOVE_STEP_DEG * 2   # settle re-sends are step-limited BELOW lerobot's clamp (see _settle)
+SETTLE_STALL_TICKS = 10               # give up early when the error stops improving (gravity-loaded joints)
 TILT_W = 3.0  # mm of cost per radian of gripper tilt (position dominates)
 HOME_JOINTS = np.array([0.0, -30.0, 60.0, 60.0, 0.0, GRIPPER_OPEN])
 
@@ -203,19 +205,35 @@ class _KinematicBase:
 
     def _settle(self, q_target: np.ndarray) -> None:
         """Re-send the goal until the motors reach it (the stream can outrun max_relative_target clipping).
-        The gripper is excluded from the tolerance: closing on an object legitimately stalls short."""
+        Each re-send is itself step-limited toward the target (SETTLE_STEP_DEG < lerobot's
+        max_relative_target), so lerobot never has to clamp -- re-sending the full q_target made it log
+        'Relative goal position magnitude had to be clamped to be safe' on every tick while it walked the
+        gap in tiny clipped steps. Also exits early once the error stops improving: a gravity-loaded joint
+        can stall a couple of degrees short and would otherwise spin until the timeout. The gripper is
+        excluded from the tolerance: closing on an object legitimately stalls short."""
         t_end = time.monotonic() + SETTLE_TIMEOUT_S
+        best, stall = float("inf"), 0
         while True:
-            err = np.abs(self._read_joints() - q_target)
-            if err[:5].max() < SETTLE_TOL_DEG:
+            q = self._read_joints()
+            err = np.abs(q - q_target)
+            e = float(err[:5].max())
+            if e < SETTLE_TOL_DEG:
                 return
-            if time.monotonic() > t_end:
-                log.warning("settle timeout: joints off by %s deg", np.round(err, 1))
+            if e < best - 0.05:
+                best, stall = e, 0
+            else:
+                stall += 1
+            timed_out = time.monotonic() > t_end
+            if timed_out or stall >= SETTLE_STALL_TICKS:
+                # close-enough residuals (load/friction) are routine -> INFO; big gaps stay a WARNING
+                log.log(logging.INFO if e < 3.0 else logging.WARNING,
+                        "settle stopped (%s): joints off by %s deg",
+                        "timeout" if timed_out else "no further progress", np.round(err, 1))
                 return
             if not self.torque:
                 log.warning("settle abandoned: torque cut (E-STOP)")
                 return
-            self._write_joints(q_target)
+            self._write_joints(q + np.clip(q_target - q, -SETTLE_STEP_DEG, SETTLE_STEP_DEG))
             self._sleep(1.0 / MOVE_RATE_HZ)
 
     def _plan(self, waypoints: list[tuple[float, float, float]]) -> list[np.ndarray]:
@@ -338,19 +356,31 @@ class SO101Robot(_KinematicBase):
         cal_dir = self.cfg.robot_calibration_dir
         if cal_dir is None or not (cal_dir / f"{self.cfg.robot_id}.json").exists():
             raise FileNotFoundError(f"motor calibration {cal_dir}/{self.cfg.robot_id}.json missing (robot.calibration_dir)")
+        self._with_cameras = with_cameras
         self.robot = SO101Follower(SO101FollowerConfig(
             port=self.cfg.robot_port, id=self.cfg.robot_id, cameras=cams, calibration_dir=cal_dir,
-            max_relative_target=MOVE_STEP_DEG * 3))
+            # generous clamp: a last-resort safety net for big jumps only. Our own interpolation
+            # (MOVE_STEP_DEG) and settle re-sends (SETTLE_STEP_DEG) stay well below it, so lerobot
+            # never clamps (and never spams its 'had to be clamped' warning) in normal operation.
+            max_relative_target=MOVE_STEP_DEG * 5))
         self.robot.connect()
 
     def _read_joints(self) -> np.ndarray:
-        obs = self.robot.get_observation()
-        return np.array([float(obs[f"{m}.pos"]) for m in MOTORS])
+        # Motor bus ONLY -- get_observation() would also grab a frame from every attached camera,
+        # which is wasted work at 50 Hz and made joint reads hold the bus far longer than needed.
+        obs = self.robot.bus.sync_read("Present_Position", num_retry=self.robot.config.num_read_retries)
+        return np.array([float(obs[m]) for m in MOTORS])
 
     def _write_joints(self, q: np.ndarray) -> None:
         self.robot.send_action({f"{m}.pos": float(v) for m, v in zip(MOTORS, q)})
 
     def capture(self, name: str) -> np.ndarray:
+        if not self._with_cameras:
+            # The Session owns the cameras separately (robot.Cameras); a capture() here would sync-read
+            # the motor bus too, becoming a hidden second bus toucher. Fail loudly instead of silently
+            # doing a full get_observation().
+            raise RuntimeError("SO101Robot was connected with_cameras=False: frames come from robot.Cameras "
+                               "(the Session's cams), not through the follower")
         return self.robot.get_observation()[name]
 
     def _set_torque(self, on: bool) -> None:
@@ -445,8 +475,11 @@ def _selftest() -> None:
     assert r.torque_on().ok and r.torque
     assert not r.move_to(400, -200, 60).ok  # > max_step_mm from home
     assert r.move_to(275, 0, 60).ok
-    res = r.move_to(420, 0, 60)  # inside AABB but kinematically unreachable -> IK sanity rejects
-    assert not res.ok and "IK sanity" in res.message, res
+    try:  # far beyond the arm's reach -> the FK(IK) sanity check must reject (ik_table has no AABB gate)
+        r.ik_table(r._read_joints(), 600.0, 0.0, 60.0, 0.0)
+        raise AssertionError("IK sanity accepted an unreachable point")
+    except (SafetyError, _robot.SafetyError) as e:
+        assert "IK sanity" in str(e), e
     assert isinstance(r.capture("overhead"), np.ndarray) and r.capture("wrist").shape == (480, 640, 3)
     print("robot selftest OK")
 

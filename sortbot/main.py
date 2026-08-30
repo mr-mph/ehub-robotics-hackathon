@@ -11,6 +11,17 @@ runs immediately when idle, else at the next step boundary (loop pauses).
 
 Tests inject doubles through Session(..., factories=...) (see sortbot/testing.py); no mock is reachable
 from this CLI or the page.
+
+THREADING INVARIANT -- the Feetech serial bus: EXACTLY ONE THREAD MAY TOUCH THE MOTOR BUS AT A TIME.
+Every bus access in the app goes through Session.robot_lock (shared by the Loop thread, the HUD /state
+poller, the HUD ROBOT actions and the calibration teleop thread); any component that cannot get the lock
+serves cached data instead of reading (see Session._robot_state). The Loop never reads the bus just to
+draw the HUD: it caches the pose from its last locked robot call and hands the cached value to hud_update.
+The preview thread never touches the robot at all (cameras only -- they are opened directly by the Session,
+not through the follower). The one deliberate exception is torque_off (E-STOP), which jumps the queue if
+the lock cannot be acquired within 1 s. Set SORTBOT_BUS_ASSERT=1 to wrap the connected robot in a proxy
+that raises on any bus-touching call made without the lock held (the test suite runs with it on;
+SORTBOT_BUS_ASSERT=warn logs loudly instead of raising).
 """
 from __future__ import annotations
 
@@ -29,7 +40,7 @@ import numpy as np
 
 from sortbot import config as cfgmod
 from sortbot import perception
-from sortbot.types import Command, DetectedObject, ExecResult, RobotAPI, WorldState
+from sortbot.types import Command, DetectedObject, ExecResult, Pose, RobotAPI, WorldState
 from sortbot.models import PROVIDERS, ModelRegistry, yaml_set
 from sortbot.vlm import VLM
 from sortbot.voice import RulesStore, VoiceIO, classify
@@ -177,6 +188,21 @@ class Loop:
         self.view = None        # optional callable(overlay, raw) -> frame shown on /overhead.mjpg (mask view)
         self._overlay: np.ndarray | None = None  # overlay at decision time (log thumbnails)
         self._t0: float | None = None
+        self._pose_cache: Pose | None = None  # last pose read under the bus lock; hud_update NEVER reads the bus
+
+    # ---- bus access (see the module THREADING INVARIANT) ----
+    def _read_pose(self) -> Pose:
+        """One bus read under the shared lock; refreshes the cached pose hud_update serves."""
+        with self.lock:
+            self._pose_cache = self.robot.get_ee_pose()
+        return self._pose_cache
+
+    def _refresh_pose_locked(self) -> None:
+        """Caller must hold self.lock. Best-effort: a cache refresh must never mask the real error."""
+        try:
+            self._pose_cache = self.robot.get_ee_pose()
+        except Exception as e:  # noqa: BLE001
+            log.debug("pose cache refresh: %s", e)
 
     # ---- voice ----
     def drain_voice(self) -> bool:
@@ -193,12 +219,21 @@ class Loop:
                 # only short bare commands act immediately; "drop the red one in LEFT" is a hint for the VLM
                 bare = len(it.text.split()) <= 2
                 if bare and w in ("open", "release", "drop", "let"):
-                    self.record("open", {}, self.robot.open_gripper())
+                    with self.lock:  # every bus access goes through the shared lock (module invariant)
+                        r = self.robot.open_gripper()
+                        self._refresh_pose_locked()
+                    self.record("open", {}, r)
                     self.holding = self.holding_obj = None
                 elif bare and w == "close":
-                    self.record("close", {}, self.robot.close_gripper())
+                    with self.lock:
+                        r = self.robot.close_gripper()
+                        self._refresh_pose_locked()
+                    self.record("close", {}, r)
                 elif bare and w in ("home", "retract", "go"):
-                    self.record("home", {}, self.robot.home())
+                    with self.lock:
+                        r = self.robot.home()
+                        self._refresh_pose_locked()
+                    self.record("home", {}, r)
                 else:
                     self.hints.append(f"(human) {it.text}")
             else:
@@ -323,6 +358,7 @@ class Loop:
             self._maybe_calibrate()
             with self.lock:
                 hr = self.robot.home()
+                self._refresh_pose_locked()
             if not hr.ok:  # routine homing is not worth a history slot; failures are
                 self.record("home", {}, hr)
             if not self.drain_voice():  # before capture so voice actions cannot stale the frame
@@ -343,7 +379,7 @@ class Loop:
             if self.holding_obj is not None:
                 o = self.holding_obj
                 rules = rules + [f"holding: the {o.color_hint} object picked from ({o.centroid_mm[0]:.0f},{o.centroid_mm[1]:.0f}); object ids below are renumbered"]
-            world = WorldState(objects, self.cfg.zones, self.robot.get_ee_pose(), self.robot.gripper_open, self.holding, rules)
+            world = WorldState(objects, self.cfg.zones, self._read_pose(), self.robot.gripper_open, self.holding, rules)
             overlay = perception.render_overlay(overhead, H, objects, self.cfg.zones, world.ee_pose, rules)
             self._overlay = overlay
             self.hud_update(overlay, wrist, step, t0, "planning")
@@ -362,7 +398,10 @@ class Loop:
                 continue
             try:
                 with self.lock:
-                    res = self.execute(cmd, world)
+                    try:
+                        res = self.execute(cmd, world)
+                    finally:
+                        self._refresh_pose_locked()
             except SafetyError as e:
                 res = ExecResult(False, f"safety: {e}")
             args = dict(cmd.args)
@@ -382,10 +421,54 @@ class Loop:
             return
         if self.view is not None:
             overlay = self.view(overlay, self.last_overhead)
+        # cached pose only: hud_update must NEVER read the bus (it runs outside the locked motion sections
+        # and would race the /state poller's locked read -> feetech "Port is in use!" / serial garbage)
         self.hud.update(overlay, wrist, dict(
-            step=step, status=status, ee_pose=self.robot.get_ee_pose(), holding=self.holding,
+            step=step, status=status, ee_pose=self._pose_cache, holding=self.holding,
             gripper_open=self.robot.gripper_open, last_call=self.history[-1] if self.history else None,
             say=self.last_say, rules=self.rules.list() + self.hints, latency_ms=int((time.time() - t0) * 1000)))
+
+
+class BusAssertRobot:
+    """Debug proxy (env SORTBOT_BUS_ASSERT): asserts the shared bus lock is held on every bus-touching
+    RobotAPI call, so a future unlocked bus reader fails loudly instead of intermittently corrupting the
+    Feetech serial port. SORTBOT_BUS_ASSERT=warn logs an error and continues; any other truthy value raises.
+    torque_off/_set_torque are deliberately unguarded: the E-STOP is allowed to jump the lock queue."""
+
+    BUS_METHODS = frozenset({"home", "open_gripper", "close_gripper", "move_to", "turn_to",
+                             "get_ee_pose", "get_joints_deg", "pick", "place_at", "torque_on"})
+
+    def __init__(self, robot, lock, strict: bool = True):
+        object.__setattr__(self, "_robot", robot)
+        object.__setattr__(self, "_lock", lock)
+        object.__setattr__(self, "_strict", strict)
+
+    def __getattr__(self, name):
+        attr = getattr(self._robot, name)
+        if name in self.BUS_METHODS and callable(attr):
+            lock, strict = self._lock, self._strict
+
+            def guarded(*a, **kw):
+                if not lock._is_owned():  # noqa: SLF001 - RLock owner check, CPython guarantees it
+                    msg = (f"BUS LOCK VIOLATION: {name}() called without holding the robot bus lock "
+                           f"(thread {threading.current_thread().name}); see the sortbot.main invariant")
+                    log.error(msg)
+                    if strict:
+                        raise AssertionError(msg)
+                return attr(*a, **kw)
+
+            return guarded
+        return attr
+
+    def __setattr__(self, name, value):  # forward e.g. robot.torque / robot.table_T_base
+        setattr(self._robot, name, value)
+
+
+def _maybe_bus_assert(robot, lock):
+    flag = os.environ.get("SORTBOT_BUS_ASSERT", "").strip().lower()
+    if not flag or flag in ("0", "false", "off", "no"):
+        return robot
+    return BusAssertRobot(robot, lock, strict=flag != "warn")
 
 
 # ---- default device factories (the ONLY things the app can connect; tests override via Session(factories=...))
@@ -587,7 +670,10 @@ class Session:
         ok, msg = True, f"{key} disconnected"
         if want:
             try:
-                setattr(self, key, self.factories[key](self))
+                dev = self.factories[key](self)
+                if key == "robot":
+                    dev = _maybe_bus_assert(dev, self.robot_lock)  # SORTBOT_BUS_ASSERT: catch unlocked bus calls
+                setattr(self, key, dev)
                 if key == "robot":
                     self._attach_calib()
                 msg = f"{key} connected"
@@ -602,7 +688,11 @@ class Session:
         dev = getattr(self, key)
         if dev is not None and hasattr(dev, "disconnect"):
             try:
-                dev.disconnect()
+                if key == "robot":  # disconnect touches the bus: don't race the /state poller's locked read
+                    with self.robot_lock:
+                        dev.disconnect()
+                else:
+                    dev.disconnect()
             except Exception as e:  # noqa: BLE001
                 log.warning("%s disconnect: %s", key, e)
         setattr(self, key, None)
@@ -1111,10 +1201,14 @@ class Session:
             self.ctl.stop_ev.set()
         if self.thread is not None:
             self.thread.join(timeout=10)
-        for dev in (self.cams, self.robot):
+        for key, dev in (("cams", self.cams), ("robot", self.robot)):
             if dev is not None and hasattr(dev, "disconnect"):
                 try:
-                    dev.disconnect()
+                    if key == "robot":  # bus toucher: serialize with any straggling /state read
+                        with self.robot_lock:
+                            dev.disconnect()
+                    else:
+                        dev.disconnect()
                 except Exception:  # noqa: BLE001
                     pass
 

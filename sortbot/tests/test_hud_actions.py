@@ -58,6 +58,9 @@ def test_hud_actions() -> None:
     tmp = Path(tempfile.mkdtemp())
     cfg_copy = tmp / "config.yaml"  # set_model persists here, never into the real config.yaml
     shutil.copy(Path(m.__file__).parent / "config.yaml", cfg_copy)
+    # pin the grasp depth: the live workspace.z_trim_mm is the operator's calibration of THEIR table
+    from sortbot.models import yaml_set as _yset
+    _yset(cfg_copy, "workspace", "z_trim_mm", "0")
     args = Namespace(max_steps=40, no_voice=True, hud_port=port,
                      rules_file=str(tmp / "rules.json"), config=str(cfg_copy))
     session = m.serve(args, factories=testing.session_factories())
@@ -397,14 +400,63 @@ def test_hud_actions() -> None:
         for frag in ("MIC LIVE", "mic_on", "mic_off", 'id="checklist"', 'id="demo"', "E-STOP",
                      'id="pip"', 'id="piphide"', 'id="pipshow"', 'id="pipsize"', "sortbot.pip",
                      'data-tab="setup"', 'data-tab="operate"', 'data-tab="tune"', 'data-tab="debug"',
-                     "Not a straight line"):
+                     "Not a straight line",
+                     # the conversation panel, the grasp verdict and the grasp-depth trim control
+                     'id="chatlog"', "Talk to Luna", 'id="graspnote"', 'id="sec-ztrim"', 'id="znudge"',
+                     'id="zgrasp"', "openai_chat", "openai_verify"):
             assert frag in page, f"page missing {frag!r}"
+
+        # --- CONVERSATION: transcript + chat/verify model slots + the grasp verdict in /state ---
+        st = get("/state")
+        assert set(st["chat"]) >= {"transcript", "thinking", "alive", "replies", "model", "directives"}, st["chat"]
+        assert st["chat"]["alive"] is True, "the luna-chat worker must be running"
+        assert set(st["grasp"]) >= {"verify", "max_correction_cm", "max_retries", "min_confidence",
+                                    "last", "z_trim_mm", "grasp_z_cm"}, st["grasp"]
+        assert st["grasp"]["verify"] is True, "grasp.verify must default to true"
+        # (the checks themselves were asserted in the LOG group below/above; whatever verdict is showing
+        # must be an accepted one, since every pick in this test succeeded)
+        assert (st["grasp"]["last"] or {}).get("accepted", True) is True, st["grasp"]
+        assert post("clear_chat")["ok"]
+        session.chat.handle("hey Luna, what are you doing?")
+        # the worker thread may also be draining earlier utterances: assert about OUR exchange only
+        tr = get("/state")["chat"]["transcript"]
+        mine = [e for e in tr if e["text"].startswith("hey Luna")]
+        assert mine and mine[0]["who"] == "you", tr
+        reply = [e for e in tr if e["who"] == "luna" and e["i"] > mine[0]["i"]]
+        assert reply and reply[0]["text"], tr
+        assert post("clear_chat")["ok"] and get("/state")["chat"]["transcript"] == []
+        r = post("set_model", {"provider": "openai_chat", "value": "gpt-4o"})
+        assert r["ok"] and session.cfg.chat_model == "gpt-4o", r
+        assert post("set_model", {"provider": "openai_verify", "value": "gpt-5-mini"})["ok"]
+        assert session.cfg.verify_model == "gpt-5-mini"
+        y = _yaml.safe_load(cfg_copy.read_text())
+        assert y["vlm"]["chat_model"] == "gpt-4o" and y["vlm"]["verify_model"] == "gpt-5-mini", y
+        assert post("get_models")["data"]["current"]["openai_chat"] == "gpt-4o"
+
+        # --- GRASP DEPTH TRIM: live + persisted, bounded, with the large-trim warning ---
+        import sortbot.robot as _rb
+        st0 = get("/state")["grasp"]
+        assert st0["z_trim_mm"] == 0 and st0["grasp_z_cm"] == round(_rb.grasp_z_mm(session.cfg) / 10.0, 2)
+        r = post("set_z_trim", {"mm": -6})
+        assert r["ok"] and r["data"]["z_trim_mm"] == -6 and not r["data"]["large_trim"], r
+        assert session.cfg.z_trim_mm == -6 and _rb.grasp_z_mm(session.cfg) == st0["grasp_z_cm"] * 10 - 6
+        assert session.robot.cfg.z_trim_mm == -6, "the trim must reach the connected robot with no restart"
+        assert _yaml.safe_load(cfg_copy.read_text())["workspace"]["z_trim_mm"] == -6
+        assert get("/state")["robot"]["grasp_z_cm"] == round(_rb.grasp_z_mm(session.cfg) / 10.0, 2)
+        r = post("set_z_trim", {"mm": -80})  # legal (a table can genuinely be that far down) but warned
+        assert r["ok"] and r["data"]["large_trim"] is True and "LARGE TRIM" in r["message"], r
+        assert get("/state")["grasp"]["large_trim"] is True
+        assert not post("set_z_trim", {"mm": -500})["ok"]  # outside the +-150 mm clamp
+        assert not post("set_z_trim", {"mm": "deep"})["ok"]
+        assert post("set_z_trim", {"mm": 0})["ok"] and get("/state")["grasp"]["large_trim"] is False
+        assert _yaml.safe_load(cfg_copy.read_text())["workspace"]["z_trim_mm"] == 0
+        assert "# indices verified" in cfg_copy.read_text(), "config.yaml comments were clobbered"
     finally:
         session.shutdown()
         session.voice.stop()
         if session.hud is not None:
             session.hud.stop()
-    print("hud actions OK: RUN/ROBOT/PERCEPTION/VOICE/RULES/MODELS/LOG groups, E-STOP, restart, calibration, "
+    print("hud actions OK: RUN/ROBOT/PERCEPTION/VOICE/RULES/MODELS/LOG/CHAT groups, E-STOP, restart, calibration, "
           "push-to-talk transcribe, model hot-swap, px->mm + /log, "
           "help on every action, mic toggle, page/action cross-check all over HTTP")
 

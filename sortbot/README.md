@@ -111,7 +111,7 @@ position, size and hidden state are remembered per browser) -- and four intent t
 * **OPERATE** -- task text, big Start/Pause/Resume/Stop (+ Step once / max steps), corrections (text box,
   push-to-talk, and the **Listening** toggle mapped to `mic_on`/`mic_off` -- the mic NEVER runs unless that
   toggle is on, and it is off on every start), and the rules editor.
-* **TUNE** -- model dropdowns.
+* **TUNE** -- model dropdowns (planner / chat / grasp-check / TTS / STT / voice) and the **grasp depth** trim.
 * **DEBUG** -- manual arm control (home / gripper / jog pad / go-to / torque), the decision log, and a raw
   list of every registered action.
 
@@ -146,10 +146,24 @@ to the VLM prompt as `GOAL: ...`). Runs are restartable from the page without re
 
 ROBOT group (all through the normal safety envelope; refused while the loop is running -- pause first):
 `home`, `open_gripper`, `close_gripper`, `jog(axis: x|y|z|roll, delta)` (mm, or degrees for roll),
-`goto(x, y, z)`, `torque_on`, and `torque_off` = **E-STOP** (always visible in the header):
+`goto(x, y, z)`, `set_z_trim(mm)` (grasp depth, see below), `torque_on`, and `torque_off` = **E-STOP** (always visible in the header):
 `bus.disable_torque()` plus a flag; every motion raises/returns a torque error until
 `torque_on`, and the loop is paused. `GET /state` carries `robot: {ee_pose, joints_deg, gripper_open, holding,
-torque}`.
+torque, z_trim_mm, grasp_z_cm}`.
+
+### Grasp depth (the gripper stops short of the table / presses into it)
+
+`workspace.z_trim_mm` (default 0, range ±150 mm) shifts the plane the arm works to. **Negative lowers it.**
+If picks close on air just above the object, the assumed table plane is too high -- trim down; if the arm
+leans on the table, trim up. One number moves the commanded grasp z, the pre-place z and the safety
+envelope's z floor together (`robot.grasp_z_mm` is the single source; nothing else derives a z floor).
+`workspace.z_floor_mm` (default -150 mm) is the absolute backstop against a typo, not a policy limit --
+lower it if your table really is deeper. Live from the HUD **Tune > Grasp depth**: a typed field plus
+-10/-2/+2/+10 mm nudges, the resulting grasp height in cm, and an amber warning past ±40 mm (large trims
+are allowed, but check the arm clears the table first). `set_z_trim` persists to `config.yaml`, so it
+survives a restart. A deep trim makes every grasp further from HOME: if moves start coming back as
+"step of N mm exceeds max_step" the message says how much of that the trim added -- reduce the trim or
+raise `workspace.max_step_mm`.
 
 VOICE group: `say_to_bot(text)` (alias `say_to_robot`) sends a typed correction through the voice classifier --
 rule-shaped sentences are persisted to RULES immediately (or by the loop while running), short bare commands

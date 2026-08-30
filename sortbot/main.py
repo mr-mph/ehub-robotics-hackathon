@@ -1681,8 +1681,11 @@ class Session:
                 self._robot_cache["error"] = str(e)
             finally:
                 self.robot_lock.release()
+        import sortbot.robot as robot_mod
         return {**self._robot_cache, "gripper_open": r.gripper_open, "torque": bool(getattr(r, "torque", True)),
-                "holding": self.loop.holding if self.loop is not None else None}
+                "holding": self.loop.holding if self.loop is not None else None,
+                "z_trim_mm": round(float(self.cfg.z_trim_mm), 2),
+                "grasp_z_cm": round(robot_mod.grasp_z_mm(self.cfg) / 10.0, 2)}
 
     # ------------------------------------------------ idle preview + teardown
     def _preview_loop(self) -> None:

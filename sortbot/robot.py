@@ -199,22 +199,43 @@ class _KinematicBase:
         q = np.array([*q5, q_seed[5]])
         err = float(np.linalg.norm(self.fk_table(q)[:3, 3] - [x, y, z]))
         if err > IK_TOL_MM:
-            raise SafetyError(f"IK sanity failed for ({x:.0f},{y:.0f},{z:.0f}) mm: FK(IK) off by {err:.1f} mm (unreachable)")
+            trim = z_trim_mm(self.cfg)
+            # tell the two causes apart: "the arm cannot go there" vs "the arm cannot go that DEEP"
+            deep = trim < 0 and z < max(float(self.cfg.grasp_z_mm),
+                                        float(self.cfg.table_z_mm) + float(self.cfg.gripper_clearance_mm))
+            why = (f"unreachable at this grasp depth (z={z:.0f} mm comes from the grasp depth trim "
+                   f"{trim:+.0f} mm) -- reduce workspace.z_trim_mm" if deep else "unreachable")
+            raise SafetyError(f"IK sanity failed for ({x:.0f},{y:.0f},{z:.0f}) mm: FK(IK) off by {err:.1f} mm ({why})")
         return q
 
     # ---- safety ----
     def check_target(self, x: float, y: float, z: float) -> None:
         lo, hi = self.cfg.aabb_min_mm, self.cfg.aabb_max_mm
-        zmin = self.cfg.table_z_mm + self.cfg.gripper_clearance_mm
+        zmin, hard = grasp_z_mm(self.cfg), hard_floor_mm(self.cfg)
+        if z < hard - 1e-6:  # trim-independent backstop: workspace.z_floor_mm
+            raise SafetyError(f"target z={z:.1f} mm is below the absolute floor workspace.z_floor_mm = "
+                              f"{hard:.1f} mm; raise the grasp depth trim (workspace.z_trim_mm, currently "
+                              f"{z_trim_mm(self.cfg):+.1f} mm) or lower z_floor_mm if the table really is deeper")
         if z < zmin - 1e-6:
-            raise SafetyError(f"target z={z:.1f} mm below clearance {zmin:.1f} mm")
+            raise SafetyError(f"target z={z:.1f} mm below clearance {zmin:.1f} mm "
+                              f"(grasp depth trim {z_trim_mm(self.cfg):+.1f} mm)")
+        # a negative trim lowers the z floor with it, so the AABB's own z minimum must not veto it
+        lo = (lo[0], lo[1], min(lo[2], zmin))
         for i, (v, name) in enumerate(zip((x, y, z), "xyz")):
             if not lo[i] <= v <= hi[i]:
                 raise SafetyError(f"target {name}={v:.1f} mm outside workspace [{lo[i]}, {hi[i]}]")
         p = self.get_ee_pose()
         d = math.dist((p.x, p.y, p.z), (x, y, z))
         if d > self.cfg.max_step_mm:
-            raise SafetyError(f"step of {d:.0f} mm exceeds max_step {self.cfg.max_step_mm:.0f} mm")
+            trim = z_trim_mm(self.cfg)
+            # a deep trim makes every grasp/place further from HOME: say so, or this reads as "unreachable"
+            why = ""
+            if trim < 0 and z < float(self.cfg.table_z_mm) + float(self.cfg.gripper_clearance_mm):
+                d0 = math.dist((p.x, p.y, p.z), (x, y, z - trim))
+                if d0 <= self.cfg.max_step_mm:
+                    why = (f" -- the grasp depth trim ({trim:+.0f} mm) adds {d - d0:.0f} mm to this move; "
+                           f"reduce workspace.z_trim_mm or raise workspace.max_step_mm")
+            raise SafetyError(f"step of {d:.0f} mm exceeds max_step {self.cfg.max_step_mm:.0f} mm{why}")
 
     # ---- state ----
     def get_joints_deg(self) -> np.ndarray:
@@ -372,7 +393,7 @@ class _KinematicBase:
 
     def pick(self, x_mm: float, y_mm: float) -> ExecResult:
         x, y = float(x_mm), float(y_mm)
-        zg = max(self.cfg.grasp_z_mm, self.cfg.table_z_mm + self.cfg.gripper_clearance_mm)
+        zg = grasp_z_mm(self.cfg)  # trimmed by workspace.z_trim_mm (see the helpers at the top)
         # label carries no bare coordinates: failure strings reach the VLM, whose surface is cm
         # (the inner SafetyError text stays mm but always says "mm" explicitly)
         return self._run("pick",
@@ -382,7 +403,7 @@ class _KinematicBase:
                          lambda: self.move_to(x, y, self.cfg.travel_z_mm))
 
     def place_at(self, x: float, y: float) -> ExecResult:
-        zp = max(self.cfg.grasp_z_mm, self.cfg.table_z_mm + self.cfg.gripper_clearance_mm) + 10.0
+        zp = grasp_z_mm(self.cfg) + 10.0
         return self._run("place",  # no bare mm coordinates in the label (see pick)
                          lambda: self.move_to(x, y, zp),
                          self.open_gripper,
@@ -495,7 +516,7 @@ def _selftest() -> None:
     assert math.dist((p.x, p.y, p.z), (cfg.home.x, cfg.home.y, cfg.home.z)) < IK_TOL_MM, p
 
     # FK(IK) round trip on a grid of the physically reachable core workspace (see module docstring)
-    zg = cfg.grasp_z_mm + cfg.gripper_clearance_mm
+    zg = grasp_z_mm(cfg)
     worst, n, tilt_lo = 0.0, 0, 0.0
     for x in np.linspace(150, 300, 6):
         for y in np.linspace(-200, 200, 7):
@@ -516,11 +537,39 @@ def _selftest() -> None:
     n0 = len(r.log)
     assert r.pick(300.0, 120.0).ok and not r.gripper_open
     zs = [r.fk_table(q)[2, 3] for q in r.log[n0:]]
-    assert min(zs) >= cfg.gripper_clearance_mm - 2.0, min(zs)
+    assert min(zs) >= grasp_z_mm(cfg) - 2.0, min(zs)
     assert r.place_at(275.0, 0.0).ok and r.gripper_open
     p = r.get_ee_pose()
     assert abs(p.x - 275) < IK_TOL_MM and abs(p.y) < IK_TOL_MM and abs(p.z - cfg.travel_z_mm) < IK_TOL_MM, p
 
+    # --- workspace.z_trim_mm: a negative trim really does lower BOTH the commanded grasp z and the floor,
+    # and the absolute floor (table - 40 mm) still refuses anything below it whatever the trim says ---
+    import dataclasses
+    zg0 = grasp_z_mm(cfg)
+    low = dataclasses.replace(cfg, z_trim_mm=-6.0)
+    assert abs(grasp_z_mm(low) - (zg0 - 6.0)) < 1e-9, (grasp_z_mm(low), zg0)
+    assert abs(table_plane_mm(low) - (cfg.table_z_mm - 6.0)) < 1e-9
+    assert z_trim_mm(dataclasses.replace(cfg, z_trim_mm=-999.0)) == -Z_TRIM_LIMIT_MM  # clamped at 150 mm
+    assert Z_TRIM_LIMIT_MM >= 150.0 and not large_trim(cfg) and large_trim(dataclasses.replace(cfg, z_trim_mm=-55.0))
+    # the floor is a configurable backstop, not a policy limit: a deep table is reachable by lowering it
+    deep = dataclasses.replace(cfg, z_trim_mm=-90.0, z_floor_mm=-150.0)
+    assert grasp_z_mm(deep) < -70.0 and hard_floor_mm(deep) == -150.0
+    try:
+        MockRobot(deep).check_target(250.0, 0.0, -160.0)
+        raise AssertionError("z_floor_mm not enforced")
+    except (SafetyError, _robot.SafetyError) as e:
+        assert "z_floor_mm" in str(e), e
+    rl = MockRobot(low)
+    rl.home()
+    assert rl.move_to(250.0, 0.0, grasp_z_mm(low)).ok, "the trimmed grasp height must be reachable"
+    zs_low = [rl.fk_table(q)[2, 3] for q in rl.log[-1:]]
+    assert min(zs_low) < zg0 - 3.0, (min(zs_low), zg0)  # genuinely lower than the untrimmed plane
+    assert not rl.move_to(250.0, 0.0, grasp_z_mm(low) - 3.0).ok, "below the trimmed floor must be refused"
+    try:  # the absolute floor is trim-independent
+        rl.check_target(250.0, 0.0, hard_floor_mm(low) - 1.0)
+        raise AssertionError("absolute floor not enforced")
+    except (SafetyError, _robot.SafetyError) as e:
+        assert "absolute floor" in str(e), e
     for bad in ((275, 0, 5), (50, 0, 60), (275, 300, 60), (500, 0, 60), (275, 0, 300)):
         assert not r.move_to(*bad).ok, bad
         try:

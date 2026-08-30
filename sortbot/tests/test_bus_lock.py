@@ -106,7 +106,13 @@ def test_bus_lock() -> None:
 
     port = _free_port()
     tmp = Path(tempfile.mkdtemp())
-    args = Namespace(max_steps=12, no_voice=True, hud_port=port, rules_file=str(tmp / "rules.json"), config=None)
+    cfg_copy = tmp / "config.yaml"  # pin the operator's grasp depth trim; this test is about the bus
+    import shutil
+    shutil.copy(Path(m.__file__).parent / "config.yaml", cfg_copy)
+    from sortbot.models import yaml_set
+    yaml_set(cfg_copy, "workspace", "z_trim_mm", "0")
+    args = Namespace(max_steps=12, no_voice=True, hud_port=port, rules_file=str(tmp / "rules.json"),
+                     config=str(cfg_copy))
     session = m.serve(args, factories=testing.session_factories(make_robot=make_robot))
     session.step_delay_s = 0.05  # step boundaries where the pollers can win the lock
     get, post = _mk(f"http://127.0.0.1:{port}")

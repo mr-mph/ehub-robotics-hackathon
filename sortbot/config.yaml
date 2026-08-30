@@ -20,6 +20,15 @@ workspace:
   # Set to [0, 0, 0] to go back to the raw URDF frame (then recalibrate).
   tool_offset_mm: [-7.8, 0.0, 3.7]
   table_z_mm: 0.0
+  # GRASP DEPTH TRIM (mm, range -150..+150, live-editable from the HUD Tune tab / set_z_trim).
+  # NEGATIVE lowers the plane the gripper descends to. Use it when the jaws stop short of the table
+  # (the usual symptom: picks close on air just above the object); raise it if the arm presses down.
+  # It shifts the commanded grasp/place z AND the safety envelope's z floor together. Beyond -40 mm it
+  # still works but is warned about: check the arm clears the table before running.
+  z_trim_mm: -10
+  # Absolute floor for any commanded z (table-frame mm). A backstop against a typo or a runaway, NOT a
+  # policy limit -- lower it if your table really does sit further below the assumed plane.
+  z_floor_mm: -150.0
   gripper_clearance_mm: 15.0
   travel_z_mm: 120.0
   grasp_z_mm: 8.0

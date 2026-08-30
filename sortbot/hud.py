@@ -489,6 +489,7 @@ function renderAll(){
  $('sec-voice').hidden=!has('say_to_bot');
  $('sec-rules').hidden=!has('add_rule');
  $('sec-models').hidden=!has('get_models');
+ $('sec-ztrim').hidden=!has('set_z_trim');
  $('sec-robot').hidden=!has('home');
  $('sec-log').hidden=!has('log_clear');
  $('mictoggle').hidden=!has('mic_on');

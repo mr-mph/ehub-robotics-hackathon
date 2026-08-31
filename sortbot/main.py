@@ -1834,6 +1834,10 @@ def serve(args, factories: dict | None = None) -> Session:
     voice = VoiceIO(cfg.elevenlabs_voice_id, stdin=io.StringIO("") if args.no_voice else None,
                     force_text=True, tts_model=cfg.tts_model, stt_model=cfg.stt_model)  # mic only via explicit mic_on toggle
     voice.start()
+    # voice.listen_on_start (user opt-in): boot straight into hands-free Listening. The mic_on/mic_off
+    # toggle and the MIC LIVE chip keep working exactly as before; --no-voice still means silent.
+    if cfg.listen_on_start and not args.no_voice:
+        log.info("listen_on_start: %s", voice.mic_on())
     rules = RulesStore(args.rules_file) if args.rules_file else RulesStore()
     return Session(cfg, hud, voice, rules, max_steps=args.max_steps, factories=factories)
 

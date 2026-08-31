@@ -56,6 +56,9 @@ class Config:
     z_floor_mm: float = -150.0   # workspace.z_floor_mm: absolute floor for any commanded z (a backstop)
     tts_model: str = "eleven_turbo_v2_5"   # voice.tts_model
     stt_model: str = "scribe_v2"           # voice.stt_model
+    # voice.listen_on_start: start hands-free Listening at boot (user's explicit choice; the mic then
+    # hears the whole room until toggled off -- the MIC LIVE chip shows while it is on).
+    listen_on_start: bool = True
     # vlm.chat_model / vlm.verify_model: the small fast models behind the conversational Chat worker and
     # the pre-grasp alignment check. Empty falls back to chat_model, then to openai_model.
     chat_model: str = ""
@@ -111,6 +114,7 @@ def load(path: str | Path = DEFAULT_YAML) -> Config:
         z_floor_mm=float(w.get("z_floor_mm", Config.z_floor_mm)),
         tts_model=str(raw["voice"].get("tts_model", Config.tts_model)),
         stt_model=str(raw["voice"].get("stt_model", Config.stt_model)),
+        listen_on_start=bool(raw["voice"].get("listen_on_start", Config.listen_on_start)),
         chat_model=chat_model,
         verify_model=str(vl.get("verify_model") or "") or chat_model,
         chat_effort=str(vl.get("chat_effort", Config.chat_effort)),

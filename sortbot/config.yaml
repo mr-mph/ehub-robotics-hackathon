@@ -62,10 +62,10 @@ vlm:
   chat_model: gpt-5.6-luna
   chat_effort: low         # none | low | medium | high  (reasoning effort for chat + verify; keep it low)
   # The grasp-alignment check before every close (overhead + wrist -> aligned/dx/dy). Defaults to chat_model.
-  verify_model: gpt-5.6-luna
+  verify_model: gpt-5.4-mini
 grasp:
   # NEVER close the claw without first checking BOTH cameras that the jaws are over the object.
-  verify: true              # false is possible but logs a loud warning at startup -- keep it true
+  verify: false             # DISABLED at user request (was: true) -- re-enable for unattended runs
   max_correction_cm: 2.0    # a single re-centring nudge is clamped to this
   max_retries: 2            # re-checks after a correction; still not aligned -> the pick is ABORTED
   min_confidence: 0.5       # a low-confidence "aligned" verdict does not count as aligned
@@ -73,6 +73,7 @@ voice:
   elevenlabs_voice_id: 21m00Tcm4TlvDq8ikWAM
   tts_model: eleven_flash_v2_5    # eleven_flash_v2_5 | eleven_turbo_v2_5 | eleven_multilingual_v2 | eleven_v3
   stt_model: scribe_v2           # scribe_v2 | scribe_v1
+  listen_on_start: true          # start hands-free Listening at boot (MIC LIVE chip shows; hears the whole room until toggled off)
 hud:
   port: 8765
 calib_file: sortbot/calib/calib.json

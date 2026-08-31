@@ -61,6 +61,9 @@ def test_hud_actions() -> None:
     # pin the grasp depth: the live workspace.z_trim_mm is the operator's calibration of THEIR table
     from sortbot.models import yaml_set as _yset
     _yset(cfg_copy, "workspace", "z_trim_mm", "0")
+    # pin the alignment check ON: it is a runtime toggle the operator may flip in the live config,
+    # but this suite tests the invariant that holds while it is enabled
+    _yset(cfg_copy, "grasp", "verify", "true")
     args = Namespace(max_steps=40, no_voice=True, hud_port=port,
                      rules_file=str(tmp / "rules.json"), config=str(cfg_copy))
     session = m.serve(args, factories=testing.session_factories())

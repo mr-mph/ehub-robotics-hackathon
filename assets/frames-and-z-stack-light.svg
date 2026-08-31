@@ -1,0 +1,178 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1150" height="900" viewBox="0 0 1150 900" font-family="ui-sans-serif, -apple-system, Segoe UI, Roboto, sans-serif">
+  <defs>
+    <marker id="arrow-frames-light" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#0969da"/>
+    </marker>
+    <marker id="arrow-trim-light" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#bc4c00"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="1150" height="900" fill="#ffffff"/>
+
+  <text x="30" y="34" font-size="22" font-weight="700" fill="#1f2328">Frames, units, and the z stack</text>
+  <text x="30" y="54" font-size="14" fill="#656d76">side elevation of the workspace: every z plane the code enforces, base&#8594;table frame, and cm&#8596;mm</text>
+
+  <!-- ============ MAIN PANEL: SIDE ELEVATION ============ -->
+  <g>
+    <!-- z scale: z=250 -> y=90, z=-150 -> y=560 (1.175 units/mm) -->
+
+    <!-- z=250 AABB ceiling -->
+    <line x1="100" y1="90" x2="800" y2="90" stroke="#d1d9e0" stroke-width="2" stroke-dasharray="6 4"/>
+    <text x="810" y="87" font-size="15" font-weight="600" fill="#1f2328">z = 250 mm</text>
+    <text x="810" y="104" font-size="12.5" fill="#656d76">AABB ceiling</text>
+
+    <!-- z=180 home -->
+    <line x1="100" y1="184" x2="800" y2="184" stroke="#d1d9e0" stroke-width="2" stroke-dasharray="6 4"/>
+    <text x="810" y="181" font-size="15" font-weight="600" fill="#1f2328">z = 180 mm</text>
+    <text x="810" y="198" font-size="12.5" fill="#656d76">home (150, 0, 180)</text>
+
+    <!-- z=120 travel_z_mm -->
+    <line x1="100" y1="255" x2="800" y2="255" stroke="#0969da" stroke-width="2.5"/>
+    <text x="810" y="252" font-size="15" font-weight="600" fill="#0969da">z = 120 mm</text>
+    <text x="810" y="269" font-size="13" fill="#656d76">travel_z_mm &#8212; every move lifts here first</text>
+
+    <!-- z=8 grasp_z_mm -->
+    <line x1="100" y1="399" x2="800" y2="399" stroke="#0969da" stroke-width="2.5"/>
+    <path d="M800,399 H806 V352" fill="none" stroke="#d1d9e0" stroke-width="1.5"/>
+    <text x="812" y="340" font-size="15" font-weight="600" fill="#1f2328">z = 8 mm</text>
+    <text x="812" y="357" font-size="13" fill="#656d76">grasp_z_mm (+ gripper_clearance_mm 15)</text>
+
+    <!-- z=0 table_z_mm -->
+    <line x1="100" y1="411" x2="800" y2="411" stroke="#1f2328" stroke-width="3"/>
+    <text x="810" y="415" font-size="15" font-weight="600" fill="#1f2328">z = 0 mm</text>
+    <text x="810" y="432" font-size="13" fill="#656d76">table_z_mm &#8212; TABLE SURFACE</text>
+    <!-- table hatching -->
+    <g stroke="#656d76" stroke-width="1.5">
+      <line x1="100" y1="411" x2="88" y2="425"/>
+      <line x1="140" y1="411" x2="128" y2="425"/>
+      <line x1="180" y1="411" x2="168" y2="425"/>
+      <line x1="220" y1="411" x2="208" y2="425"/>
+      <line x1="260" y1="411" x2="248" y2="425"/>
+      <line x1="300" y1="411" x2="288" y2="425"/>
+      <line x1="340" y1="411" x2="328" y2="425"/>
+      <line x1="380" y1="411" x2="368" y2="425"/>
+      <line x1="420" y1="411" x2="408" y2="425"/>
+      <line x1="460" y1="411" x2="448" y2="425"/>
+      <line x1="500" y1="411" x2="488" y2="425"/>
+      <line x1="540" y1="411" x2="528" y2="425"/>
+      <line x1="580" y1="411" x2="568" y2="425"/>
+      <line x1="620" y1="411" x2="608" y2="425"/>
+      <line x1="660" y1="411" x2="648" y2="425"/>
+      <line x1="700" y1="411" x2="688" y2="425"/>
+      <line x1="740" y1="411" x2="728" y2="425"/>
+      <line x1="780" y1="411" x2="768" y2="425"/>
+    </g>
+
+    <!-- z=-150 z_floor_mm hard floor -->
+    <line x1="100" y1="560" x2="800" y2="560" stroke="#bc4c00" stroke-width="4"/>
+    <text x="810" y="557" font-size="15" font-weight="700" fill="#bc4c00">z = -150 mm</text>
+    <text x="810" y="574" font-size="13" fill="#bc4c00">z_floor_mm &#8212; HARD FLOOR, trim-independent backstop</text>
+
+    <!-- arm base sketch, left, sitting on table -->
+    <g>
+      <rect x="115" y="391" width="34" height="20" rx="3" fill="#8b949e" opacity="0.35"/>
+      <rect x="122" y="360" width="20" height="34" rx="3" fill="#8b949e" opacity="0.5"/>
+      <text x="132" y="352" font-size="12" fill="#656d76" text-anchor="middle">base</text>
+    </g>
+
+    <!-- gripper sketch, right, near grasp plane -->
+    <g>
+      <line x1="700" y1="255" x2="700" y2="380" stroke="#8b949e" stroke-width="4"/>
+      <path d="M685,380 L685,399 M715,380 L715,399" stroke="#1f2328" stroke-width="4" stroke-linecap="round"/>
+      <text x="700" y="245" font-size="12" fill="#656d76" text-anchor="middle">gripper</text>
+    </g>
+
+    <!-- trim callout: near grasp plane -->
+    <g>
+      <line x1="620" y1="399" x2="620" y2="560" stroke="#bc4c00" stroke-width="1.5" marker-start="url(#arrow-trim-light)" marker-end="url(#arrow-trim-light)"/>
+      <rect x="480" y="450" width="290" height="66" rx="6" fill="#ffffff" stroke="#bc4c00" stroke-width="1.5"/>
+      <text x="495" y="470" font-size="13" font-weight="700" fill="#bc4c00">z_trim_mm = -10</text>
+      <text x="495" y="487" font-size="12.5" fill="#1f2328">range -150..+150; warns beyond |40|</text>
+      <text x="495" y="504" font-size="12.5" fill="#1f2328">one knob, both move: grasp plane + floor</text>
+    </g>
+    <path d="M620,405 L590,399" stroke="#bc4c00" stroke-width="1.5" marker-end="url(#arrow-trim-light)" fill="none"/>
+    <path d="M620,554 L590,560" stroke="#bc4c00" stroke-width="1.5" marker-end="url(#arrow-trim-light)" fill="none"/>
+
+    <!-- motion path: 1 lift to travel_z, 2 XY 40mm substeps, 3 descend -->
+    <g stroke="#1a7f37" stroke-width="2.5" fill="none" stroke-dasharray="5 5">
+      <path d="M170,391 L170,255" marker-end="url(#arrow-frames-light)"/>
+      <path d="M170,255 L700,255" marker-end="url(#arrow-frames-light)"/>
+      <path d="M700,255 L700,391" marker-end="url(#arrow-frames-light)"/>
+    </g>
+    <!-- substep ticks on XY leg -->
+    <g stroke="#1a7f37" stroke-width="1.5">
+      <line x1="230" y1="249" x2="230" y2="261"/>
+      <line x1="290" y1="249" x2="290" y2="261"/>
+      <line x1="350" y1="249" x2="350" y2="261"/>
+      <line x1="410" y1="249" x2="410" y2="261"/>
+      <line x1="470" y1="249" x2="470" y2="261"/>
+      <line x1="530" y1="249" x2="530" y2="261"/>
+      <line x1="590" y1="249" x2="590" y2="261"/>
+      <line x1="650" y1="249" x2="650" y2="261"/>
+    </g>
+    <text x="180" y="230" font-size="13" font-weight="600" fill="#1a7f37">1 lift to travel_z</text>
+    <text x="330" y="235" font-size="13" font-weight="600" fill="#1a7f37">2 cartesian XY, 40 mm sub-steps (pre-planned)</text>
+    <text x="330" y="218" font-size="12.5" fill="#656d76">max_step_mm = 600 (runaway backstop, XY only &#8212; z not folded in)</text>
+    <text x="705" y="330" font-size="13" font-weight="600" fill="#1a7f37">3 descend</text>
+  </g>
+
+  <!-- ============ TOP-VIEW INSET ============ -->
+  <g>
+    <rect x="936" y="90" width="204" height="150" rx="6" fill="#ffffff" stroke="#d1d9e0" stroke-width="1.5"/>
+    <text x="950" y="112" font-size="12" font-weight="700" fill="#1f2328">top view (table frame, mm)</text>
+    <rect x="975" y="130" width="130" height="88" fill="none" stroke="#0969da" stroke-width="2"/>
+    <circle cx="975" cy="174" r="4" fill="#1f2328"/>
+    <text x="967" y="178" text-anchor="end" font-size="10.5" fill="#656d76">base</text>
+    <text x="983" y="146" font-size="11" fill="#1f2328">AABB: x 120..420</text>
+    <text x="983" y="161" font-size="11" fill="#1f2328">y -220..+220</text>
+    <path d="M975,174 L1032,174" stroke="#1a7f37" stroke-width="2" marker-end="url(#arrow-frames-light)"/>
+    <text x="1038" y="178" font-size="11" fill="#1a7f37">x fwd</text>
+    <path d="M975,174 L975,212" stroke="#bc4c00" stroke-width="2" marker-end="url(#arrow-trim-light)"/>
+    <text x="983" y="233" font-size="11" fill="#bc4c00">y left</text>
+  </g>
+
+  <!-- ============ FRAME BOX ============ -->
+  <g>
+    <rect x="30" y="620" width="220" height="70" rx="6" fill="#ffffff" stroke="#0969da" stroke-width="1.5"/>
+    <text x="140" y="647" font-size="14" font-weight="700" fill="#1f2328" text-anchor="middle">base_link</text>
+    <text x="140" y="665" font-size="12" fill="#656d76" text-anchor="middle">METRES &#8212; URDF FK/IK</text>
+
+    <path d="M250,655 L410,655" stroke="#0969da" stroke-width="2" marker-end="url(#arrow-frames-light)" fill="none"/>
+    <text x="330" y="640" font-size="12.5" fill="#0969da" text-anchor="middle">table_T_base</text>
+    <text x="330" y="668" font-size="11" fill="#656d76" text-anchor="middle">(rigid; ball mode =</text>
+    <text x="330" y="682" font-size="11" fill="#656d76" text-anchor="middle">identity rot + z offset)</text>
+
+    <rect x="410" y="620" width="260" height="70" rx="6" fill="#ffffff" stroke="#0969da" stroke-width="1.5"/>
+    <text x="540" y="642" font-size="14" font-weight="700" fill="#1f2328" text-anchor="middle">table frame</text>
+    <text x="540" y="659" font-size="12" fill="#656d76" text-anchor="middle">MILLIMETRES &#8212; origin = base</text>
+    <text x="540" y="675" font-size="12" fill="#656d76" text-anchor="middle">projected onto tabletop, table z = 0</text>
+  </g>
+
+  <!-- ============ TOOL OFFSET CALLOUT ============ -->
+  <g>
+    <rect x="730" y="620" width="380" height="86" rx="6" fill="#ffffff" stroke="#8b949e" stroke-width="1.5"/>
+    <text x="745" y="641" font-size="13" font-weight="700" fill="#1f2328">tool_offset_mm [-7.8, 0.0, 3.7]</text>
+    <text x="745" y="659" font-size="12" fill="#656d76">FK returns gripper_frame_link: 7.8 mm off jaw</text>
+    <text x="745" y="674" font-size="12" fill="#656d76">centreline, 3.7 mm back from fingertips &#8212;</text>
+    <text x="745" y="689" font-size="12" fill="#656d76">rotates with shoulder_pan / wrist_roll</text>
+  </g>
+
+  <!-- ============ UNIT BAND ============ -->
+  <g>
+    <rect x="30" y="740" width="1090" height="130" rx="8" fill="#ffffff" stroke="#d1d9e0" stroke-width="1.5"/>
+    <line x1="575" y1="740" x2="575" y2="870" stroke="#d1d9e0" stroke-width="1.5"/>
+
+    <text x="52" y="768" font-size="14.5" font-weight="700" fill="#0969da">VLM sees / emits &#8212; CENTIMETRES</text>
+    <text x="52" y="789" font-size="12.5" fill="#1f2328">grid every 5 cm</text>
+    <text x="52" y="807" font-size="12.5" fill="#1f2328">x 12..42, y -22..+22, z 0..25</text>
+    <text x="52" y="825" font-size="12.5" fill="#1f2328">grid_cm = 5 cm spacing</text>
+    <text x="52" y="850" font-size="13" font-weight="600" fill="#bc4c00">cm &#8594; mm: main._mm_args (the only place)</text>
+
+    <text x="597" y="768" font-size="14.5" font-weight="700" fill="#1a7f37">robot.py / config.yaml / calib.json &#8212; MILLIMETRES</text>
+    <text x="597" y="789" font-size="12.5" fill="#1f2328">travel_z_mm, grasp_z_mm, z_floor_mm, tool_offset_mm</text>
+    <text x="597" y="807" font-size="12.5" fill="#1f2328">AABB, table_T_base, all safety-envelope math</text>
+    <text x="597" y="850" font-size="13" font-weight="600" fill="#bc4c00">mm &#8594; cm: vlm._state_text + overlay labels</text>
+  </g>
+
+</svg>

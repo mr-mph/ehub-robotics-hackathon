@@ -1,0 +1,116 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1180" height="850" viewBox="0 0 1180 850" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, sans-serif">
+<desc>Five threads and four queues: the talk path runs voice to q_heard to the luna-chat worker to q_directives to the action Loop, with q_say returning spoken replies and q_log feeding the HUD. An urgent regex pre-filter bypasses the queues entirely to reach E-STOP. Session.robot_lock serialises every access to the Feetech serial bus, with a different acquire timeout per caller; luna-chat and preview never take the lock.</desc>
+<defs>
+<marker id="ar-light" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#0969da"/></marker>
+<marker id="arw-light" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#bc4c00"/></marker>
+<marker id="arg-light" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#8c959f"/></marker>
+<marker id="ark-light" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#1f2328"/></marker>
+</defs>
+<rect width="1180" height="850" fill="#ffffff"/>
+<text x="40" y="44" text-anchor="start" font-size="21" fill="#1f2328" font-weight="700">Five threads, four queues, one serial bus</text>
+<text x="40" y="68" text-anchor="start" font-size="13" fill="#656d76">Talking and acting are separate threads. Exactly one of them may touch the serial bus.</text>
+<text x="40" y="106" text-anchor="start" font-size="12.5" fill="#656d76" font-weight="700">TALK PATH — the conversation never blocks the arm</text>
+<rect x="40" y="124" width="190" height="56" rx="8" fill="#ffffff" stroke="#d1d9e0" stroke-width="1.5"/>
+<text x="135" y="148" text-anchor="middle" font-size="13.5" fill="#1f2328" font-weight="600">voice — mic</text>
+<text x="135" y="166" text-anchor="middle" font-size="10.5" fill="#656d76">streaming STT, VAD 0.7 s</text>
+<path d="M232,152 H264" fill="none" stroke="#0969da" stroke-width="1.5" marker-end="url(#ar-light)"/>
+<rect x="264" y="126" width="158" height="52" rx="26" fill="#ddf4ff" stroke="#0969da" stroke-width="1.5"/>
+<text x="343" y="148" text-anchor="middle" font-size="13" fill="#1f2328" font-weight="700">q_heard</text>
+<text x="343" y="165" text-anchor="middle" font-size="10.5" fill="#656d76">endpointed utterances</text>
+<path d="M424,152 H462" fill="none" stroke="#0969da" stroke-width="1.5" marker-end="url(#ar-light)"/>
+<rect x="464" y="118" width="236" height="68" rx="8" fill="#ffffff" stroke="#d1d9e0" stroke-width="1.5"/>
+<text x="582" y="142" text-anchor="middle" font-size="13.5" fill="#1f2328" font-weight="600">luna-chat (ChatWorker)</text>
+<text x="582" y="160" text-anchor="middle" font-size="10.5" fill="#656d76">drains q_heard at 20 Hz</text>
+<text x="582" y="177" text-anchor="middle" font-size="10.5" fill="#656d76">one fast chat_model call</text>
+<path d="M702,152 H728" fill="none" stroke="#0969da" stroke-width="1.5" marker-end="url(#ar-light)"/>
+<rect x="730" y="126" width="186" height="52" rx="26" fill="#ddf4ff" stroke="#0969da" stroke-width="1.5"/>
+<text x="823" y="148" text-anchor="middle" font-size="13" fill="#1f2328" font-weight="700">q_directives</text>
+<text x="823" y="165" text-anchor="middle" font-size="10.5" fill="#656d76">rules / hints / commands / stop</text>
+<path d="M918,152 H946" fill="none" stroke="#0969da" stroke-width="1.5" marker-end="url(#ar-light)"/>
+<rect x="948" y="118" width="200" height="80" rx="8" fill="#ffffff" stroke="#0969da" stroke-width="2.5"/>
+<text x="1048" y="142" text-anchor="middle" font-size="13.5" fill="#1f2328" font-weight="700">Loop (action loop)</text>
+<text x="1048" y="160" text-anchor="middle" font-size="10.5" fill="#656d76">the only thread that moves the arm</text>
+<text x="1048" y="178" text-anchor="middle" font-size="10.5" fill="#656d76">drain_inputs(): non-blocking</text>
+<path d="M582,188 V212" fill="none" stroke="#0969da" stroke-width="1.5" marker-end="url(#ar-light)"/>
+<rect x="496" y="214" width="172" height="52" rx="26" fill="#ddf4ff" stroke="#0969da" stroke-width="1.5"/>
+<text x="582" y="236" text-anchor="middle" font-size="13" fill="#1f2328" font-weight="700">q_say</text>
+<text x="582" y="253" text-anchor="middle" font-size="10.5" fill="#656d76">one TTS worker</text>
+<path d="M494,240 H460" fill="none" stroke="#0969da" stroke-width="1.5" marker-end="url(#ar-light)"/>
+<rect x="268" y="214" width="190" height="52" rx="8" fill="#ffffff" stroke="#d1d9e0" stroke-width="1.5"/>
+<text x="363" y="236" text-anchor="middle" font-size="13" fill="#1f2328" font-weight="600">voice — TTS</text>
+<text x="363" y="253" text-anchor="middle" font-size="10.5" fill="#656d76">priority=True drops the backlog</text>
+<text x="690" y="244" text-anchor="start" font-size="11" fill="#656d76">playback is serialized — it never talks over itself</text>
+<path d="M1048,200 V274" fill="none" stroke="#0969da" stroke-width="1.5" marker-end="url(#ar-light)"/>
+<rect x="955" y="276" width="186" height="50" rx="26" fill="#ddf4ff" stroke="#0969da" stroke-width="1.5"/>
+<text x="1048" y="297" text-anchor="middle" font-size="13" fill="#1f2328" font-weight="700">q_log</text>
+<text x="1048" y="314" text-anchor="middle" font-size="10.5" fill="#656d76">DecisionLog, 200-entry ring</text>
+<rect x="700" y="276" width="190" height="50" rx="8" fill="#ffffff" stroke="#d1d9e0" stroke-width="1.5"/>
+<text x="795" y="297" text-anchor="middle" font-size="13" fill="#1f2328" font-weight="600">hud (FastAPI/uvicorn)</text>
+<text x="795" y="314" text-anchor="middle" font-size="10.5" fill="#656d76">127.0.0.1:8765</text>
+<path d="M953,301 H892" fill="none" stroke="#8c959f" stroke-width="1.5" marker-end="url(#arg-light)"/>
+<text x="922" y="294" text-anchor="middle" font-size="10" fill="#656d76">GET /log</text>
+<rect x="268" y="276" width="190" height="50" rx="8" fill="#ffffff" stroke="#d1d9e0" stroke-width="1.5"/>
+<text x="363" y="297" text-anchor="middle" font-size="13" fill="#1f2328" font-weight="600">preview</text>
+<text x="363" y="314" text-anchor="middle" font-size="10.5" fill="#656d76">0.4 s, ~2.5 Hz</text>
+<path d="M460,301 H698" fill="none" stroke="#8c959f" stroke-width="1.5" marker-end="url(#arg-light)"/>
+<text x="579" y="294" text-anchor="middle" font-size="10" fill="#656d76">MJPEG frames</text>
+<line x1="40" y1="352" x2="1140" y2="352" stroke="#d1d9e0" stroke-width="1"/>
+<rect x="40" y="368" width="1100" height="138" rx="10" fill="#fff6ef" stroke="#bc4c00" stroke-width="1.5"/>
+<text x="62" y="396" text-anchor="start" font-size="13" fill="#bc4c00" font-weight="700">URGENT BYPASS — around the queues, not through them</text>
+<rect x="64" y="406" width="280" height="62" rx="8" fill="#ffffff" stroke="#bc4c00" stroke-width="1.5"/>
+<text x="204" y="432" text-anchor="middle" font-size="12.5" fill="#1f2328" font-weight="600">interim transcript</text>
+<text x="204" y="450" text-anchor="middle" font-size="10.5" fill="#656d76">mid-sentence, still speaking</text>
+<path d="M346,437 H382" fill="none" stroke="#bc4c00" stroke-width="1.5" marker-end="url(#arw-light)"/>
+<rect x="384" y="406" width="320" height="62" rx="8" fill="#ffffff" stroke="#bc4c00" stroke-width="1.5"/>
+<text x="544" y="428" text-anchor="middle" font-size="12.5" fill="#1f2328" font-weight="600">regex pre-filter</text>
+<text x="544" y="445" text-anchor="middle" font-size="10.5" fill="#656d76">stop / halt / freeze / e-stop  (5 patterns)</text>
+<text x="544" y="461" text-anchor="middle" font-size="10.5" fill="#656d76">pause / wait / hold on  (2 patterns)</text>
+<path d="M706,437 H742" fill="none" stroke="#bc4c00" stroke-width="1.5" marker-end="url(#arw-light)"/>
+<rect x="744" y="406" width="180" height="62" rx="8" fill="#ffffff" stroke="#bc4c00" stroke-width="1.5"/>
+<text x="834" y="432" text-anchor="middle" font-size="12.5" fill="#1f2328" font-weight="600">Control events</text>
+<text x="834" y="450" text-anchor="middle" font-size="10.5" fill="#656d76">no model call</text>
+<path d="M926,437 H962" fill="none" stroke="#bc4c00" stroke-width="1.5" marker-end="url(#arw-light)"/>
+<rect x="964" y="406" width="152" height="62" rx="8" fill="#ffffff" stroke="#bc4c00" stroke-width="2.5"/>
+<text x="1040" y="432" text-anchor="middle" font-size="13" fill="#bc4c00" font-weight="700">E-STOP</text>
+<text x="1040" y="450" text-anchor="middle" font-size="10.5" fill="#656d76">torque_off()</text>
+<text x="62" y="492" text-anchor="start" font-size="11.5" fill="#bc4c00" font-weight="700">measured firing 127 ms before the speaker finished the sentence</text>
+<line x1="40" y1="530" x2="1140" y2="530" stroke="#d1d9e0" stroke-width="1"/>
+<text x="40" y="556" text-anchor="start" font-size="12.5" fill="#656d76" font-weight="700">THE SERIAL BUS — one thread at a time</text>
+<rect x="40" y="578" width="320" height="44" rx="8" fill="#ffffff" stroke="#d1d9e0" stroke-width="1.5"/>
+<text x="58" y="597" text-anchor="start" font-size="12.5" fill="#1f2328" font-weight="600">Loop</text>
+<text x="58" y="613" text-anchor="start" font-size="10.5" fill="#656d76">holds the lock through an entire motion</text>
+<path d="M362,600 H428" fill="none" stroke="#0969da" stroke-width="1.5" marker-end="url(#ar-light)"/>
+<rect x="40" y="630" width="320" height="44" rx="8" fill="#ffffff" stroke="#d1d9e0" stroke-width="1.5"/>
+<text x="58" y="649" text-anchor="start" font-size="12.5" fill="#1f2328" font-weight="600">HUD /state poller</text>
+<text x="58" y="665" text-anchor="start" font-size="10.5" fill="#656d76">0.2 s  →  else serve the cached pose</text>
+<path d="M362,652 H428" fill="none" stroke="#0969da" stroke-width="1.5" marker-end="url(#ar-light)"/>
+<rect x="40" y="682" width="320" height="44" rx="8" fill="#ffffff" stroke="#d1d9e0" stroke-width="1.5"/>
+<text x="58" y="701" text-anchor="start" font-size="12.5" fill="#1f2328" font-weight="600">ROBOT actions</text>
+<text x="58" y="717" text-anchor="start" font-size="10.5" fill="#656d76">2.0 s  →  else fail the action</text>
+<path d="M362,704 H428" fill="none" stroke="#0969da" stroke-width="1.5" marker-end="url(#ar-light)"/>
+<rect x="40" y="734" width="320" height="44" rx="8" fill="#ffffff" stroke="#bc4c00" stroke-width="2"/>
+<text x="58" y="753" text-anchor="start" font-size="12.5" fill="#bc4c00" font-weight="600">E-STOP</text>
+<text x="58" y="769" text-anchor="start" font-size="10.5" fill="#656d76">1.0 s  →  jumps the queue</text>
+<path d="M362,756 H428" fill="none" stroke="#0969da" stroke-width="1.5" marker-end="url(#ar-light)"/>
+<rect x="40" y="786" width="320" height="44" rx="8" fill="#ffffff" stroke="#d1d9e0" stroke-width="1.5"/>
+<text x="58" y="805" text-anchor="start" font-size="12.5" fill="#1f2328" font-weight="600">calibration teleop</text>
+<text x="58" y="821" text-anchor="start" font-size="10.5" fill="#656d76">holds it for the whole session</text>
+<path d="M362,808 H428" fill="none" stroke="#0969da" stroke-width="1.5" marker-end="url(#ar-light)"/>
+<rect x="430" y="578" width="210" height="252" rx="8" fill="#ffffff" stroke="#0969da" stroke-width="2.5"/>
+<text x="535" y="610" text-anchor="middle" font-size="14.5" fill="#1f2328" font-weight="700">Session.robot_lock</text>
+<text x="535" y="630" text-anchor="middle" font-size="11.5" fill="#656d76">(RLock)</text>
+<text x="535" y="700" text-anchor="middle" font-size="12" fill="#656d76">exactly one thread</text>
+<text x="535" y="718" text-anchor="middle" font-size="12" fill="#656d76">at a time</text>
+<path d="M642,704 H708" fill="none" stroke="#0969da" stroke-width="1.5" marker-end="url(#ar-light)"/>
+<rect x="710" y="660" width="250" height="90" rx="8" fill="#ffffff" stroke="#1f2328" stroke-width="2"/>
+<text x="835" y="696" text-anchor="middle" font-size="14" fill="#1f2328" font-weight="700">Feetech serial bus</text>
+<text x="835" y="718" text-anchor="middle" font-size="12" fill="#656d76">SO101  ·  6 motors</text>
+<rect x="710" y="578" width="430" height="64" rx="8" fill="#f6f8fa" stroke="#d1d9e0" stroke-width="1.5" stroke-dasharray="5 4"/>
+<text x="726" y="602" text-anchor="start" font-size="12" fill="#1f2328" font-weight="600">luna-chat and preview never ask for the lock</text>
+<text x="726" y="622" text-anchor="start" font-size="11" fill="#656d76">they read cached JPEGs (≤512 px, q72) and a cached pose</text>
+<path d="M706,614 H650" fill="none" stroke="#8c959f" stroke-width="1.5" stroke-dasharray="5 4"/>
+<g stroke="#8c959f" stroke-width="1.8"><line x1="672" y1="607" x2="684" y2="621"/><line x1="684" y1="607" x2="672" y2="621"/></g>
+<rect x="710" y="772" width="430" height="58" rx="8" fill="#f6f8fa" stroke="#d1d9e0" stroke-width="1.5"/>
+<text x="726" y="796" text-anchor="start" font-size="12.5" fill="#1f2328" font-weight="700">SORTBOT_BUS_ASSERT=1</text>
+<text x="726" y="816" text-anchor="start" font-size="11" fill="#656d76">proxy raises on any unlocked bus call  (=warn only logs)</text>
+</svg>

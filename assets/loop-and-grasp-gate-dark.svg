@@ -1,0 +1,147 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 1060" width="1200" height="1060" role="img" aria-labelledby="title-dark desc-dark" font-family="ui-sans-serif, -apple-system, Segoe UI, Roboto, sans-serif">
+<title id="title-dark">The act loop and the grasp-verify gate</title>
+<desc id="desc-dark">Outer cycle: home, capture, composite overlay, planner call, validate, execute, record, back to home. Inner gate on pick_at/close_gripper: descend, verify_grasp on two cameras, check aligned and confidence, close on yes, nudge and retry up to two times on no, retreat with jaws open on exhausted retries. Failures feed back into prompt history as text.</desc>
+<defs>
+<marker id="arrow-loop-dark" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+<path d="M0,0 L10,5 L0,10 z" fill="#4493f8"/>
+</marker>
+<marker id="arrow-dash-dark" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+<path d="M0,0 L10,5 L0,10 z" fill="#db6d28"/>
+</marker>
+</defs>
+
+<rect x="0" y="0" width="1200" height="1060" fill="#0d1117"/>
+
+<text x="600" y="34" text-anchor="middle" font-size="22" font-weight="700" fill="#e6edf3">The act loop and the grasp-verify gate</text>
+<text x="600" y="55" text-anchor="middle" font-size="13" fill="#8b949e">outer cycle runs every step. the inner gate runs only before pick_at / close_gripper.</text>
+
+<text x="100" y="82" font-size="13" font-weight="700" fill="#8b949e">OUTER CYCLE</text>
+
+<!-- Row A -->
+<g>
+<rect x="100" y="100" width="170" height="70" rx="8" fill="#0d1117" stroke="#4493f8" stroke-width="1.5"/>
+<text x="185" y="140" text-anchor="middle" font-size="15" fill="#e6edf3">home()</text>
+
+<rect x="290" y="100" width="280" height="70" rx="8" fill="#0d1117" stroke="#4493f8" stroke-width="1.5"/>
+<text x="430" y="130" text-anchor="middle" font-size="13" fill="#e6edf3">capture</text>
+<text x="430" y="148" text-anchor="middle" font-size="11" fill="#8b949e">overhead 640x480 + wrist 640x480</text>
+
+<rect x="590" y="100" width="290" height="70" rx="8" fill="#0d1117" stroke="#4493f8" stroke-width="1.5"/>
+<text x="735" y="123" text-anchor="middle" font-size="13" fill="#e6edf3">composite cached cm-grid overlay</text>
+<text x="735" y="140" text-anchor="middle" font-size="10.5" fill="#8b949e">5 cm grid, magenta EE cross</text>
+<text x="735" y="154" text-anchor="middle" font-size="10.5" fill="#8b949e">dimmed grid = outside calibrated hull</text>
+
+<rect x="900" y="100" width="270" height="112" rx="8" fill="#0d1117" stroke="#4493f8" stroke-width="2"/>
+<text x="1035" y="122" text-anchor="middle" font-size="13" font-weight="700" fill="#e6edf3">PLANNER call</text>
+<text x="1035" y="138" text-anchor="middle" font-size="10.5" fill="#8b949e">tool_choice=required</text>
+<text x="1035" y="151" text-anchor="middle" font-size="10.5" fill="#8b949e">parallel_tool_calls=false</text>
+<text x="1035" y="164" text-anchor="middle" font-size="10.5" fill="#8b949e">two PNGs, detail=high + state text</text>
+</g>
+
+<path d="M270,135 H290" fill="none" stroke="#4493f8" stroke-width="1.5" marker-end="url(#arrow-loop-dark)"/>
+<path d="M570,135 H590" fill="none" stroke="#4493f8" stroke-width="1.5" marker-end="url(#arrow-loop-dark)"/>
+<path d="M880,135 H900" fill="none" stroke="#4493f8" stroke-width="1.5" marker-end="url(#arrow-loop-dark)"/>
+
+<!-- planner tool-call list, inside the planner box -->
+<line x1="912" y1="172" x2="1158" y2="172" stroke="#4493f8" stroke-width="1" opacity="0.35"/>
+<text x="1035" y="187" text-anchor="middle" font-size="9" fill="#8b949e">pick_at(x_cm,y_cm) | place_at(x_cm,y_cm) | move_to(x,y,z)</text>
+<text x="1035" y="199" text-anchor="middle" font-size="9" fill="#8b949e">turn_to(deg) | turn_by(deg) | open_gripper | close_gripper</text>
+<text x="1035" y="207" text-anchor="middle" font-size="9" fill="#8b949e">say(text) | done(summary)</text>
+
+<!-- unit band around the planner->validate edge -->
+<path d="M1035,212 V260" fill="none" stroke="#4493f8" stroke-width="1.5" marker-end="url(#arrow-loop-dark)"/>
+<text x="1022" y="233" text-anchor="end" font-size="10.5" font-weight="700" fill="#e6edf3">VLM side: CENTIMETRES</text>
+<text x="1048" y="233" text-anchor="start" font-size="10.5" font-weight="700" fill="#e6edf3">robot side: MILLIMETRES</text>
+<text x="1035" y="250" text-anchor="middle" font-size="10" fill="#db6d28">x10 at main._mm_args</text>
+
+<!-- prompt-history node -->
+<rect x="590" y="190" width="280" height="50" rx="8" fill="#0d1117" stroke="#8b949e" stroke-width="1.5" stroke-dasharray="4 3"/>
+<text x="730" y="211" text-anchor="middle" font-size="11.5" fill="#e6edf3">prompt history: last 10 steps</text>
+<text x="730" y="226" text-anchor="middle" font-size="11.5" fill="#e6edf3">as tool(args) -&gt; result</text>
+
+<!-- prompt-history feeds planner -->
+<path d="M872,196 H886 V150 H896" fill="none" stroke="#4493f8" stroke-width="1.5" marker-end="url(#arrow-loop-dark)"/>
+
+<!-- Row B -->
+<g>
+<rect x="900" y="260" width="270" height="70" rx="8" fill="#0d1117" stroke="#4493f8" stroke-width="1.5"/>
+<text x="1035" y="284" text-anchor="middle" font-size="13" fill="#e6edf3">validate vs safety envelope</text>
+<text x="1035" y="300" text-anchor="middle" font-size="10.5" fill="#8b949e">AABB, grasp_z + z_trim,</text>
+<text x="1035" y="314" text-anchor="middle" font-size="10.5" fill="#8b949e">hard floor, IK reachability</text>
+
+<rect x="590" y="260" width="290" height="70" rx="8" fill="#0d1117" stroke="#4493f8" stroke-width="1.5"/>
+<text x="735" y="300" text-anchor="middle" font-size="13" fill="#e6edf3">execute under Session.robot_lock</text>
+
+<rect x="290" y="260" width="280" height="70" rx="8" fill="#0d1117" stroke="#4493f8" stroke-width="1.5"/>
+<text x="430" y="300" text-anchor="middle" font-size="13" fill="#e6edf3">record to decision log (200-entry ring)</text>
+</g>
+
+<path d="M900,295 H880" fill="none" stroke="#4493f8" stroke-width="1.5" marker-end="url(#arrow-loop-dark)"/>
+<path d="M590,295 H570" fill="none" stroke="#4493f8" stroke-width="1.5" marker-end="url(#arrow-loop-dark)"/>
+
+<!-- loop back: record -> home -->
+<path d="M290,295 H55 V135 H100" fill="none" stroke="#4493f8" stroke-width="1.5" marker-end="url(#arrow-loop-dark)"/>
+
+<!-- dashed: validate rejected -> prompt history -->
+<path d="M900,262 L870,222" fill="none" stroke="#db6d28" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#arrow-dash-dark)"/>
+<text x="866" y="253" text-anchor="end" font-size="10.5" fill="#db6d28">rejected -&gt; FAILED: &lt;reason&gt;</text>
+
+<!-- INNER GATE -->
+<text x="100" y="395" font-size="13" font-weight="700" fill="#8b949e">INNER GATE — only for pick_at / close_gripper</text>
+<path d="M735,330 L635,458" fill="none" stroke="#8b949e" stroke-width="1.5" stroke-dasharray="4 3"/>
+<text x="742" y="400" font-size="10.5" fill="#8b949e">called out from execute</text>
+
+<rect x="425" y="460" width="420" height="60" rx="8" fill="#0d1117" stroke="#4493f8" stroke-width="1.5"/>
+<text x="635" y="495" text-anchor="middle" font-size="13.5" fill="#e6edf3">descend to grasp plane, jaws OPEN</text>
+
+<path d="M635,520 V550" fill="none" stroke="#4493f8" stroke-width="1.5" marker-end="url(#arrow-loop-dark)"/>
+
+<rect x="425" y="550" width="420" height="60" rx="8" fill="#0d1117" stroke="#4493f8" stroke-width="1.5"/>
+<text x="635" y="576" text-anchor="middle" font-size="13.5" fill="#e6edf3">verify_grasp(overhead JPEG + wrist JPEG)</text>
+<text x="635" y="594" text-anchor="middle" font-size="11" fill="#8b949e">on verify_model</text>
+
+<path d="M635,610 V640" fill="none" stroke="#4493f8" stroke-width="1.5" marker-end="url(#arrow-loop-dark)"/>
+
+<rect x="425" y="640" width="420" height="60" rx="8" fill="#0d1117" stroke="#4493f8" stroke-width="1.5"/>
+<text x="635" y="666" text-anchor="middle" font-size="12.5" fill="#e6edf3">{aligned, dx_cm, dy_cm, reason,</text>
+<text x="635" y="683" text-anchor="middle" font-size="12.5" fill="#e6edf3">confidence 0..1}</text>
+
+<path d="M635,700 V693" fill="none" stroke="#4493f8" stroke-width="1.5" marker-end="url(#arrow-loop-dark)"/>
+
+<!-- decision diamond -->
+<polygon points="635,695 870,770 635,845 400,770" fill="#0d1117" stroke="#3fb950" stroke-width="2"/>
+<text x="635" y="766" text-anchor="middle" font-size="11.5" font-weight="700" fill="#e6edf3">aligned AND confidence &gt;=</text>
+<text x="635" y="783" text-anchor="middle" font-size="11.5" font-weight="700" fill="#e6edf3">grasp.min_confidence (0.5)?</text>
+
+<!-- YES -> close -->
+<path d="M870,770 H915" fill="none" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arrow-loop-dark)"/>
+<text x="892" y="760" text-anchor="middle" font-size="11.5" font-weight="700" fill="#3fb950">YES</text>
+<rect x="915" y="735" width="270" height="70" rx="8" fill="#0d1117" stroke="#3fb950" stroke-width="2"/>
+<text x="1050" y="762" text-anchor="middle" font-size="12.5" fill="#e6edf3">CLOSE gripper</text>
+<text x="1050" y="778" text-anchor="middle" font-size="10.5" fill="#8b949e">motor 5: 60 open -&gt; 5 closed</text>
+
+<!-- NO -> nudge -->
+<path d="M400,770 H360" fill="none" stroke="#db6d28" stroke-width="1.5" marker-end="url(#arrow-loop-dark)"/>
+<text x="378" y="760" text-anchor="middle" font-size="11.5" font-weight="700" fill="#db6d28">NO</text>
+<rect x="60" y="735" width="300" height="90" rx="8" fill="#0d1117" stroke="#db6d28" stroke-width="1.5"/>
+<text x="210" y="762" text-anchor="middle" font-size="12" fill="#e6edf3">nudge dx/dy, clamped to</text>
+<text x="210" y="778" text-anchor="middle" font-size="12" fill="#e6edf3">grasp.max_correction_cm = 2.0 cm,</text>
+<text x="210" y="794" text-anchor="middle" font-size="12" fill="#e6edf3">through the same safety envelope</text>
+
+<path d="M210,735 V580 H425" fill="none" stroke="#db6d28" stroke-width="1.5" marker-end="url(#arrow-loop-dark)"/>
+<text x="60" y="655" font-size="10.5" fill="#db6d28">up to grasp.max_retries = 2 re-checks</text>
+
+<!-- NO exhausted -> retreat -->
+<path d="M635,845 V900" fill="none" stroke="#db6d28" stroke-width="1.5" marker-end="url(#arrow-loop-dark)"/>
+<text x="645" y="880" font-size="10.5" fill="#db6d28">NO, retries exhausted</text>
+
+<rect x="465" y="900" width="340" height="70" rx="8" fill="#0d1117" stroke="#db6d28" stroke-width="2"/>
+<text x="635" y="940" text-anchor="middle" font-size="13.5" fill="#e6edf3">retreat, jaws STILL OPEN</text>
+
+<!-- dashed retreat -> prompt history -->
+<path d="M465,935 H20 V215 H590" fill="none" stroke="#db6d28" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#arrow-dash-dark)"/>
+<text x="240" y="928" text-anchor="middle" font-size="10.5" fill="#db6d28">FAILED: alignment not confirmed after N tries</text>
+
+<text x="600" y="1010" text-anchor="middle" font-size="13" font-style="italic" fill="#8b949e">low confidence counts as NOT aligned — a wrong "aligned" closes on nothing.</text>
+
+</svg>
